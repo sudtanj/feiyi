@@ -45,6 +45,16 @@ pub struct StreamState {
     /// (set when it sends a prompt, cleared when the turn ends). Output
     /// while it is clear is a turn the CLI runs of its own.
     pub turn_open: Arc<AtomicBool>,
+    /// The model answered since the last result.
+    assistant_seen: bool,
+    /// A task notification arrived after our prompt but before any answer:
+    /// the CLI runs it as a turn of its own first (on resume it replays
+    /// "stopped before the previous session ended" notices this way), and
+    /// that turn's result is not our prompt's.
+    notification_ahead: bool,
+    /// agent id -> tool_use_id of the background sub-agent, so a report that
+    /// names only the agent (or one resumed with SendMessage) is matched.
+    background_agents: HashMap<String, String>,
 }
 
 /// The `PreToolUse` hook callback id the daemon registers for Agent/Task
@@ -107,6 +117,9 @@ fn launched_in_background(name: &str, input: &Value, output: &str) -> bool {
     let asked = input.get("run_in_background").and_then(|v| v.as_bool()).unwrap_or(false);
     match name {
         "Workflow" => true,
+        // A finished sub-agent continued with a new message runs in the
+        // background again and reports back like a launch.
+        "SendMessage" => output.contains("\"resumedAgentId\""),
         "Bash" | "PowerShell" => asked || output.starts_with("Command running in background with ID:") || (output.starts_with("Command did not complete within its") && output.contains("moved to the background (ID:")),
         "Task" | "Agent" => {
             if output.starts_with("Async agent launched") || output.starts_with("Forked agent") {
@@ -127,13 +140,28 @@ fn launched_in_background(name: &str, input: &Value, output: &str) -> bool {
     }
 }
 
+/// The id of the sub-agent a background launch or SendMessage resume runs,
+/// as its report's `<task-id>` will name it.
+fn background_agent_id(name: &str, input: &Value, output: &str) -> Option<String> {
+    let id_after = |key: &str| {
+        let rest = &output[output.find(key)? + key.len()..];
+        let id: String = rest.trim_start_matches([' ', '"', ':']).chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').collect();
+        (!id.is_empty()).then_some(id)
+    };
+    match name {
+        "SendMessage" => id_after("\"resumedAgentId\"").or_else(|| s(input, "to")),
+        "Task" | "Agent" => id_after("agentId:"),
+        _ => None,
+    }
+}
+
 fn s(v: &Value, key: &str) -> Option<String> {
     v.get(key).and_then(|x| x.as_str()).map(|x| x.to_string())
 }
 
 impl StreamState {
     pub fn new(agent_id: String, events: EventTx, stdin: mpsc::UnboundedSender<String>, interrupted: Arc<AtomicBool>, session_id: Option<String>) -> Self {
-        StreamState { agent_id, events, stdin, interrupted, session_id, tools: HashMap::new(), streamed: HashSet::new(), current_message: None, context_tokens: None, limit_info: None, limit_refused: None, sub_limited: false, sub_logs: HashMap::new(), background: HashMap::new(), sub_active: Arc::default(), sub_cap: Arc::new(AtomicUsize::new(usize::MAX)), admitted: HashMap::new(), turn_open: Arc::default() }
+        StreamState { agent_id, events, stdin, interrupted, session_id, tools: HashMap::new(), streamed: HashSet::new(), current_message: None, context_tokens: None, limit_info: None, limit_refused: None, sub_limited: false, sub_logs: HashMap::new(), background: HashMap::new(), sub_active: Arc::default(), sub_cap: Arc::new(AtomicUsize::new(usize::MAX)), admitted: HashMap::new(), turn_open: Arc::default(), assistant_seen: false, notification_ahead: false, background_agents: HashMap::new() }
     }
 
     fn emit(&self, ev: ProviderEvent) {
@@ -190,6 +218,7 @@ impl StreamState {
             "assistant" if !is_sidechain => {
                 if !replay {
                     self.ensure_turn();
+                    self.assistant_seen = true;
                 }
                 self.handle_assistant(&msg);
             }
@@ -202,7 +231,11 @@ impl StreamState {
                 // traffic; a plain text message is a prompt echoed back.
                 let content = msg.pointer("/message/content").unwrap_or(&Value::Null);
                 let results = content.as_array().map(|b| b.iter().any(|b| b.get("type").and_then(|t| t.as_str()).map(|t| t.ends_with("tool_result")).unwrap_or(false))).unwrap_or(false);
-                if results || content_text(content).contains("<task-notification>") {
+                let notification = content_text(content).contains("<task-notification>");
+                if notification && !results && !replay && !self.assistant_seen && self.turn_open.load(Ordering::SeqCst) {
+                    self.notification_ahead = true;
+                }
+                if results || notification {
                     self.ensure_turn();
                 }
                 self.handle_tool_results(&msg);
@@ -288,7 +321,7 @@ impl StreamState {
     /// workflows show no activity until they report, so they may stay quiet
     /// longer than sub-agents before they count as hung.
     fn note_background(&self) {
-        let quiet_max = if self.background.values().all(|(name, _)| is_agent_tool(name)) { SUBAGENT_QUIET_MAX } else { BACKGROUND_QUIET_MAX };
+        let quiet_max = if self.background.values().all(|(name, _)| is_agent_tool(name) || name == "SendMessage") { SUBAGENT_QUIET_MAX } else { BACKGROUND_QUIET_MAX };
         let shells_only = !self.background.is_empty() && self.background.values().all(|(name, _)| name == "Bash");
         *self.sub_active.lock().unwrap() = SubAgents { running: !self.background.is_empty(), last_seen: Some(Instant::now()), quiet_max, shells_only };
     }
@@ -335,8 +368,13 @@ impl StreamState {
         }
         self.ensure_turn();
         for note in text.split("<task-notification>").skip(1) {
-            let Some(id) = tag(note, "tool-use-id") else { continue };
+            // Reports name the launching call, or (a sub-agent resumed with
+            // SendMessage) only the agent: match either.
+            let by_call = tag(note, "tool-use-id").filter(|id| self.background.contains_key(id));
+            let by_agent = || tag(note, "task-id").and_then(|t| self.background_agents.get(&t).cloned()).filter(|id| self.background.contains_key(id));
+            let Some(id) = by_call.or_else(by_agent) else { continue };
             self.admitted.remove(&id);
+            self.background_agents.retain(|_, call| call != &id);
             let Some((name, input)) = self.background.remove(&id) else { continue };
             self.sub_logs.remove(&id);
             let summary = tag(note, "summary").unwrap_or_default();
@@ -356,6 +394,7 @@ impl StreamState {
     /// it: fail the cards instead of leaving them running.
     pub fn process_ended(&mut self, killed: bool) {
         let error = if killed { "Stopped before it reported back: its Claude Code process was shut down" } else { "Stopped before it reported back: its Claude Code process exited" };
+        self.background_agents.clear();
         for (id, (name, input)) in std::mem::take(&mut self.background) {
             let mut detail = tools::claude_detail(&name, &input, None);
             let log = self.sub_logs.remove(&id);
@@ -389,6 +428,9 @@ impl StreamState {
                 let card = if is_agent_tool(&name) { self.sub_agent_card(&id, &name, &input, "running") } else { tools::tool_call(&id, &name, tools::claude_detail(&name, &input, None), "running", None) };
                 self.timeline(card);
                 if self.background.len() < MAX_BACKGROUND {
+                    if let Some(agent) = background_agent_id(&name, &input, &output) {
+                        self.background_agents.insert(agent, id.clone());
+                    }
                     self.background.insert(id, (name, input));
                     self.note_background();
                 }
@@ -408,6 +450,17 @@ impl StreamState {
 
     fn handle_result(&mut self, msg: &Value) {
         let agent_id = self.agent_id.clone();
+        let answered = std::mem::take(&mut self.assistant_seen);
+        // The end of a notification-only turn the CLI ran ahead of our prompt
+        // (no model answer, nothing spent): our prompt is still queued in the
+        // CLI and runs next, so the daemon's turn stays open. Ending it here
+        // read as "no response", and the retry killed the process together
+        // with the background work running in it.
+        let output_tokens = msg.pointer("/usage/output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+        if std::mem::take(&mut self.notification_ahead) && !answered && output_tokens == 0 && !self.interrupted.load(Ordering::SeqCst) {
+            crate::log!("claude {agent_id}: a background notice ran as a turn ahead of the prompt; waiting for the prompt's turn");
+            return;
+        }
         // The turn is over: the next output starts one of the CLI's own.
         self.turn_open.store(false, Ordering::SeqCst);
         if let Some(u) = msg.get("usage") {
@@ -964,6 +1017,22 @@ mod tests {
     }
 
     #[test]
+    fn a_notice_run_ahead_of_the_prompt_does_not_end_its_turn() {
+        let note = "<task-notification>\n<task-id>ag1</task-id>\n<status>stopped</status>\n<summary>Background agent didn't finish before the previous session ended</summary>\n</task-notification>";
+        let notice = json!({ "type": "user", "message": { "content": note } });
+        let empty = json!({ "type": "result", "subtype": "success", "result": "", "usage": { "output_tokens": 0 } });
+        let answer = json!({ "type": "assistant", "message": { "content": [{ "type": "text", "text": "Hi" }] } });
+        let done = json!({ "type": "result", "subtype": "success", "result": "Hi", "usage": { "output_tokens": 3 } });
+        let ends = |events: &[ProviderEvent]| events.iter().filter(|e| matches!(e, ProviderEvent::TurnCompleted { .. })).count();
+        // The notice's own (empty) result is skipped; the prompt's ends the turn.
+        assert_eq!(ends(&run(&[notice.clone(), empty.clone()])), 0);
+        assert_eq!(ends(&run(&[notice.clone(), empty.clone(), answer.clone(), done.clone()])), 1);
+        // A turn the model answered ends as usual, notice or not.
+        assert_eq!(ends(&run(&[notice, answer, done])), 1);
+        assert_eq!(ends(&run(&[empty])), 1);
+    }
+
+    #[test]
     fn foreground_results_are_not_taken_for_background_launches() {
         let call = |id: &str, name: &str, input: Value| json!({ "type": "assistant", "message": { "content": [{ "type": "tool_use", "id": id, "name": name, "input": input }] } });
         let result = |id: &str, text: &str| json!({ "type": "user", "message": { "content": [{ "type": "tool_result", "tool_use_id": id, "content": text }] } });
@@ -992,6 +1061,12 @@ mod tests {
         // A command Bash moved to the background after its timeout reports back too.
         assert!(launched_in_background("Bash", &json!({ "command": "make" }), "Command did not complete within its 120000ms timeout and was moved to the background (ID: bg1). Output is being written to: /tmp/bg1.out"));
         assert!(!launched_in_background("Bash", &json!({ "command": "make" }), "Command did not complete within its 120000ms timeout and was killed."));
+        // A finished sub-agent resumed with SendMessage runs in the background again.
+        let resumed = r#"{"success":true,"message":"Resuming agent acfe8f6","resumedAgentId":"acfe8f66d49bad632"}"#;
+        assert!(launched_in_background("SendMessage", &json!({ "to": "acfe8f66d49bad632" }), resumed));
+        assert!(!launched_in_background("SendMessage", &json!({ "to": "a1" }), r#"{"success":true,"message":"Message sent"}"#));
+        assert_eq!(background_agent_id("SendMessage", &json!({ "to": "x" }), resumed).as_deref(), Some("acfe8f66d49bad632"));
+        assert_eq!(background_agent_id("Agent", &json!({}), "Async agent launched successfully.\nagentId: a1b2 (internal ID)").as_deref(), Some("a1b2"));
     }
 
     #[test]

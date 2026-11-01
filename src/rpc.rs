@@ -429,15 +429,25 @@ impl Manager {
                 }
                 reply(out, json!({ "type": "push.unregister.response", "payload": { "requestId": rid } }));
             }
-            // ponytail: no terminals, project icons, workspace scripts or
-            // paseo.json support; answer empty so the app stops erroring.
-            // Implement the real features if the app needs them.
+            // ponytail: no terminals (a PTY plus a screen emulator per shell does
+            // not fit a 1 GB VM): answer empty so the app stops erroring.
             "list_terminals_request" => reply(out, json!({ "type": "list_terminals_response", "payload": { "cwd": s(&msg, "cwd").unwrap_or_default(), "terminals": [], "requestId": rid } })),
             "subscribe_terminals_request" => reply(out, json!({ "type": "terminals_changed", "payload": { "requestId": rid, "cwd": s(&msg, "cwd").unwrap_or_default(), "terminals": [] } })),
             "unsubscribe_terminals_request" => {}
-            "project_icon_request" => reply(out, json!({ "type": "project_icon_response", "payload": { "cwd": s(&msg, "cwd").unwrap_or_default(), "icon": null, "error": null, "requestId": rid } })),
-            "workspace.script.list.request" => reply(out, json!({ "type": "workspace.script.list.response", "payload": { "requestId": rid, "workspaceId": s(&msg, "workspaceId").unwrap_or_default(), "scripts": [], "error": null } })),
-            "read_project_config_request" => reply(out, json!({ "type": "read_project_config_response", "payload": { "requestId": rid, "repoRoot": s(&msg, "repoRoot").unwrap_or_default(), "ok": true, "config": null, "revision": null } })),
+            "project_icon_request" => reply(out, json!({ "type": "project_icon_response", "payload": { "cwd": s(&msg, "cwd").unwrap_or_default(), "icon": s(&msg, "cwd").and_then(|c| crate::project_meta::icon(&c)), "error": null, "requestId": rid } })),
+            "workspace.script.list.request" => {
+                let id = s(&msg, "workspaceId").unwrap_or_default();
+                // Ids the app derives for agents without a workspace record get no scripts.
+                let scripts = self.workspaces.iter().find(|w| w.id == id).map(|w| crate::project_meta::scripts(&w.directory)).unwrap_or_default();
+                reply(out, json!({ "type": "workspace.script.list.response", "payload": { "requestId": rid, "workspaceId": id, "scripts": scripts, "error": null } }));
+            }
+            "read_project_config_request" => {
+                let root = s(&msg, "repoRoot").unwrap_or_default();
+                let mut payload = crate::project_meta::read_config(&root);
+                payload["requestId"] = json!(rid);
+                payload["repoRoot"] = json!(root);
+                reply(out, json!({ "type": "read_project_config_response", "payload": payload }));
+            }
             "abort_request" => {}
             "ping" => {
                 let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);

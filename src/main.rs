@@ -11,6 +11,7 @@ mod manager;
 mod mcp;
 mod mcp_server;
 mod projects;
+mod project_meta;
 mod push;
 mod providers;
 mod relay;

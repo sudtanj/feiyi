@@ -675,9 +675,12 @@ impl Manager {
         let running = self.running.len();
         let change = self.capacity.update(running, queued, self.claude.idle_mb());
         if change == crate::capacity::Change::Critical {
-            let freed = self.claude.release_idle();
+            let (freed, lost) = self.claude.release_idle();
             if freed > 0 {
                 crate::warn!("capacity: released {freed} idle claude process(es) to free memory");
+            }
+            for agent_id in lost {
+                self.relaunch_lost_work(&agent_id);
             }
         }
         // Sub-agents share their agent's process: under pressure no new ones start.
@@ -1109,6 +1112,36 @@ impl Manager {
     /// The CLI ran a turn of its own while none was open here (background
     /// sub-agents reporting back) and it hit the limit: open a turn that
     /// waits for the reset and then has the unfinished work picked up.
+    /// Background work died with its process, stopped to free memory: open a
+    /// turn that asks the agent to launch it again once memory has had a
+    /// moment to recover, so the task goes on instead of silently stopping.
+    fn relaunch_lost_work(&mut self, agent_id: &str) {
+        let turn_id = new_id();
+        let provider = {
+            let Some(a) = self.agents.get_mut(agent_id).filter(|a| a.status != "running" && a.rec.archived_at.is_none()) else { return };
+            a.status = "running";
+            a.active_turn = Some((turn_id.clone(), now_iso()));
+            a.turn_text = BACKGROUND_LOST_PROMPT.to_string();
+            a.retry_text = BACKGROUND_LOST_PROMPT.to_string();
+            a.retry_at = Some(Instant::now() + RELAUNCH_DELAY);
+            a.attempts = 0;
+            a.produced = true;
+            a.compacting = false;
+            a.limit_hit = None;
+            a.limit_wait = false;
+            a.limit_since = None;
+            a.last_event = Instant::now();
+            a.rec.provider.clone()
+        };
+        crate::warn!("agent {agent_id}: background work stopped to free memory; relaunching in {}s", RELAUNCH_DELAY.as_secs());
+        self.stream(agent_id, &provider, json!({ "type": "turn_started", "provider": provider, "turnId": turn_id }));
+        let note = json!({ "type": "notification", "level": "warning", "message": format!("The machine ran low on memory, so this agent's background work was stopped. Relaunching it automatically in {}s.", RELAUNCH_DELAY.as_secs()) });
+        self.append_item(agent_id, note);
+        self.touch(agent_id);
+        self.publish_agent(agent_id);
+        self.persist_pending(agent_id);
+    }
+
     fn wait_out_idle_limit(&mut self, agent_id: &str, resets_at: Option<u64>) {
         let turn_id = new_id();
         let provider = {
@@ -1487,6 +1520,9 @@ impl Agent {
 }
 
 /// Sent when an interrupted turn is retried after it had already produced output.
+/// How long background work stopped to free memory waits before it is relaunched.
+const RELAUNCH_DELAY: Duration = Duration::from_secs(60);
+const BACKGROUND_LOST_PROMPT: &str = "Your background sub-agents, shell commands or workflows were stopped before they reported back: the machine ran low on memory and their process was shut down, so their results are lost. This is temporary, not a failure of the work. Launch the ones still needed again (fewer at once if memory is tight; if a launch is refused, retry later as its reason says), then continue the task to the end.";
 const CONTINUE_PROMPT: &str = "Your previous response was interrupted unexpectedly. Continue from where you left off and finish the task.";
 
 /// Sent when the daemon restarted in the middle of a turn that had already produced output.

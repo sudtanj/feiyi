@@ -245,15 +245,18 @@ impl ClaudePool {
     /// Stop processes that aren't running a turn, to free memory. Plain idle
     /// ones go first; those holding background sub-agents are only stopped
     /// (killing them; their cards say so) when there was nothing else to free.
-    pub fn release_idle(&mut self) -> usize {
+    /// Returns how many were stopped and the agents whose background work died.
+    pub fn release_idle(&mut self) -> (usize, Vec<String>) {
         let mut idle: Vec<String> = self.procs.iter().filter(|(_, p)| !p.busy() && !p.holding()).map(|(id, _)| id.clone()).collect();
+        let mut lost = Vec::new();
         if idle.is_empty() {
             idle = self.procs.iter().filter(|(_, p)| !p.busy()).map(|(id, _)| id.clone()).collect();
+            lost = idle.clone();
         }
         for id in &idle {
             self.stop(id);
         }
-        idle.len()
+        (idle.len(), lost)
     }
 
     /// Stop the longest-idle warm process, except those of `keep` (agents

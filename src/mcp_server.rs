@@ -271,6 +271,7 @@ impl Manager {
         let uptime = humantime::parse_rfc3339(&self.started_at).ok().and_then(|t| SystemTime::now().duration_since(t).ok()).map(|d| d.as_secs());
         let sent = crate::egress::snapshot();
         let egress: Vec<Value> = sent.iter().take(8).map(|(kind, n, bytes)| json!({ "type": kind, "messages": n, "bytes": bytes })).collect();
+        let rpc_errors: Vec<Value> = crate::egress::rpc_failures().into_iter().take(20).map(|(k, n)| json!({ "request": k, "count": n })).collect();
         json!({
             "version": env!("CARGO_PKG_VERSION"),
             "pid": std::process::id(),
@@ -284,6 +285,7 @@ impl Manager {
             "machine": machine_status(),
             "connectedClients": self.clients.iter().filter(|c| !c.out.is_closed()).count(),
             "sentToApps": egress,
+            "rpcErrors": rpc_errors,
         })
     }
 

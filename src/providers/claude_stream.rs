@@ -456,8 +456,12 @@ impl StreamState {
         // CLI and runs next, so the daemon's turn stays open. Ending it here
         // read as "no response", and the retry killed the process together
         // with the background work running in it.
+        // A result with text (e.g. a sub-agent's failure handled by the CLI)
+        // is a real end of turn.
         let output_tokens = msg.pointer("/usage/output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-        if std::mem::take(&mut self.notification_ahead) && !answered && output_tokens == 0 && !self.interrupted.load(Ordering::SeqCst) {
+        let silent = msg.get("result").and_then(|v| v.as_str()).map_or(true, |r| r.trim().is_empty());
+        let is_error = msg.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
+        if std::mem::take(&mut self.notification_ahead) && !answered && silent && !is_error && output_tokens == 0 && !self.interrupted.load(Ordering::SeqCst) {
             crate::log!("claude {agent_id}: a background notice ran as a turn ahead of the prompt; waiting for the prompt's turn");
             return;
         }
@@ -540,7 +544,11 @@ impl StreamState {
     fn gate_subagent(&mut self, req: &Value) -> Value {
         let now = Instant::now();
         let (tools, background) = (&self.tools, &self.background);
-        self.admitted.retain(|id, at| tools.contains_key(id) || background.contains_key(id) || now.duration_since(*at) < ADMIT_GRACE);
+        // Background work silent past the sub-agent limit is taken for lost
+        // (its notification never matched): it stops counting, or one lost
+        // report would hold a seat until the process ends, hours later.
+        let lost = self.sub_active.lock().unwrap().quiet() >= SUBAGENT_QUIET_MAX;
+        self.admitted.retain(|id, at| tools.contains_key(id) || (!lost && background.contains_key(id)) || now.duration_since(*at) < ADMIT_GRACE);
         let cap = self.sub_cap.load(Ordering::Relaxed);
         let running = self.admitted.len();
         if running < cap {

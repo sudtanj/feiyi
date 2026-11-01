@@ -34,6 +34,23 @@ pub fn snapshot() -> Vec<(String, u64, u64)> {
     out
 }
 
+static FAILED: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
+
+/// Count one `rpc_error` reply by request type and error, to find app
+/// requests paseo-lite does not handle.
+pub fn rpc_failed(request_type: &str, error: &str) {
+    let key = format!("{request_type}: {error}");
+    *FAILED.lock().unwrap().get_or_insert_with(HashMap::new).entry(key).or_default() += 1;
+}
+
+/// rpc_error replies since start, most frequent first.
+pub fn rpc_failures() -> Vec<(String, u64)> {
+    let guard = FAILED.lock().unwrap();
+    let mut out: Vec<(String, u64)> = guard.iter().flatten().map(|(k, n)| (k.clone(), *n)).collect();
+    out.sort_by(|a, b| b.1.cmp(&a.1));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

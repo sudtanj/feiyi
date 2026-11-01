@@ -163,6 +163,11 @@ impl Capacity {
         self.strained
     }
 
+    /// The last reading was critical (about to run out).
+    pub fn critical(&self) -> bool {
+        self.critical
+    }
+
     /// Read the machine and adjust the limit. `reclaim_mb`: memory held by
     /// warm idle processes the pool would stop to make room.
     pub fn update(&mut self, running: usize, queued: usize, reclaim_mb: u64) -> Change {

@@ -636,6 +636,7 @@ fn provider_entries(claude_bin: &str, codex_bin: &str, codex_models: Option<Valu
 }
 
 pub fn rpc_error(out: &Out, request_id: &str, request_type: &str, error: &str) {
+    crate::egress::rpc_failed(request_type, error);
     reply(out, json!({ "type": "rpc_error", "payload": { "requestId": request_id, "requestType": request_type, "error": error, "code": "unsupported" } }));
 }
 

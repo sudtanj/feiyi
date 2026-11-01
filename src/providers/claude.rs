@@ -75,6 +75,8 @@ impl Proc {
     }
 }
 
+/// How long a strain reading must last before new sub-agents are refused.
+const STRAIN_HOLD: std::time::Duration = std::time::Duration::from_secs(10);
 /// Quiet background shells are checked for leftover processes after this.
 const SHELLS_CHECK_AFTER: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
@@ -112,19 +114,29 @@ pub struct ClaudePool {
     /// The machine is under pressure: children holding sub-agents count
     /// against the cap again.
     strained: bool,
+    /// Since when the readings have been strained (before the hold applies).
+    strained_since: Option<Instant>,
 }
 
 impl ClaudePool {
     pub fn new(cfg: Config, events: EventTx) -> Self {
         let sub_cap = Arc::new(AtomicUsize::new(cfg.claude_max_subagents));
-        ClaudePool { cfg, events, procs: HashMap::new(), waiting: VecDeque::new(), generation: 0, max_live: 1, sub_cap, strained: false }
+        ClaudePool { cfg, events, procs: HashMap::new(), waiting: VecDeque::new(), generation: 0, max_live: 1, sub_cap, strained: false, strained_since: None }
     }
 
     /// How many sub-agents a process may start now: the configured cap, or
-    /// none while the machine is strained (running ones carry on).
-    pub fn set_strained(&mut self, strained: bool) {
-        self.strained = strained;
-        let cap = if strained { 0 } else { self.cfg.claude_max_subagents };
+    /// none while the machine is strained (running ones carry on). A strain
+    /// reading must last `STRAIN_HOLD` before it closes the gate (unless it
+    /// is critical): a 2-second pressure blip, such as a CLI starting, used
+    /// to refuse background agents launched at that moment.
+    pub fn set_strained(&mut self, strained: bool, critical: bool) {
+        let now = Instant::now();
+        let since = if strained { *self.strained_since.get_or_insert(now) } else {
+            self.strained_since = None;
+            now
+        };
+        self.strained = critical || (strained && now.duration_since(since) >= STRAIN_HOLD);
+        let cap = if self.strained { 0 } else { self.cfg.claude_max_subagents };
         if self.sub_cap.swap(cap, Ordering::Relaxed) != cap {
             crate::log!("claude: up to {cap} sub-agent(s) per agent");
         }

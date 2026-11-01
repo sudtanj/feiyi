@@ -107,32 +107,51 @@ fn start(tag: &str, password: Option<&str>) -> Daemon {
 /// Start (or restart) the daemon on an existing directory. `hang`: the fake
 /// claude accepts a prompt and never answers, to simulate a turn in flight.
 fn start_at(dir: PathBuf, password: Option<&str>, mode: &str) -> Daemon {
-    let port = free_port();
     let claude = fake_claude(&dir, mode);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_paseo-lite"));
-    cmd.args(["--listen", &format!("127.0.0.1:{port}"), "--no-relay"])
-        .env("PASEO_LITE_HOME", dir.join("home"))
-        .env("PASEO_CLAUDE_BIN", &claude)
-        .env("PASEO_CODEX_BIN", "/nonexistent/codex")
-        .env("PASEO_DEFAULT_SYSTEM_PROMPT", "")
-        .env("PASEO_RETRY_MAX", "0")
-        .env("PASEO_LIMIT_POLL_SECS", "1")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    if let Some(p) = password {
-        cmd.env("PASEO_PASSWORD", p);
-    }
-    let child = cmd.spawn().expect("start paseo-lite");
-    let daemon = Daemon { child, port, dir };
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while Instant::now() < deadline {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return daemon;
+    // free_port() can hand two parallel tests the same port; a daemon that
+    // lost the race exits, so retry on a fresh port rather than talk to the
+    // other test's daemon.
+    for _ in 0..5 {
+        let port = free_port();
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_paseo-lite"));
+        cmd.args(["--listen", &format!("127.0.0.1:{port}"), "--no-relay"])
+            .env("PASEO_LITE_HOME", dir.join("home"))
+            .env("PASEO_CLAUDE_BIN", &claude)
+            .env("PASEO_CODEX_BIN", "/nonexistent/codex")
+            .env("PASEO_DEFAULT_SYSTEM_PROMPT", "")
+            .env("PASEO_RETRY_MAX", "0")
+            .env("PASEO_LIMIT_POLL_SECS", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if let Some(p) = password {
+            cmd.env("PASEO_PASSWORD", p);
         }
-        std::thread::sleep(Duration::from_millis(100));
+        let mut child = cmd.spawn().expect("start paseo-lite");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut exited = false;
+        while Instant::now() < deadline {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                exited = true;
+                break;
+            }
+            if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                std::thread::sleep(Duration::from_millis(100));
+                if matches!(child.try_wait(), Ok(Some(_))) {
+                    exited = true;
+                    break;
+                }
+                return Daemon { child, port, dir };
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if !exited {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("daemon did not start listening on {port}");
+        }
     }
-    panic!("daemon did not start listening on {port}");
+    panic!("daemon kept exiting at start (port collisions?)");
 }
 
 type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;

@@ -846,6 +846,9 @@ impl Manager {
                 }
             }
         }
+        // A turn that ends with background work still running is a pause, not
+        // the end of the task: no "finished" notice until the last turn.
+        let background = matches!(outcome, Ok(None)) && self.claude.working_in_background(agent_id);
         let (provider, turn_id) = {
             let Some(agent) = self.agents.get_mut(agent_id) else { return };
             let turn_id = agent.active_turn.take().map(|t| t.0);
@@ -853,7 +856,7 @@ impl Manager {
             let pending: Vec<String> = agent.permissions.drain(..).filter_map(|p| p.request.get("id").and_then(|i| i.as_str()).map(String::from)).collect();
             agent.status = if outcome.is_err() { "error" } else { "idle" };
             let reason = match &outcome {
-                Ok(None) => Some("finished"),
+                Ok(None) => (!background).then_some("finished"),
                 Err(_) => Some("error"),
                 Ok(Some(_)) => None,
             };
@@ -895,9 +898,9 @@ impl Manager {
         self.checkout.poke();
         if !compacting {
             match &outcome {
-                Ok(None) => self.notify_attention(agent_id, "finished"),
+                Ok(None) if !background => self.notify_attention(agent_id, "finished"),
                 Err(_) => self.notify_attention(agent_id, "error"),
-                Ok(Some(_)) => {}
+                Ok(_) => {}
             }
         }
 

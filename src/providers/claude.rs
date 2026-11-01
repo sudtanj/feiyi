@@ -489,6 +489,12 @@ impl ClaudePool {
         }
     }
 
+    /// Its turn ended but background work it started still runs: a later turn
+    /// picks up the results, so the task is not finished yet.
+    pub fn working_in_background(&self, agent_id: &str) -> bool {
+        self.procs.get(agent_id).is_some_and(|p| p.holding() && p.sub_active.lock().unwrap().running)
+    }
+
     /// Stop the agent's process when background sub-agents work in it (an
     /// interrupt would leave them running). Returns waiting prompts that may
     /// start in the freed slot, or None when there was nothing to stop.

@@ -194,6 +194,8 @@ PASEO_LISTEN=0.0.0.0:6768 PASEO_PASSWORD=secret paseo-lite
 | `PASEO_ZILONG_MCP_URL` | – | zilong-router MCP gateway (`http://<router>:20128/mcp`) for every Claude Code and Codex agent. See [MCP: zilong-router](#mcp-zilong-router) |
 | `PASEO_ZILONG_API_KEY` | – | its API key, sent as a Bearer token |
 | `PASEO_DEBUG_MCP` | on | `0`/`false`/`off` stops giving agents the built-in `paseo-lite` debug MCP server. See [MCP: paseo-lite](#mcp-paseo-lite) |
+| `PASEO_CAVEMAN` | `ultra` | Token Saver terse-answer prompt level (always on): `lite`, `full`, `ultra`, `wenyan-lite`, `wenyan`, `wenyan-ultra`. See [Token Saver](#token-saver) |
+| `PASEO_PONYTAIL` | `ultra` | Token Saver minimal-code prompt level (always on): `lite`, `full`, `ultra` |
 
 A systemd unit is in `contrib/paseo-lite.service`.
 
@@ -242,6 +244,18 @@ a random token made at each daemon start, and must come from this machine. Claud
 
 Set `PASEO_DEBUG_MCP=0` to turn it off.
 
+## Token Saver
+
+Ported from zilong-router's Token Saver (9router's page of the same name). zilong-router rewrites proxied API requests; paseo-lite does not proxy the API, so it works through the CLIs instead:
+
+- **Caveman** (`PASEO_CAVEMAN=lite|full|ultra|wenyan-lite|wenyan|wenyan-ultra`, `ultra` by default): a terse-style system prompt for shorter answers.
+- **Ponytail** (`PASEO_PONYTAIL=lite|full|ultra`, `ultra` by default): biases the model toward minimal code.
+
+  Both are appended to every agent's system prompt after the other instructions (Claude `--append-system-prompt`, Codex `developerInstructions`). The Token Saver is always on: `off` or an unknown level logs a warning and uses `ultra`.
+- **RTK** (always on; Claude Code only): compacts the output of git status/diff/log/show, grep/rg, find, ls, tree and cargo/npm/go build and test before it reaches the model, often 60-90% fewer tokens. At startup the daemon writes `~/.paseo-lite/claude-settings.json` with a `PreToolUse` hook on Bash (`paseo-lite rtk-hook`, 5 s timeout) and starts `claude` with `--settings <that file>`, which adds to your own settings. The hook rewrites a plain, single command of that kind to `paseo-lite rtk -- '<command>'`, which runs it with `sh -c` (stderr merged into stdout, stdin and exit code kept) and prints the compressed output with a one-line note, or the output as is when no filter matched. Anything else runs unchanged: pipes, `&&`/`||`/`;`/`&`, redirections other than `2>&1`, heredocs, `$`/backtick expansion, `cd`, variable prefixes, background shells, and any error in the hook. It only rewrites in **Bypass** mode, and never sets a permission decision: Claude Code checks permissions against the rewritten command, so in the other modes it would stop matching your allow rules and the read-only command list and ask where it otherwise wouldn't. Append `| cat` to a command to see its raw output. Codex agents get no RTK for now: Codex's own `PreToolUse` hooks (with `updatedInput`) sit behind the experimental `codex_hooks` feature and a hook-trust step, which paseo-lite does not turn on.
+
+`daemon_status` shows the active settings under `config.tokenSaver`.
+
 ## Layout
 
 ```
@@ -256,6 +270,7 @@ src/providers/claude*.rs Claude Code pool + stream-json parser
 src/providers/codex*.rs  shared Codex app-server client + event mapping
 src/mcp.rs               MCP servers for agents (zilong-router, paseo-lite) as Claude --mcp-config / Codex -c overrides
 src/mcp_server.rs        the built-in paseo-lite debug MCP server (/mcp)
+src/token_saver/         Token Saver: Caveman/Ponytail prompts, RTK output compression + Claude Bash hook
 src/store.rs             agents.json + JSONL timelines
 src/usage.rs             token/cost ledger per provider and model, price list
 web/index.html           built-in pairing page (QR behind the password)

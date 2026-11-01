@@ -528,9 +528,10 @@ impl Manager {
             model: a.rec.model.clone(),
             mode_id: a.rec.mode_id.clone(),
             session_id: a.rec.session_id.clone(),
-            // Built-in default, then the app's appendSystemPrompt, then the agent's own.
+            // Built-in default, then the app's appendSystemPrompt, then the
+            // agent's own, then the Token Saver's Caveman / Ponytail prompts.
             system_prompt: {
-                let parts: Vec<String> = [self.cfg.default_system_prompt.clone(), self.daemon_config.append_system_prompt(), a.rec.system_prompt.clone()]
+                let parts: Vec<String> = [self.cfg.default_system_prompt.clone(), self.daemon_config.append_system_prompt(), a.rec.system_prompt.clone(), crate::token_saver::system_prompt(&self.cfg)]
                     .into_iter()
                     .flatten()
                     .filter(|p| !p.trim().is_empty())

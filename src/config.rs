@@ -103,6 +103,13 @@ pub struct Config {
     /// mcp_server.rs) given to every agent; None when `PASEO_DEBUG_MCP=0` or
     /// no local URL can be derived from `listen`.
     pub debug_mcp: Option<crate::mcp::DebugMcp>,
+    /// Token Saver (token_saver/): the Caveman level (`PASEO_CAVEMAN`) and
+    /// Ponytail level (`PASEO_PONYTAIL`) added to every agent's system prompt:
+    /// `ultra` unless set to another level (always on).
+    pub caveman: Option<String>,
+    pub ponytail: Option<String>,
+    /// RTK tool-output compression for Claude Code's Bash tool: always on.
+    pub rtk: bool,
 }
 
 fn env(key: &str) -> Option<String> {
@@ -115,6 +122,17 @@ fn env_bool(key: &str) -> Option<bool> {
 
 fn env_secs(key: &str, default: u64) -> Duration {
     Duration::from_secs(env(key).and_then(|v| v.parse().ok()).unwrap_or(default))
+}
+
+/// A level from `levels`; unset = `ultra`. The Token Saver is always on, so
+/// `off` or an unknown value warns and also means `ultra`.
+fn env_level(key: &str, levels: &[&str]) -> Option<String> {
+    let Some(v) = env(key).map(|v| v.to_ascii_lowercase()) else { return Some("ultra".into()) };
+    if levels.contains(&v.as_str()) {
+        return Some(v);
+    }
+    crate::warn!("{key}={v} is not one of {}; the Token Saver is always on, using ultra", levels.join("|"));
+    Some("ultra".into())
 }
 
 impl Config {
@@ -195,6 +213,9 @@ impl Config {
             zilong_mcp_url: env("PASEO_ZILONG_MCP_URL"),
             zilong_api_key: env(crate::mcp::KEY_ENV),
             debug_mcp,
+            caveman: env_level("PASEO_CAVEMAN", crate::token_saver::prompts::CAVEMAN_LEVELS),
+            ponytail: env_level("PASEO_PONYTAIL", crate::token_saver::prompts::PONYTAIL_LEVELS),
+            rtk: true,
         }
     }
 }

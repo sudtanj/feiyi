@@ -293,6 +293,10 @@ impl ClaudePool {
             cmd.arg("--mcp-config").arg(mcp);
         }
         cmd.args(["--permission-mode", spec.mode_id.as_deref().unwrap_or("default")]);
+        // Token Saver's RTK hook on Bash, merged with the user's own settings.
+        if let Some(settings) = crate::token_saver::claude_settings(&self.cfg) {
+            cmd.arg("--settings").arg(settings);
+        }
         if let Some(model) = spec.model.as_deref().filter(|m| !m.is_empty() && *m != "default") {
             cmd.args(["--model", model]);
         }

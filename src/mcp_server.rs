@@ -452,6 +452,12 @@ fn redacted_config(cfg: &crate::config::Config) -> Value {
         "deleteProjectFiles": format!("{:?}", cfg.delete_project_files),
         "timelineUnloadSecs": secs(cfg.timeline_unload),
         "defaultSystemPromptSet": cfg.default_system_prompt.is_some(),
+        "tokenSaver": {
+            "caveman": cfg.caveman.as_deref().unwrap_or("off"),
+            "ponytail": cfg.ponytail.as_deref().unwrap_or("off"),
+            "rtk": cfg.rtk,
+            "rtkClaudeSettings": crate::token_saver::claude_settings(cfg).map(|p| p.display().to_string()),
+        },
         "mcp": {
             "zilongRouterUrl": cfg.zilong_mcp_url.as_deref().map(redact_url),
             "zilongApiKeySet": cfg.zilong_api_key.is_some(),

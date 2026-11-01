@@ -20,6 +20,7 @@ mod server;
 mod session;
 mod snapshot;
 mod store;
+mod token_saver;
 mod uploads;
 mod usage;
 mod util;
@@ -50,6 +51,8 @@ ENVIRONMENT (selection):
     PASEO_CLAUDE_SUBAGENT_PROMPT  extra instructions for Claude Code agents (default: hand work to background sub-agents and stay free; set empty to disable)
     PASEO_CLAUDE_MAX_SUBAGENTS    sub-agents one Claude Code agent may run at once; none start while the machine is strained (default 3)
     PASEO_DEBUG_MCP=0        do not give agents the built-in paseo-lite debug MCP server
+    PASEO_CAVEMAN            Token Saver terse-answer prompt level (always on): lite|full|ultra|wenyan-lite|wenyan|wenyan-ultra (default ultra)
+    PASEO_PONYTAIL           Token Saver minimal-code prompt level (always on): lite|full|ultra (default ultra)
 ";
 
 fn hostname() -> String {
@@ -72,6 +75,13 @@ fn print_pairing(cfg: &Config, identity: &e2ee::DaemonIdentity) {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // Hidden Token Saver subcommands, run by Claude Code (token_saver/mod.rs).
+    // First, so the wrapped command's own `-h` is not taken for ours.
+    match args.first().map(String::as_str) {
+        Some(token_saver::HOOK_CMD) => return token_saver::hook_main(),
+        Some(token_saver::RUN_CMD) => token_saver::run_main(&args[1..]),
+        _ => {}
+    }
     if args.iter().any(|a| a == "help" || a == "--help" || a == "-h") {
         print!("{HELP}");
         return;
@@ -116,6 +126,7 @@ async fn run(cfg: Config, identity: Arc<e2ee::DaemonIdentity>) {
 
     crate::log!("paseo-lite {} serverId={} home={}", env!("CARGO_PKG_VERSION"), identity.server_id, cfg.home.display());
     mcp::write_claude_config(&cfg);
+    token_saver::write_claude_settings(&cfg);
     uploads::prune(&cfg.home);
     usage::load_prices(&cfg.home);
     tokio::spawn(usage::refresh_prices(cfg.home.clone()));

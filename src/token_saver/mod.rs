@@ -1,6 +1,6 @@
 //! Token Saver, ported from zilong-router (which follows 9router's page of the
 //! same name): the Caveman and Ponytail system prompts plus RTK tool-output
-//! compression. zilong-router applies them to proxied API requests; paseo-lite
+//! compression. zilong-router applies them to proxied API requests; feiyi
 //! does not proxy the API, so here:
 //!
 //! - Caveman / Ponytail (`PASEO_CAVEMAN`, `PASEO_PONYTAIL`, always on, `ultra`
@@ -9,9 +9,9 @@
 //!   through `--append-system-prompt`, Codex as `developerInstructions`).
 //! - RTK (always on) is a Claude Code `PreToolUse` hook on
 //!   the Bash tool, given through `--settings <home>/claude-settings.json`.
-//!   The hook (`paseo-lite rtk-hook`) rewrites simple, well-known commands
+//!   The hook (`feiyi rtk-hook`) rewrites simple, well-known commands
 //!   (git status/diff/log/show, grep, find, ls, cargo build, ...) to
-//!   `paseo-lite rtk -- '<command>'`, which runs the command and prints its
+//!   `feiyi rtk -- '<command>'`, which runs the command and prints its
 //!   output compressed. It only rewrites in `bypassPermissions` mode: Claude
 //!   Code checks permissions against the rewritten command, so in any other
 //!   mode it would no longer match the user's allow rules or the read-only
@@ -27,13 +27,13 @@ use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-/// Hidden subcommands of the `paseo-lite` binary.
+/// Hidden subcommands of the `feiyi` binary.
 pub const HOOK_CMD: &str = "rtk-hook";
 pub const RUN_CMD: &str = "rtk";
 
 /// Shown after compressed output, so the agent knows how to see it raw
 /// (commands with a pipe are never rewritten).
-const FOOTER: &str = "[paseo-lite rtk: output compressed; append `| cat` to the command for the raw output]";
+const FOOTER: &str = "[feiyi rtk: output compressed; append `| cat` to the command for the raw output]";
 
 /// Caveman then Ponytail, as one block for the system prompt.
 pub fn system_prompt(cfg: &Config) -> Option<String> {
@@ -67,7 +67,7 @@ pub fn write_claude_settings(cfg: &Config) {
     let settings = if cfg.rtk { current_exe().as_deref().and_then(claude_settings_json) } else { None };
     let Some(settings) = settings else {
         if cfg.rtk {
-            crate::warn!("token saver: cannot locate the paseo-lite binary; Claude Code starts without RTK");
+            crate::warn!("token saver: cannot locate the feiyi binary; Claude Code starts without RTK");
         }
         let _ = std::fs::remove_file(&path);
         return;
@@ -88,9 +88,9 @@ pub fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
-// ----- paseo-lite rtk-hook -------------------------------------------------------------
+// ----- feiyi rtk-hook -------------------------------------------------------------
 
-/// `paseo-lite rtk-hook`: Claude Code's PreToolUse hook input on stdin. Prints
+/// `feiyi rtk-hook`: Claude Code's PreToolUse hook input on stdin. Prints
 /// the rewrite, or nothing (no change) on any error or for any other command.
 pub fn hook_main() {
     let mut input = String::new();
@@ -137,7 +137,7 @@ fn hook_output(event: &Value, exe: &Path) -> Option<Value> {
 /// (`$`, backticks), heredocs or newlines. `cd`, `export` and the like are not
 /// on the list, so commands that change the shell's state (which Claude Code
 /// keeps between calls) are never wrapped, and neither is an already wrapped
-/// command (its program is paseo-lite).
+/// command (its program is feiyi).
 pub fn worth_wrapping(command: &str) -> bool {
     let command = command.trim();
     if command.is_empty() || command.len() > 4096 || command.contains(['\n', '\r']) {
@@ -231,9 +231,9 @@ fn worth(words: &[String]) -> bool {
     }
 }
 
-// ----- paseo-lite rtk -- <command> -----------------------------------------------------
+// ----- feiyi rtk -- <command> -----------------------------------------------------
 
-/// `paseo-lite rtk -- <command>`: runs the command with `sh -c` (stderr merged
+/// `feiyi rtk -- <command>`: runs the command with `sh -c` (stderr merged
 /// into stdout), prints its output compressed when a filter matched (else as
 /// is) and exits with its exit code.
 pub fn run_main(args: &[String]) -> ! {
@@ -242,7 +242,7 @@ pub fn run_main(args: &[String]) -> ! {
         _ => args,
     };
     if args.is_empty() {
-        eprintln!("usage: paseo-lite rtk -- <shell command>");
+        eprintln!("usage: feiyi rtk -- <shell command>");
         std::process::exit(2);
     }
     let command = args.join(" ");
@@ -255,7 +255,7 @@ pub fn run_main(args: &[String]) -> ! {
     let output = match output {
         Ok(o) => o,
         Err(e) => {
-            eprintln!("paseo-lite rtk: cannot run sh: {e}");
+            eprintln!("feiyi rtk: cannot run sh: {e}");
             std::process::exit(127);
         }
     };
@@ -332,7 +332,7 @@ mod tests {
             "npm start",
             "echo hi",
             "find . -exec rm {} \\;",
-            "'/x/paseo-lite' rtk -- 'git status'",
+            "'/x/feiyi' rtk -- 'git status'",
             "git status 'unterminated",
             "ls 2>/dev/null",
         ] {
@@ -342,13 +342,13 @@ mod tests {
 
     #[test]
     fn hook_rewrites_bash_in_bypass_mode_only() {
-        let exe = Path::new("/opt/paseo lite/paseo-lite");
+        let exe = Path::new("/opt/my tools/feiyi");
         let event = |mode: &str, command: &str| json!({ "hook_event_name": "PreToolUse", "tool_name": "Bash", "permission_mode": mode, "tool_input": { "command": command, "description": "d", "timeout": 1000 } });
         let out = hook_output(&event("bypassPermissions", "git log -n 5 --format='%h %s'"), exe).unwrap();
         let hso = &out["hookSpecificOutput"];
         assert_eq!(hso["hookEventName"], "PreToolUse");
         assert!(hso.get("permissionDecision").is_none());
-        assert_eq!(hso["updatedInput"]["command"], r#"'/opt/paseo lite/paseo-lite' rtk -- 'git log -n 5 --format='\''%h %s'\'''"#);
+        assert_eq!(hso["updatedInput"]["command"], r#"'/opt/my tools/feiyi' rtk -- 'git log -n 5 --format='\''%h %s'\'''"#);
         assert_eq!(hso["updatedInput"]["description"], "d");
         assert_eq!(hso["updatedInput"]["timeout"], 1000);
         for mode in ["default", "acceptEdits", "plan"] {
@@ -365,9 +365,9 @@ mod tests {
 
     #[test]
     fn settings_hold_one_bash_hook() {
-        let s = claude_settings_json(Path::new("/usr/bin/paseo-lite")).unwrap();
+        let s = claude_settings_json(Path::new("/usr/bin/feiyi")).unwrap();
         assert_eq!(s["hooks"]["PreToolUse"][0]["matcher"], "Bash");
-        assert_eq!(s["hooks"]["PreToolUse"][0]["hooks"][0]["command"], "'/usr/bin/paseo-lite' rtk-hook");
+        assert_eq!(s["hooks"]["PreToolUse"][0]["hooks"][0]["command"], "'/usr/bin/feiyi' rtk-hook");
     }
 
     #[test]

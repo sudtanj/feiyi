@@ -27,8 +27,8 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }}
       - uses: actions/upload-artifact@v4
         with:
-          name: paseo-lite-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/paseo-lite
+          name: feiyi-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/feiyi
 
   # Unit tests: pure logic inside the daemon (config merge, cleanup guards,
   # push payloads, snapshot cleaning, retry classification, ...).
@@ -62,10 +62,10 @@ jobs:
         include:
           - runner: ubuntu-latest
             target: x86_64-unknown-linux-musl
-            name: paseo-lite-x86_64-linux-musl
+            name: feiyi-x86_64-linux-musl
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
-            name: paseo-lite-aarch64-linux-musl
+            name: feiyi-aarch64-linux-musl
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -80,7 +80,7 @@ jobs:
       - name: Stage binary
         run: |
           set -euo pipefail
-          cp target/${{ matrix.target }}/release/paseo-lite "${{ matrix.name }}"
+          cp target/${{ matrix.target }}/release/feiyi "${{ matrix.name }}"
           sha256sum "${{ matrix.name }}" > "${{ matrix.name }}.sha256"
       - uses: actions/upload-artifact@v4
         with:
@@ -98,7 +98,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          pattern: paseo-lite-*-linux-musl
+          pattern: feiyi-*-linux-musl
           path: dist
           merge-multiple: true
       - name: Publish rolling release

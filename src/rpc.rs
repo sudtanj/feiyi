@@ -257,7 +257,7 @@ impl Manager {
                 let source = msg.get("source").cloned().unwrap_or(Value::Null);
                 let fail = |error: String, code: &str| json!({ "type": "workspace.create.response", "payload": { "requestId": rid, "workspace": null, "setupTerminalId": null, "error": error, "errorCode": code } });
                 if s(&source, "kind").as_deref() != Some("directory") {
-                    return reply(out, fail("paseo-lite does not create git worktrees yet; choose Local isolation".into(), "unsupported"));
+                    return reply(out, fail("feiyi does not create git worktrees yet; choose Local isolation".into(), "unsupported"));
                 }
                 let dir = match normalize_dir(&s(&source, "path").unwrap_or_default()) {
                     Ok(d) => d,
@@ -316,7 +316,7 @@ impl Manager {
                 reply(out, json!({ "type": "workspace.clear_attention.response", "payload": { "requestId": rid, "workspaceId": msg.get("workspaceId").cloned().unwrap_or(Value::Null), "clearedAgentIds": all_cleared, "results": results, "success": true, "error": null } }));
             }
             "workspace_setup_status_request" => {
-                // No setup scripts in paseo-lite: report "nothing to show".
+                // No setup scripts in feiyi: report "nothing to show".
                 reply(out, json!({ "type": "workspace_setup_status_response", "payload": { "requestId": rid, "workspaceId": s(&msg, "workspaceId").unwrap_or_default(), "snapshot": null } }));
             }
             "project.list.request" => {
@@ -442,7 +442,7 @@ impl Manager {
                 let git = crate::git_actions::GitCtx { watcher: self.checkout.clone(), bcast: self.bcast.clone() };
                 // File explorer, downloads, saves and entry edits (files.rs).
                 if !crate::files::handle(&kind, &msg, &rid, out) && !crate::git_actions::handle(&git, &kind, &msg, &rid, out) && !self.handle_ext_rpc(&kind, &msg, &rid, out) && request_id.is_some() {
-                    rpc_error(out, &rid, &kind, "not supported by paseo-lite");
+                    rpc_error(out, &rid, &kind, "not supported by feiyi");
                 }
             }
         }

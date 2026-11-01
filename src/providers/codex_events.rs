@@ -163,7 +163,7 @@ impl Codex {
         );
         let agent_id = self.agent_for(&params);
         let (true, Some(agent_id)) = (is_approval, agent_id) else {
-            self.send_raw(json!({ "id": id, "error": { "code": -32601, "message": format!("{method} is not supported by paseo-lite") } }));
+            self.send_raw(json!({ "id": id, "error": { "code": -32601, "message": format!("{method} is not supported by feiyi") } }));
             return;
         };
         let legacy = !method.starts_with("item/");

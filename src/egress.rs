@@ -37,7 +37,7 @@ pub fn snapshot() -> Vec<(String, u64, u64)> {
 static FAILED: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
 /// Count one `rpc_error` reply by request type and error, to find app
-/// requests paseo-lite does not handle.
+/// requests feiyi does not handle.
 pub fn rpc_failed(request_type: &str, error: &str) {
     let key = format!("{request_type}: {error}");
     *FAILED.lock().unwrap().get_or_insert_with(HashMap::new).entry(key).or_default() += 1;

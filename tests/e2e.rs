@@ -31,7 +31,7 @@ fn free_port() -> u16 {
 
 fn unique_dir(tag: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-    let dir = std::env::temp_dir().join(format!("paseo-lite-e2e-{tag}-{}-{nanos}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("feiyi-e2e-{tag}-{}-{nanos}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
@@ -113,7 +113,7 @@ fn start_at(dir: PathBuf, password: Option<&str>, mode: &str) -> Daemon {
     // other test's daemon.
     for _ in 0..5 {
         let port = free_port();
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_paseo-lite"));
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_feiyi"));
         cmd.args(["--listen", &format!("127.0.0.1:{port}"), "--no-relay"])
             .env("PASEO_LITE_HOME", dir.join("home"))
             .env("PASEO_CLAUDE_BIN", &claude)
@@ -127,7 +127,7 @@ fn start_at(dir: PathBuf, password: Option<&str>, mode: &str) -> Daemon {
         if let Some(p) = password {
             cmd.env("PASEO_PASSWORD", p);
         }
-        let mut child = cmd.spawn().expect("start paseo-lite");
+        let mut child = cmd.spawn().expect("start feiyi");
         let deadline = Instant::now() + Duration::from_secs(20);
         let mut exited = false;
         while Instant::now() < deadline {

@@ -1,6 +1,6 @@
 //! Benchmark: the release daemon inside Docker containers sized like the small
 //! machines it targets (memory, CPU quota, no swap), driven over WebSocket like
-//! the app. paseo-lite reads its limits from the container's cgroup, so each
+//! the app. feiyi reads its limits from the container's cgroup, so each
 //! container also exercises the auto capacity it picks there.
 //!
 //! A fake `claude` (mawk, as in the image) stands in for Claude Code: it holds `BENCH_CLAUDE_MB`
@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_tungstenite::tungstenite::Message;
 
-const BIN: &str = env!("CARGO_BIN_EXE_paseo-lite");
+const BIN: &str = env!("CARGO_BIN_EXE_feiyi");
 const IMAGE: &str = "ubuntu:24.04";
 /// Chats started at once in the burst, and the turns each one runs.
 const BURST_AGENTS: usize = 6;
@@ -113,13 +113,13 @@ impl Drop for Container {
 }
 
 fn start(sys: &System, claude_mb: &str) -> (Container, Duration) {
-    let dir = std::env::temp_dir().join(format!("paseo-lite-bench-{}-{}", sys.id, std::process::id()));
+    let dir = std::env::temp_dir().join(format!("feiyi-bench-{}-{}", sys.id, std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("home")).unwrap();
     std::fs::create_dir_all(dir.join("work")).unwrap();
     let claude = fake_claude(&dir);
     let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-    let name = format!("paseo-lite-bench-{}-{}", sys.id, std::process::id());
+    let name = format!("feiyi-bench-{}-{}", sys.id, std::process::id());
     let user = format!("{}:{}", unsafe { libc::getuid() }, unsafe { libc::getgid() });
     let d = dir.display().to_string();
     let env = [
@@ -136,11 +136,11 @@ fn start(sys: &System, claude_mb: &str) -> (Container, Duration) {
         .iter()
         .map(|s| s.to_string())
         .collect();
-    args.extend(["-v".into(), format!("{d}:{d}"), "-v".into(), format!("{BIN}:/usr/local/bin/paseo-lite:ro")]);
+    args.extend(["-v".into(), format!("{d}:{d}"), "-v".into(), format!("{BIN}:/usr/local/bin/feiyi:ro")]);
     for e in &env {
         args.extend(["-e".into(), e.clone()]);
     }
-    args.extend([IMAGE.into(), "paseo-lite".into(), "--listen".into(), format!("127.0.0.1:{port}"), "--no-relay".into()]);
+    args.extend([IMAGE.into(), "feiyi".into(), "--listen".into(), format!("127.0.0.1:{port}"), "--no-relay".into()]);
     let started = Instant::now();
     docker(&args.iter().map(String::as_str).collect::<Vec<_>>());
     let pid: u32 = docker(&["inspect", "-f", "{{.State.Pid}}", name.as_str()]).parse().expect("container pid");
@@ -472,7 +472,7 @@ async fn small_machines() {
     println!("{md}");
     if let Ok(path) = std::env::var("GITHUB_STEP_SUMMARY") {
         let mut f = std::fs::OpenOptions::new().append(true).create(true).open(path).unwrap();
-        writeln!(f, "## paseo-lite benchmark\n\n{md}").unwrap();
+        writeln!(f, "## feiyi benchmark\n\n{md}").unwrap();
     }
     // The workflow collects these into the README.
     if let Ok(path) = std::env::var("BENCH_OUT") {

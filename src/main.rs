@@ -29,12 +29,12 @@ mod workspaces;
 use config::Config;
 use std::sync::Arc;
 
-const HELP: &str = "paseo-lite — low-resource daemon for Claude Code and Codex agents
+const HELP: &str = "feiyi — low-resource daemon for Claude Code and Codex agents
 
 USAGE:
-    paseo-lite [--listen HOST:PORT] [--no-relay]   run the daemon
-    paseo-lite pair                                print the pairing link + QR
-    paseo-lite help
+    feiyi [--listen HOST:PORT] [--no-relay]   run the daemon
+    feiyi pair                                print the pairing link + QR
+    feiyi help
 
 ENVIRONMENT (selection):
     PASEO_LITE_HOME          state dir (default ~/.paseo-lite)
@@ -50,7 +50,7 @@ ENVIRONMENT (selection):
     PASEO_DEFAULT_SYSTEM_PROMPT  instructions for every agent (default: do not run/test the app locally; set empty to disable)
     PASEO_CLAUDE_SUBAGENT_PROMPT  extra instructions for Claude Code agents (default: hand work to background sub-agents and stay free; set empty to disable)
     PASEO_CLAUDE_MAX_SUBAGENTS    sub-agents one Claude Code agent may run at once; none start while the machine is strained (default 3)
-    PASEO_DEBUG_MCP=0        do not give agents the built-in paseo-lite debug MCP server
+    PASEO_DEBUG_MCP=0        do not give agents the built-in feiyi debug MCP server
     PASEO_CAVEMAN            Token Saver terse-answer prompt level (always on): lite|full|ultra|wenyan-lite|wenyan|wenyan-ultra (default ultra)
     PASEO_PONYTAIL           Token Saver minimal-code prompt level (always on): lite|full|ultra (default ultra)
 ";
@@ -61,7 +61,7 @@ fn hostname() -> String {
         .or_else(|| std::fs::read_to_string("/etc/hostname").ok())
         .map(|h| h.trim().to_string())
         .filter(|h| !h.is_empty())
-        .unwrap_or_else(|| "paseo-lite".into())
+        .unwrap_or_else(|| "feiyi".into())
 }
 
 fn print_pairing(cfg: &Config, identity: &e2ee::DaemonIdentity) {
@@ -124,7 +124,7 @@ async fn run(cfg: Config, identity: Arc<e2ee::DaemonIdentity>) {
         home: cfg.home.clone(),
     });
 
-    crate::log!("paseo-lite {} serverId={} home={}", env!("CARGO_PKG_VERSION"), identity.server_id, cfg.home.display());
+    crate::log!("feiyi {} serverId={} home={}", env!("CARGO_PKG_VERSION"), identity.server_id, cfg.home.display());
     mcp::write_claude_config(&cfg);
     token_saver::write_claude_settings(&cfg);
     uploads::prune(&cfg.home);

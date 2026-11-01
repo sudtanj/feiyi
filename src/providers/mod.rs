@@ -86,7 +86,7 @@ pub fn claude_thinking_options() -> Value {
 
 /// Claude Code model catalog, ported from upstream's curated manifest
 /// (providers/claude/model-manifest.ts). Upstream verifies it with a probe
-/// process; paseo-lite skips the probe to avoid spawning `claude` just to
+/// process; feiyi skips the probe to avoid spawning `claude` just to
 /// list models. Mythos 5.1 is omitted because upstream only shows it after
 /// discovery confirms access.
 pub fn claude_models() -> Value {

@@ -20,7 +20,7 @@ pub struct Ctx {
     pub server_id: String,
     pub hostname: String,
     pub password: Option<String>,
-    /// paseo-lite home: uploads are stored under `uploads/`.
+    /// feiyi home: uploads are stored under `uploads/`.
     pub home: std::path::PathBuf,
 }
 
@@ -38,7 +38,7 @@ fn server_info(ctx: &Ctx) -> Arc<str> {
             "protocolVersion": WS_PROTOCOL_VERSION,
             "serverId": ctx.server_id,
             "hostname": ctx.hostname,
-            "version": concat!("paseo-lite-", env!("CARGO_PKG_VERSION")),
+            "version": concat!("feiyi-", env!("CARGO_PKG_VERSION")),
             // The app gates screens on these flags; only list what rpc.rs implements.
             // Add Project needs both projectAdd and stableProjectIdentity.
             "features": {

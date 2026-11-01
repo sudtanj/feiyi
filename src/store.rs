@@ -87,7 +87,7 @@ pub struct ProjectRecord {
     /// Display name override (`project.rename`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_name: Option<String>,
-    /// paseo-lite created this directory (clone / new folder): while it is
+    /// feiyi created this directory (clone / new folder): while it is
     /// still empty, removing the project deletes it without git checks.
     #[serde(default)]
     pub owned: bool,
@@ -97,7 +97,7 @@ pub struct ProjectRecord {
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceRecord {
     pub id: String,
-    /// Project id (the project root path, as everywhere else in paseo-lite).
+    /// Project id (the project root path, as everywhere else in feiyi).
     pub project_id: String,
     pub project_root: String,
     /// Directory agents in this workspace run in.

@@ -4,7 +4,7 @@
 //! https://github.com/rtk-ai/rtk), with the regexes rewritten as plain string
 //! checks so the binary needs no regex engine. zilong-router rewrites tool
 //! results inside proxied request bodies; here the same filters run on a
-//! command's output (`paseo-lite rtk`, see mod.rs).
+//! command's output (`feiyi rtk`, see mod.rs).
 
 use std::collections::BTreeMap;
 

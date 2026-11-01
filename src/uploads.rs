@@ -324,7 +324,7 @@ mod tests {
 
     #[tokio::test]
     async fn full_upload_round_trip() {
-        let home = std::env::temp_dir().join(format!("paseo-lite-up-{}", uuid::Uuid::new_v4()));
+        let home = std::env::temp_dir().join(format!("feiyi-up-{}", uuid::Uuid::new_v4()));
         let mut up = Uploads::default();
         let req = json!({ "type": "file.upload.request", "requestId": "r1", "fileName": "notes.txt", "mimeType": "text/plain", "size": 11, "modifiedAt": "x" });
         assert!(up.begin(&home, &req).is_none());
@@ -341,7 +341,7 @@ mod tests {
 
     #[tokio::test]
     async fn oversize_and_mismatch_are_rejected() {
-        let home = std::env::temp_dir().join(format!("paseo-lite-up-{}", uuid::Uuid::new_v4()));
+        let home = std::env::temp_dir().join(format!("feiyi-up-{}", uuid::Uuid::new_v4()));
         let mut up = Uploads::default();
         let too_big = json!({ "requestId": "big", "fileName": "x", "mimeType": "a/b", "size": MAX_UPLOAD_BYTES + 1 });
         assert!(up.begin(&home, &too_big).unwrap()["payload"]["error"].is_string());
@@ -354,7 +354,7 @@ mod tests {
 
     #[test]
     fn prompt_and_bubble() {
-        let home = std::env::temp_dir().join(format!("paseo-lite-up-{}", uuid::Uuid::new_v4()));
+        let home = std::env::temp_dir().join(format!("feiyi-up-{}", uuid::Uuid::new_v4()));
         let png = base64::engine::general_purpose::STANDARD.encode(b"\x89PNG fake");
         let att = json!([{ "type": "uploaded_file", "id": "u", "fileName": "spec.pdf", "mimeType": "application/pdf", "size": 3, "path": "/tmp/spec.pdf" }]);
         let prompt = build_prompt(&home, "look at this", Some(&json!([{ "data": png, "mimeType": "image/png" }])), Some(&att));

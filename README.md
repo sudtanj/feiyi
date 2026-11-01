@@ -1,27 +1,35 @@
-# paseo-lite
+# feiyi
 
-A Rust rewrite of the [Paseo](https://github.com/getpaseo/paseo) daemon for low-spec machines
-(small VMs, Raspberry Pi, free-tier cloud instances). It runs **Claude Code** and **Codex** agents
-across all your projects from a single process, and reuses Paseo's **end-to-end encrypted relay**,
-so you can pair it with the Paseo apps exactly like the Node daemon.
+A lightweight Rust daemon for the [Paseo](https://github.com/getpaseo/paseo) app: a rewrite of the
+Paseo daemon for low-spec machines (small VMs, Raspberry Pi, free-tier cloud instances). It runs
+**Claude Code** and **Codex** agents across all your projects from a single process, and reuses Paseo's
+**end-to-end encrypted relay**, so you can pair it with the Paseo apps exactly like the Node daemon.
+
+*The name:* Fei Yi (费祎), chancellor of Shu Han, was known for clearing heaps of state business quickly
+while still finding time to host guests, which is what a light daemon juggling many coding agents on a
+tiny VM tries to do.
+
+feiyi was called paseo-lite before. The `PASEO_*` environment variables (including `PASEO_LITE_HOME`)
+and the default data directory `~/.paseo-lite` keep their names for compatibility, so existing agents,
+history and pairing carry over without changes.
 
 ## What's different from upstream
 
-| | Paseo (Node) | paseo-lite |
+| | Paseo (Node) | feiyi |
 |---|---|---|
 | Daemon runtime | Node.js, multi-package | one static Rust binary, single-threaded tokio runtime |
 | Codex | one `codex app-server` **per agent**, plus throwaway ones for model listing | **one shared** `codex app-server` for every agent in every project; threads are routed by `threadId`, each with its own `cwd`; the model list is cached on disk |
 | Claude Code | one long-lived `claude` child per agent | **one shared** `claude` process (more when the machine allows, see below); a process is bound to one session and `cwd`, so switching agents replaces it (`--resume`) |
 | One CLI at a time | both run freely | only one CLI has a process at any time. All turns from every project and both providers share one FIFO queue. The active CLI stays warm (pre-started at launch for the last used provider). When the next queued turn needs the other CLI, it waits for running turns to finish, the active CLI is shut down, and the other one cold-starts and stays warm until the next switch. Codex model listing never starts Codex while Claude Code is active |
 | Queued messages | each waits for its own turn | messages sent to a chat while it is busy are combined into **one** turn when the current one finishes (same conversation, one round trip, the context is sent once). Each still shows as its own bubble; slash commands always run on their own |
-| Agents at once | each agent runs freely | `auto` by default: it starts at the ceiling below and drops one turn at a time when pressure builds up, then adds one back once turns are waiting and the machine has stayed calm for `PASEO_AUTO_STABLE_SECS` (memory stalls under 5%, low CPU pressure, little CPU throttling, room for one more agent's memory and processes, where memory held by warm idle Claude processes counts as room since the pool stops one when a turn needs it); running turns are never stopped, and spare warm processes are released. In Docker every figure is the container's: the cgroup memory limit (`--memory`, `memory.high`), CPU quota (`--cpus`, `--cpuset-cpus`), pids limit (`--pids-limit`) and the container's own pressure, re-read every minute so `docker update` applies live. The ceiling is what the memory limit fits at `PASEO_AGENT_MB` per agent, twice the CPU count, 64 pids per agent, and `PASEO_AUTO_MAX_AGENTS`; on a 1 GB VM with the paseo-lite init script (zram swap, `PASEO_AGENT_MB=135`, a 320-pids limit) that is four. A number in `PASEO_CLAUDE_MAX_LIVE` / `PASEO_CODEX_MAX_ACTIVE` fixes the cap instead |
+| Agents at once | each agent runs freely | `auto` by default: it starts at the ceiling below and drops one turn at a time when pressure builds up, then adds one back once turns are waiting and the machine has stayed calm for `PASEO_AUTO_STABLE_SECS` (memory stalls under 5%, low CPU pressure, little CPU throttling, room for one more agent's memory and processes, where memory held by warm idle Claude processes counts as room); when growing relied on that memory, one idle process is released before the extra turn starts. Running turns are never stopped, and spare warm processes are released. In Docker every figure is the container's: the cgroup memory limit (`--memory`, `memory.high`), CPU quota (`--cpus`, `--cpuset-cpus`), pids limit (`--pids-limit`) and the container's own pressure, re-read every minute so `docker update` applies live. The ceiling is the smallest of: what the memory limit (less 96 MB for the daemon) fits at `PASEO_AGENT_MB` per agent, twice the CPU count, what the pids limit fits at 64 pids per agent, and `PASEO_AUTO_MAX_AGENTS`; on a 1 GB VM set up with zram swap, `PASEO_AGENT_MB=135` and a 320-pids limit that is four. A number in `PASEO_CLAUDE_MAX_LIVE` / `PASEO_CODEX_MAX_ACTIVE` fixes the cap instead |
 | Staying in control | – | the daemon keeps the room to step in: agents get an OOM score above the daemon's own (Docker's `--oom-score-adj` is shared by the whole container), so the kernel kills an agent first; when the container is nearly out of memory or pids, the limit drops at once and every idle `claude` process is stopped (fixed caps included); warm-ups wait while the machine is strained |
 | Images and files | inline images and uploaded files | same protocol: images sent with a message and files uploaded through `file.upload` (binary frames, up to 100 MB) are saved under `~/.paseo-lite/uploads` (kept 14 days). The agent is told each file's path; images are also given to the model as images (Claude image blocks, Codex local images) |
 | Usage | plan limit windows from provider plugins | tokens and cost **per provider and model**, booked from the CLIs' own totals (Claude Code `modelUsage` incl. its USD cost; Codex `tokenUsage`, priced from LiteLLM's public price list, refreshed daily). Shown in the app's Usage screen: cost today / 7 / 30 days / all time, tokens, the in/cached/out split, the top models, the 30-day daily average, a 30-day projection, the prompt cache hit rate and each of the last 30 days, plus one card per model with its cost and tokens over 7 / 30 days and all time, the token split and the effective cost per 1M tokens; an agent's view adds its own spend. Costs are API list prices (what the tokens would cost through the API), not subscription billing. Days are UTC; kept in `~/.paseo-lite/usage.json` |
 | Usage limits | the turn fails; you send it again after the reset | the turn **waits** for the Claude / Codex usage limit to reset (time read from Claude's rate-limit event or Codex's rate-limit windows), then continues on its own and runs anything queued meanwhile; the chat says when. Sending a message tries again at once; stop cancels (`PASEO_RESUME_AFTER_LIMIT`) |
 | Timelines | in memory | append-only JSONL on disk; streamed chunks merged into one row; unloaded from memory after `PASEO_TIMELINE_UNLOAD_SECS` idle; tool output clipped to 16 KiB |
 | Data use | — | streamed text is sent to the app in ~150 ms batches instead of one message per delta; Claude Code runs with `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` (no telemetry or update checks); contexts are compacted at `PASEO_AUTO_COMPACT_TOKENS`. `diagnostics` lists the bytes sent to apps per message type |
-| MCP servers | per agent, per provider | one [zilong-router](https://github.com/sudtanj/zilong-router) MCP gateway (`PASEO_ZILONG_MCP_URL`) for every Claude Code and Codex agent, see [MCP: zilong-router](#mcp-zilong-router), plus the built-in `paseo-lite` debug MCP server (see [MCP: paseo-lite](#mcp-paseo-lite)); Paseo's own agent-control MCP server is not provided |
+| MCP servers | per agent, per provider | one [zilong-router](https://github.com/sudtanj/zilong-router) MCP gateway (`PASEO_ZILONG_MCP_URL`) for every Claude Code and Codex agent, see [MCP: zilong-router](#mcp-zilong-router), plus the built-in `feiyi` debug MCP server (see [MCP: feiyi](#mcp-feiyi)); Paseo's own agent-control MCP server is not provided |
 | Projects | — | a project is just a directory; adding one costs no process and no memory until an agent runs a turn |
 
 Idle cost is the daemon plus one warm process of the active CLI (`claude` or `codex app-server`). Set `PASEO_CODEX_KEEP_WARM=0` / `PASEO_CLAUDE_KEEP_WARM=0` to start them on demand and release them after `PASEO_CODEX_IDLE_SECS` / `PASEO_CLAUDE_IDLE_SECS` instead.
@@ -47,12 +55,12 @@ The default relay is `relay.paseo.sh:443`. You can point it at a self-hosted
 ### Web app on GitHub Pages
 
 `.github/workflows/pages.yml` builds the official Paseo web app (upstream `packages/app`, pinned to a
-release, `v0.12.0` by default) and publishes it at `https://sudtanj.github.io/paseo-lite/`, so you don't
-depend on app.paseo.sh and the app version stays one that works with paseo-lite. Run it from the
+release, `v0.12.0` by default) and publishes it at `https://sudtanj.github.io/feiyi/`, so you don't
+depend on app.paseo.sh and the app version stays one that works with feiyi. Run it from the
 Actions tab, optionally with another upstream tag. To make the pairing QR/link open this copy:
 
 ```sh
-PASEO_APP_BASE_URL=https://sudtanj.github.io/paseo-lite paseo-lite
+PASEO_APP_BASE_URL=https://sudtanj.github.io/feiyi feiyi
 ```
 
 The page is HTTPS, so it reaches the daemon through the relay (end-to-end encrypted, as with
@@ -84,7 +92,7 @@ the relay it is all a client needs, so treat it like a password. On this site it
 
 ## Protocol compatibility
 
-paseo-lite speaks Paseo's core WebSocket protocol subset with the upstream message names and shapes:
+feiyi speaks Paseo's core WebSocket protocol subset with the upstream message names and shapes:
 
 - `hello` → `status/server_info` handshake, plus `ping`/`pong`;
 - agents: `fetch_agents`, `fetch_agent`, `fetch_agent_history`, `create_agent` (with `initialPrompt`),
@@ -117,17 +125,17 @@ on unsupported features will show errors.
 **Removing a project** (or archiving its last workspace) archives its agents and deletes the local folder
 when that can't lose work: it must be a git repository with no uncommitted changes, no stashes, no
 other worktrees, every commit on a remote, and no ignored files beyond regenerable ones
-(`node_modules`, `target`, `dist`, `.venv`, …, and the runtime state Claude Code keeps under `.claude/`), so a `.env` keeps it. Cloning a repository again onto a kept checkout of it reuses that checkout instead of failing. A folder paseo-lite created
+(`node_modules`, `target`, `dist`, `.venv`, …, and the runtime state Claude Code keeps under `.claude/`), so a `.env` keeps it. Cloning a repository again onto a kept checkout of it reuses that checkout instead of failing. A folder feiyi created
 that is still empty is deleted without checks. Otherwise the folder is kept and the app is told why.
 Whatever the policy, only folders strictly inside your home directory are deleted, never one that
-holds paseo-lite's data or another project. See `PASEO_DELETE_PROJECT_FILES`.
+holds feiyi's data or another project. See `PASEO_DELETE_PROJECT_FILES`.
 
 **Notifications** work like upstream: the app registers its Expo push token, and when an agent
 finishes or needs permission, a client that's looking at that agent gets nothing, the most recently
 active client gets an in-app notice, and if nobody is active (phone locked, app closed) the phone
 gets a push notification via Expo.
 
-paseo-lite also serves a small built-in pairing page at `http://<listen>/` (one HTML file, no build step).
+feiyi also serves a small built-in pairing page at `http://<listen>/` (one HTML file, no build step).
 It shows only a password form; after the daemon accepts the password over `/ws` it shows the relay
 pairing QR code and link, and locks again after two minutes or when the tab is hidden. It never lists
 projects or agents (use the Paseo app for that), and it stays disabled when `PASEO_PASSWORD` is unset.
@@ -135,7 +143,7 @@ projects or agents (use the Paseo app for that), and it stays disabled when `PAS
 ## Build
 
 ```sh
-cargo build --release        # binary: target/release/paseo-lite
+cargo build --release        # binary: target/release/feiyi
 ```
 
 The release profile optimises for size (`opt-level="z"`, LTO, stripped). You can cross-compile
@@ -145,10 +153,10 @@ on a 1 GB VM is slow.
 ## Run
 
 ```sh
-paseo-lite                    # 127.0.0.1:6768 + relay; prints a pairing QR/link
-paseo-lite --no-relay         # direct connections only (LAN/Tailscale/SSH tunnel)
-paseo-lite pair               # print the pairing link again
-PASEO_LISTEN=0.0.0.0:6768 PASEO_PASSWORD=secret paseo-lite
+feiyi                    # 127.0.0.1:6768 + relay; prints a pairing QR/link
+feiyi --no-relay         # direct connections only (LAN/Tailscale/SSH tunnel)
+feiyi pair               # print the pairing link again
+PASEO_LISTEN=0.0.0.0:6768 PASEO_PASSWORD=secret feiyi
 ```
 
 `claude` and/or `codex` must be on `PATH` and already logged in. To use other binaries, set
@@ -168,7 +176,7 @@ PASEO_LISTEN=0.0.0.0:6768 PASEO_PASSWORD=secret paseo-lite
 | `PASEO_APP_BASE_URL` | `https://app.paseo.sh` | pairing link base |
 | `PASEO_CLAUDE_MAX_LIVE` | `auto` | max concurrent `claude` processes, or `auto` to follow the machine; extra prompts queue |
 | `PASEO_CLAUDE_KEEP_WARM` | `true` | keep the `claude` process warm and pre-start it |
-| `PASEO_CLAUDE_IDLE_SECS` | `90` | keep-warm time after a Claude turn (when keep-warm is off). A process with background work still running (sub-agents, `run_in_background` shell commands, workflows) is kept until it reports back (or goes 30 minutes without activity; 2 hours for shells and workflows, which show none until they finish); it is not evicted, but it takes no slot, so a prompt from another chat starts alongside it (while the machine is strained the prompt waits for it instead) |
+| `PASEO_CLAUDE_IDLE_SECS` | `90` | keep-warm time after a Claude turn (when keep-warm is off). A process with background work still running (sub-agents, including ones resumed with `SendMessage`, `run_in_background` shell commands, workflows) is kept until it reports back (or goes 30 minutes without activity; 2 hours for shells and workflows, which show none until they finish); it is not evicted, but it takes no slot, so a prompt from another chat starts alongside it (while the machine is strained the prompt waits for it instead). Background shells that went quiet stop holding the process once the CLI has no child processes left (their report was lost). On resume Claude Code replays "stopped before the previous session ended" notices as an empty turn ahead of the prompt; that turn is not taken for a "no response" failure, so no retry kills the process |
 | `PASEO_CODEX_IDLE_SECS` | `300` | idle time before the shared app-server exits (when keep-warm is off) |
 | `PASEO_CODEX_MAX_ACTIVE` | `auto` | max concurrent Codex turns, or `auto`; extra prompts queue |
 | `PASEO_AGENT_MB` | `300` | `auto`: memory budgeted per agent, for the ceiling and the room check |
@@ -190,14 +198,14 @@ PASEO_LISTEN=0.0.0.0:6768 PASEO_PASSWORD=secret paseo-lite
 | `PASEO_TIMELINE_UNLOAD_SECS` | `600` | drop idle timelines from memory |
 | `PASEO_DEFAULT_SYSTEM_PROMPT` | built-in low-resource note | instructions added to every agent (Claude `--append-system-prompt`, Codex `developerInstructions`); the default tells agents not to run, serve or test the app locally on a small VM. Set to an empty string to disable |
 | `PASEO_CLAUDE_SUBAGENT_PROMPT` | built-in sub-agent note | instructions added to Claude Code agents only, after the ones above; the default tells them to hand bigger or independent parts of a task to parallel background sub-agents (Agent tool) and end the turn at once, without waiting or polling, so the chat stays free for your next message while they work; each result comes back as a notification the CLI acts on in a turn of its own, which the daemon records like any other (the same for background shell commands and workflows; their cards get their final status even when no turn follows). Sub-agents live inside the agent's own `claude` process, so they add parallelism on a machine that fits only one process. Set to an empty string to disable |
-| `PASEO_CLAUDE_MAX_SUBAGENTS` | `3` | sub-agents (foreground or background) one Claude Code agent may run at once. The daemon registers a `PreToolUse` hook for `Agent`/`Task` and refuses further launches, with a reason the model acts on, until one reports back; while the machine is strained (memory or CPU pressure, low free memory) it starts none, and running ones carry on. A hook deny applies in every permission mode, Bypass included. Background shell commands and workflows don't count. `0` = no sub-agents |
+| `PASEO_CLAUDE_MAX_SUBAGENTS` | `3` | sub-agents (foreground or background) one Claude Code agent may run at once. The daemon registers a `PreToolUse` hook for `Agent`/`Task` and refuses further launches, with a reason the model acts on, until one reports back; once the machine has been strained (memory or CPU pressure, low free memory) for 10 s, or at once when it is critical, it starts none, and running ones carry on. A background sub-agent silent for 30 minutes stops counting against the cap (its report is taken for lost). A hook deny applies in every permission mode, Bypass included. Background shell commands and workflows don't count. `0` = no sub-agents |
 | `PASEO_ZILONG_MCP_URL` | – | zilong-router MCP gateway (`http://<router>:20128/mcp`) for every Claude Code and Codex agent. See [MCP: zilong-router](#mcp-zilong-router) |
 | `PASEO_ZILONG_API_KEY` | – | its API key, sent as a Bearer token |
-| `PASEO_DEBUG_MCP` | on | `0`/`false`/`off` stops giving agents the built-in `paseo-lite` debug MCP server. See [MCP: paseo-lite](#mcp-paseo-lite) |
+| `PASEO_DEBUG_MCP` | on | `0`/`false`/`off` stops giving agents the built-in `feiyi` debug MCP server. See [MCP: feiyi](#mcp-feiyi) |
 | `PASEO_CAVEMAN` | `ultra` | Token Saver terse-answer prompt level (always on): `lite`, `full`, `ultra`, `wenyan-lite`, `wenyan`, `wenyan-ultra`. See [Token Saver](#token-saver) |
 | `PASEO_PONYTAIL` | `ultra` | Token Saver minimal-code prompt level (always on): `lite`, `full`, `ultra` |
 
-A systemd unit is in `contrib/paseo-lite.service`.
+A systemd unit is in `contrib/feiyi.service`.
 
 ## MCP: zilong-router
 
@@ -207,7 +215,7 @@ it as one Streamable HTTP server, `zilong-router`, next to the servers in your `
 and `~/.codex/config.toml`. Register the actual MCP servers in the router's dashboard.
 
 - Claude Code: `--mcp-config ~/.paseo-lite/claude-mcp.json`, written at startup with mode 0600 (it also holds
-  the `paseo-lite` server below; removed when neither is configured).
+  the `feiyi` server below; removed when neither is configured).
 - Codex: `codex app-server -c mcp_servers.zilong-router.url=… -c mcp_servers.zilong-router.bearer_token_env_var="PASEO_ZILONG_API_KEY"`.
 - `PASEO_ZILONG_API_KEY` is sent as `Authorization: Bearer …`; leave it unset for a router on loopback that doesn't
   require keys. The key never appears on a command line, but the agents inherit it in their environment.
@@ -222,9 +230,9 @@ env:
   PASEO_ZILONG_API_KEY: ${{ secrets.PASEO_ZILONG_API_KEY }}
 ```
 
-## MCP: paseo-lite
+## MCP: feiyi
 
-Every Claude Code and Codex agent (and its sub-agents) also gets `paseo-lite`, an MCP server built into the daemon
+Every Claude Code and Codex agent (and its sub-agents) also gets `feiyi`, an MCP server built into the daemon
 for inspecting and debugging the daemon itself. It is served on the daemon's own listener as `POST /mcp` (Streamable
 HTTP, JSON replies only, no sessions) at `http://127.0.0.1:<port>/mcp`, the port taken from `PASEO_LISTEN`; it is
 disabled, with a warning, when no local address can be derived from it. Requests need `Authorization: Bearer <token>`,
@@ -234,7 +242,7 @@ a random token made at each daemon start, and must come from this machine. Claud
 
 | Tool | What it returns |
 |---|---|
-| `daemon_status` | version, pid, uptime, config with secrets redacted, turn capacity (limit, running, queued, ceiling and what bounds it, last grow/shrink decision), cgroup memory/swap/pids, memory and CPU pressure, load average |
+| `daemon_status` | version, pid, uptime, config with secrets redacted (Token Saver levels under `config.tokenSaver`), turn capacity (limit, running, queued, ceiling and what bounds it, last grow/shrink decision), cgroup memory/swap/pids, memory and CPU pressure, load average, and `rpcErrors`: the `rpc_error` replies sent to apps since start, counted by request type and error |
 | `list_agents` | `{limit=20, includeArchived=false}`: the most recently updated agents: provider, title, cwd, status, CLI slot or queue position, queued messages, retry/limit state, last activity and error, pending permissions |
 | `agent_timeline` | `{agentId, limit=50}`: the agent's latest timeline rows, long text cut to ~2000 characters |
 | `agent_processes` | live `claude` processes (agent, pid, busy, holding sub-agents, idle time, RSS/swap and descendants from `/proc`), prompts waiting for a slot, the shared `codex app-server` |
@@ -242,17 +250,18 @@ a random token made at each daemon start, and must come from this machine. Claud
 | `list_projects` | projects and workspaces with agent counts |
 | `rpc` | `{message}`: one app-protocol session message through the same handler the app uses, returning its replies. Can change state |
 
-Set `PASEO_DEBUG_MCP=0` to turn it off.
+Set `PASEO_DEBUG_MCP=0` to turn it off. The server was named `paseo-lite` before the rename, so Claude Code
+permission rules for its tools must now name `mcp__feiyi__…`.
 
 ## Token Saver
 
-Ported from zilong-router's Token Saver (9router's page of the same name). zilong-router rewrites proxied API requests; paseo-lite does not proxy the API, so it works through the CLIs instead:
+Ported from zilong-router's Token Saver (9router's page of the same name). zilong-router rewrites proxied API requests; feiyi does not proxy the API, so it works through the CLIs instead:
 
 - **Caveman** (`PASEO_CAVEMAN=lite|full|ultra|wenyan-lite|wenyan|wenyan-ultra`, `ultra` by default): a terse-style system prompt for shorter answers.
 - **Ponytail** (`PASEO_PONYTAIL=lite|full|ultra`, `ultra` by default): biases the model toward minimal code.
 
-  Both are appended to every agent's system prompt after the other instructions (Claude `--append-system-prompt`, Codex `developerInstructions`). The Token Saver is always on: `off` or an unknown level logs a warning and uses `ultra`.
-- **RTK** (always on; Claude Code only): compacts the output of git status/diff/log/show, grep/rg, find, ls, tree and cargo/npm/go build and test before it reaches the model, often 60-90% fewer tokens. At startup the daemon writes `~/.paseo-lite/claude-settings.json` with a `PreToolUse` hook on Bash (`paseo-lite rtk-hook`, 5 s timeout) and starts `claude` with `--settings <that file>`, which adds to your own settings. The hook rewrites a plain, single command of that kind to `paseo-lite rtk -- '<command>'`, which runs it with `sh -c` (stderr merged into stdout, stdin and exit code kept) and prints the compressed output with a one-line note, or the output as is when no filter matched. Anything else runs unchanged: pipes, `&&`/`||`/`;`/`&`, redirections other than `2>&1`, heredocs, `$`/backtick expansion, `cd`, variable prefixes, background shells, and any error in the hook. It only rewrites in **Bypass** mode, and never sets a permission decision: Claude Code checks permissions against the rewritten command, so in the other modes it would stop matching your allow rules and the read-only command list and ask where it otherwise wouldn't. Append `| cat` to a command to see its raw output. Codex agents get no RTK for now: Codex's own `PreToolUse` hooks (with `updatedInput`) sit behind the experimental `codex_hooks` feature and a hook-trust step, which paseo-lite does not turn on.
+  Both are always on at `ultra` by default and appended to every agent's system prompt after the other instructions (Claude `--append-system-prompt`, Codex `developerInstructions`). `PASEO_CAVEMAN` / `PASEO_PONYTAIL` only choose another level; they can't be turned off: `off` or an unknown level logs a warning and uses `ultra`.
+- **RTK** (always on, no setting; Claude Code only, and it rewrites only in **Bypass** mode): compacts the output of git status/diff/log/show, grep/rg, find, ls, tree and cargo/npm/go build and test before it reaches the model, often 60-90% fewer tokens. At startup the daemon writes `~/.paseo-lite/claude-settings.json` with a `PreToolUse` hook on Bash (`feiyi rtk-hook`, 5 s timeout) and starts `claude` with `--settings <that file>`, which adds to your own settings. The hook rewrites a plain, single command of that kind to `feiyi rtk -- '<command>'`, which runs it with `sh -c` (stderr merged into stdout, stdin and exit code kept) and prints the compressed output with a one-line note, or the output as is when no filter matched. Anything else runs unchanged: pipes, `&&`/`||`/`;`/`&`, redirections other than `2>&1`, heredocs, `$`/backtick expansion, `cd`, variable prefixes, background shells, and any error in the hook. It only rewrites in **Bypass** mode, and never sets a permission decision: Claude Code checks permissions against the rewritten command, so in the other modes it would stop matching your allow rules and the read-only command list and ask where it otherwise wouldn't. Append `| cat` to a command to see its raw output. Codex agents get no RTK for now: Codex's own `PreToolUse` hooks (with `updatedInput`) sit behind the experimental `codex_hooks` feature and a hook-trust step, which feiyi does not turn on.
 
 `daemon_status` shows the active settings under `config.tokenSaver`.
 
@@ -261,6 +270,7 @@ Ported from zilong-router's Token Saver (9router's page of the same name). zilon
 ```
 src/main.rs              entry, runtime, signals
 src/manager.rs           agent state actor: turns, queueing, timeline merge, persistence
+src/capacity.rs          auto capacity: ceiling, pressure readings, grow/shrink
 src/rpc.rs               Paseo session RPC handlers
 src/snapshot.rs          wire projections (agent snapshot, workspace, timeline entry)
 src/session.rs           per-connection hello/auth + fan-out (transport agnostic)
@@ -268,17 +278,18 @@ src/server.rs            HTTP + /ws + embedded UI
 src/relay.rs, e2ee.rs    relay v2 client + NaCl box channel
 src/providers/claude*.rs Claude Code pool + stream-json parser
 src/providers/codex*.rs  shared Codex app-server client + event mapping
-src/mcp.rs               MCP servers for agents (zilong-router, paseo-lite) as Claude --mcp-config / Codex -c overrides
-src/mcp_server.rs        the built-in paseo-lite debug MCP server (/mcp)
+src/mcp.rs               MCP servers for agents (zilong-router, feiyi) as Claude --mcp-config / Codex -c overrides
+src/mcp_server.rs        the built-in feiyi debug MCP server (/mcp)
 src/token_saver/         Token Saver: Caveman/Ponytail prompts, RTK output compression + Claude Bash hook
 src/store.rs             agents.json + JSONL timelines
 src/usage.rs             token/cost ledger per provider and model, price list
 web/index.html           built-in pairing page (QR behind the password)
+contrib/feiyi.service    systemd user unit
 ```
 
 ## Support the project
 
-paseo-lite is built and maintained by one person in their spare time. If it saves you time or money, you can support continued development:
+feiyi is built and maintained by one person in their spare time. If it saves you time or money, you can support continued development:
 
 - **GitHub Sponsors:** https://github.com/sponsors/sudtanj (monthly or one-time)
 - **Star the repo**, report bugs and share it: it helps more than you'd think.
@@ -307,7 +318,7 @@ CI runs the unit and integration tests on every push and pull request, and the r
 The Benchmark workflow (`.github/workflows/bench.yml`) runs `tests/bench.rs` on an amd64 and an arm64
 runner whenever code changes on `main` (or from the Actions tab), and rewrites the numbers below and in
 the summary near the top. Each simulated machine is a Docker container with that machine's memory
-(swap off) and CPU quota. paseo-lite reads its limits from the container's cgroup, so the auto capacity
+(swap off) and CPU quota. feiyi reads its limits from the container's cgroup, so the auto capacity
 it picks is the one it would pick on that machine:
 
 | System | Runner | Memory | CPUs |

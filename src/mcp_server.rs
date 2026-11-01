@@ -1,4 +1,4 @@
-//! The built-in `paseo-lite` MCP server: `POST /mcp` on the daemon's own
+//! The built-in `feiyi` MCP server: `POST /mcp` on the daemon's own
 //! HTTP listener (server.rs), given to every Claude Code and Codex agent
 //! (mcp.rs) so an agent can inspect and debug the daemon that runs it.
 //!
@@ -28,7 +28,7 @@ use tokio::sync::{mpsc, oneshot};
 /// Supported protocol revisions, newest first (the default).
 const PROTOCOL_VERSIONS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
 
-const INSTRUCTIONS: &str = "Inspect the paseo-lite daemon that runs this agent: its status, capacity and memory (daemon_status), agents and their queues (list_agents, agent_timeline), the claude/codex processes (agent_processes), its recent log (daemon_logs) and projects (list_projects). `rpc` sends one app-protocol request as the Paseo app would and can change state.";
+const INSTRUCTIONS: &str = "Inspect the feiyi daemon that runs this agent: its status, capacity and memory (daemon_status), agents and their queues (list_agents, agent_timeline), the claude/codex processes (agent_processes), its recent log (daemon_logs) and projects (list_projects). `rpc` sends one app-protocol request as the Paseo app would and can change state.";
 
 /// How long a manager-backed tool waits for the manager.
 const MANAGER_WAIT: Duration = Duration::from_secs(15);
@@ -143,7 +143,7 @@ fn tool(name: &str, description: &str, properties: Value, required: &[&str], rea
 
 fn tools() -> Vec<Value> {
     vec![
-        tool("daemon_status", "paseo-lite daemon status: version, pid, uptime, config (secrets redacted), turn capacity (limit, running, queued, ceiling and what bounds it, last grow/shrink decision), cgroup memory/swap/pids, memory and CPU pressure (PSI), load average, daemon RSS.", json!({}), &[], true),
+        tool("daemon_status", "feiyi daemon status: version, pid, uptime, config (secrets redacted), turn capacity (limit, running, queued, ceiling and what bounds it, last grow/shrink decision), cgroup memory/swap/pids, memory and CPU pressure (PSI), load average, daemon RSS.", json!({}), &[], true),
         tool("list_agents", "All agents the daemon knows (most recently updated first): id, provider, title, cwd, status, active turn, whether it holds a CLI slot or waits in the queue, queued follow-up messages, retry/usage-limit state, last activity and error, pending permission requests.", json!({ "includeArchived": { "type": "boolean", "description": "Include archived agents (default false)." }, "limit": { "type": "integer", "minimum": 1, "maximum": 500, "description": "Most recently updated agents to return (default 20)." } }), &[], true),
         tool("agent_timeline", "Recent timeline rows of one agent (user messages, assistant text, reasoning, tool calls, notifications), oldest first, long text cut to ~2000 chars.", json!({ "agentId": { "type": "string", "description": "Agent id, a unique id prefix (4+ chars) or the exact title." }, "limit": { "type": "integer", "description": "Rows from the end (default 50, max 500).", "minimum": 1, "maximum": 500 } }), &["agentId"], true),
         tool("agent_processes", "Provider child processes: each live `claude` process (agent id, pid, busy, holding background sub-agents, idle time, RSS/swap from /proc and its descendant processes), prompts waiting for a Claude slot, and the shared `codex app-server` (pid, active turns, memory), plus the daemon's own memory.", json!({}), &[], true),
@@ -661,7 +661,7 @@ mod tests {
         let init = |v: &str| json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": { "protocolVersion": v, "capabilities": {}, "clientInfo": { "name": "t", "version": "1" } } });
         let r = dispatch(&ctx, init("2025-03-26")).await.unwrap();
         assert_eq!(r["result"]["protocolVersion"], "2025-03-26");
-        assert_eq!(r["result"]["serverInfo"]["name"], "paseo-lite");
+        assert_eq!(r["result"]["serverInfo"]["name"], "feiyi");
         assert_eq!(r["result"]["serverInfo"]["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(r["result"]["capabilities"], json!({ "tools": {} }));
         let r = dispatch(&ctx, init("1999-01-01")).await.unwrap();

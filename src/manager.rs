@@ -225,7 +225,7 @@ impl Manager {
     }
 
     /// Add a directory to the project registry (idempotent) and return its
-    /// descriptor. `owned`: paseo-lite created the directory itself.
+    /// descriptor. `owned`: feiyi created the directory itself.
     pub fn register_project(&mut self, path: &str, owned: bool) -> Value {
         match self.projects.iter_mut().find(|p| p.root_path == path) {
             Some(p) => {
@@ -976,7 +976,7 @@ impl Manager {
             let provider = a.rec.provider.clone();
             let turn_id = a.active_turn.as_ref().map(|t| t.0.clone());
             crate::log!("resuming interrupted turn for agent {id}");
-            let note = json!({ "type": "notification", "level": "info", "message": "paseo-lite restarted while this agent was working. Resuming where it left off." });
+            let note = json!({ "type": "notification", "level": "info", "message": "feiyi restarted while this agent was working. Resuming where it left off." });
             self.append_item(&id, note);
             self.stream(&id, &provider, json!({ "type": "turn_started", "provider": provider, "turnId": turn_id }));
             self.publish_agent(&id);

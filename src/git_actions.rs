@@ -245,7 +245,7 @@ async fn mutated(ctx: &GitCtx, cwd: &str, payload: Value) -> Value {
     payload
 }
 
-/// Upstream asks a model for a message when none is given; paseo-lite writes
+/// Upstream asks a model for a message when none is given; feiyi writes
 /// a plain one from the staged changes instead of spending a model call.
 async fn auto_commit_message(dir: &Path) -> String {
     let names = git(dir, &["diff", "--cached", "--name-only"]).await.unwrap_or_default();

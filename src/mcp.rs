@@ -5,7 +5,7 @@
 //! - `zilong-router`: the external gateway (`PASEO_ZILONG_MCP_URL`), when set.
 //!   Its API key (`PASEO_ZILONG_API_KEY`) reaches Codex through the
 //!   environment it inherits (`bearer_token_env_var`).
-//! - `paseo-lite`: the daemon's own debug server (`/mcp`, mcp_server.rs), on
+//! - `feiyi`: the daemon's own debug server (`/mcp`, mcp_server.rs), on
 //!   unless `PASEO_DEBUG_MCP=0`. Its bearer token is random per daemon start
 //!   and reaches Codex as `PASEO_LITE_MCP_TOKEN` on the app-server's
 //!   environment.
@@ -20,7 +20,7 @@ use std::path::PathBuf;
 
 pub const NAME: &str = "zilong-router";
 pub const KEY_ENV: &str = "PASEO_ZILONG_API_KEY";
-pub const DEBUG_NAME: &str = "paseo-lite";
+pub const DEBUG_NAME: &str = "feiyi";
 pub const DEBUG_TOKEN_ENV: &str = "PASEO_LITE_MCP_TOKEN";
 
 /// The daemon's own MCP server: where agents reach it and the token they need.
@@ -209,7 +209,7 @@ mod tests {
         cfg.zilong_mcp_url = None;
         cfg.debug_mcp = Some(debug("http://127.0.0.1:6768/mcp"));
         let args = codex_args(&cfg).join(" ");
-        assert_eq!(args, r#"-c mcp_servers.paseo-lite.url="http://127.0.0.1:6768/mcp" -c mcp_servers.paseo-lite.bearer_token_env_var="PASEO_LITE_MCP_TOKEN""#);
+        assert_eq!(args, r#"-c mcp_servers.feiyi.url="http://127.0.0.1:6768/mcp" -c mcp_servers.feiyi.bearer_token_env_var="PASEO_LITE_MCP_TOKEN""#);
         assert!(!args.contains("t0ken"));
         assert_eq!(codex_env(&cfg), vec![(DEBUG_TOKEN_ENV, "t0ken".to_string())]);
     }
@@ -223,12 +223,12 @@ mod tests {
         cfg.debug_mcp = Some(debug("http://127.0.0.1:6768/mcp"));
         let only_debug = claude_config_json(&cfg).unwrap();
         assert_eq!(only_debug["mcpServers"].as_object().unwrap().len(), 1);
-        assert_eq!(only_debug["mcpServers"]["paseo-lite"], json!({ "type": "http", "url": "http://127.0.0.1:6768/mcp", "headers": { "Authorization": "Bearer t0ken" } }));
+        assert_eq!(only_debug["mcpServers"]["feiyi"], json!({ "type": "http", "url": "http://127.0.0.1:6768/mcp", "headers": { "Authorization": "Bearer t0ken" } }));
         cfg.zilong_mcp_url = Some("http://pi:20128/mcp".into());
         cfg.zilong_api_key = Some("sk-secret".into());
         let both = claude_config_json(&cfg).unwrap();
         assert_eq!(both["mcpServers"]["zilong-router"]["headers"]["Authorization"], "Bearer sk-secret");
-        assert_eq!(both["mcpServers"]["paseo-lite"]["url"], "http://127.0.0.1:6768/mcp");
+        assert_eq!(both["mcpServers"]["feiyi"]["url"], "http://127.0.0.1:6768/mcp");
     }
 
     #[test]

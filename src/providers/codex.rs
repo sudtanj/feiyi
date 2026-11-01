@@ -107,7 +107,7 @@ impl Codex {
         }
         self.spawn()?;
         let init = json!({
-            "clientInfo": { "name": "paseo_lite", "title": "Paseo Lite", "version": env!("CARGO_PKG_VERSION") },
+            "clientInfo": { "name": "feiyi", "title": "Feiyi", "version": env!("CARGO_PKG_VERSION") },
             "capabilities": { "experimentalApi": true },
         });
         if let Err(e) = self.request("initialize", init, Duration::from_secs(30)).await {

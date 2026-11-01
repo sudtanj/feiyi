@@ -157,7 +157,7 @@ async fn request(method: &str, host: &str, path: &str, body: Option<&str>, max: 
         let _ = tcp.set_nodelay(true);
         let name = rustls::pki_types::ServerName::try_from(host.to_string()).map_err(|e| e.to_string())?;
         let mut tls = tokio_rustls::TlsConnector::from(crate::relay::tls_config()).connect(name, tcp).await.map_err(|e| e.to_string())?;
-        let agent = format!("paseo-lite/{}", env!("CARGO_PKG_VERSION"));
+        let agent = format!("feiyi/{}", env!("CARGO_PKG_VERSION"));
         let request = match body {
             Some(body) => format!(
                 "{method} {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nAccept: application/json\r\nUser-Agent: {agent}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -242,7 +242,7 @@ mod tests {
 
     #[test]
     fn token_store_lease_and_revoke() {
-        let dir = std::env::temp_dir().join(format!("paseo-lite-push-{}", crate::util::new_id()));
+        let dir = std::env::temp_dir().join(format!("feiyi-push-{}", crate::util::new_id()));
         std::fs::create_dir_all(&dir).unwrap();
         let mut store = TokenStore::load(&dir);
         store.renew("ExponentPushToken[abc]");

@@ -2,11 +2,11 @@
 //!
 //! The rule is "never destroy work that can't be recovered": a directory is
 //! deleted when git shows everything in it already exists on a remote (or it
-//! is a still-empty folder paseo-lite created). Anything else is kept and the
+//! is a still-empty folder feiyi created). Anything else is kept and the
 //! reason is reported back. `PASEO_DELETE_PROJECT_FILES=all` drops the git
 //! check, `never` disables deletion. Whatever the policy, only directories
 //! strictly inside the user's home are deleted, never one holding
-//! paseo-lite's data or another known project.
+//! feiyi's data or another known project.
 
 use crate::checkout::git;
 use std::path::{Path, PathBuf};
@@ -57,7 +57,7 @@ fn passwd_home() -> Option<PathBuf> {
 }
 
 /// Why `path` must never be deleted, if it mustn't. `others` are every other
-/// directory paseo-lite knows about (projects and agent cwds).
+/// directory feiyi knows about (projects and agent cwds).
 fn protected(path: &Path, daemon_home: &Path, others: &[String]) -> Option<String> {
     if !path.is_absolute() {
         return Some("not an absolute path".into());
@@ -80,7 +80,7 @@ fn protected(path: &Path, daemon_home: &Path, others: &[String]) -> Option<Strin
     }
     let inside = |other: &Path| std::fs::canonicalize(other).map(|o| o.starts_with(&canon)).unwrap_or(false);
     if inside(daemon_home) {
-        return Some("it contains paseo-lite's data".into());
+        return Some("it contains feiyi's data".into());
     }
     if let Some(other) = others.iter().find(|o| Path::new(o.as_str()) != path && inside(Path::new(o.as_str()))) {
         return Some(format!("it contains another project ({other})"));
@@ -194,7 +194,7 @@ pub async fn delete_project_dir(dir: String, owned: bool, policy: Policy, daemon
     if let Some(reason) = protected(path, &daemon_home, &others) {
         return Err(format!("kept {dir}: {reason}"));
     }
-    // A folder paseo-lite created and nobody used yet goes without checks;
+    // A folder feiyi created and nobody used yet goes without checks;
     // everything else (even our own clones, which may hold weeks of work)
     // must be recoverable from a remote.
     let fresh = owned && is_empty_dir(path);
@@ -240,7 +240,7 @@ mod tests {
         assert!(!claude_runtime(".claude/settings.local.json"));
         assert!(!claude_runtime(".claude/worktrees/feature/src/main.rs"));
         assert!(!claude_runtime("not.claude/first-run"));
-        let root = std::env::temp_dir().join(format!("paseo-lite-claude-{}", crate::util::new_id()));
+        let root = std::env::temp_dir().join(format!("feiyi-claude-{}", crate::util::new_id()));
         std::fs::create_dir_all(root.join(".claude/checkpoints")).unwrap();
         std::fs::write(root.join(".claude/scheduled_tasks.lock"), "{}").unwrap();
         std::fs::write(root.join(".claude/checkpoints/a"), "x").unwrap();
@@ -264,7 +264,7 @@ mod tests {
         let home = std::env::temp_dir();
         let r = delete_project_dir("/tmp".into(), true, Policy::Never, home.clone(), vec![]).await;
         assert!(r.is_err());
-        let gone = format!("/tmp/paseo-lite-missing-{}", crate::util::new_id());
+        let gone = format!("/tmp/feiyi-missing-{}", crate::util::new_id());
         assert_eq!(delete_project_dir(gone, true, Policy::Safe, home, vec![]).await, Ok(false));
     }
 }

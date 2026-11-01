@@ -32,7 +32,7 @@ impl Manager {
             "set_agent_thinking_request" => self.set_thinking(msg, &agent_key, kind, rid, out),
             "set_agent_feature_request" => {
                 let id = self.resolve(&agent_key).unwrap_or(agent_key);
-                action_reply(out, kind, rid, &id, Some("paseo-lite has no configurable agent features"));
+                action_reply(out, kind, rid, &id, Some("feiyi has no configurable agent features"));
             }
             "refresh_agent_request" => self.refresh_agent(&agent_key, kind, rid, out),
             "resume_agent_request" => self.resume_agent(msg, kind, rid, out),
@@ -421,7 +421,7 @@ impl Manager {
         let cfg = &self.cfg;
         let rt = self.runtime_status();
         let mut lines = vec![
-            format!("paseo-lite {} (pid {}, started {})", env!("CARGO_PKG_VERSION"), std::process::id(), self.started_at),
+            format!("feiyi {} (pid {}, started {})", env!("CARGO_PKG_VERSION"), std::process::id(), self.started_at),
             format!("server id: {}", self.server_id),
             format!("listen: {}", cfg.listen),
             format!("relay: {}", if cfg.relay_enabled { format!("{} (tls {})", cfg.relay_endpoint, cfg.relay_use_tls) } else { "disabled".into() }),
@@ -491,7 +491,7 @@ impl Manager {
 
     /// Unregister a project: archive its workspaces and their agents
     /// (reversible: prompting an archived agent restores it) and forget it.
-    /// Returns whether paseo-lite created the directory (None when it was
+    /// Returns whether feiyi created the directory (None when it was
     /// not a registered project) and the archived workspace ids.
     fn drop_project(&mut self, path: &str) -> (Option<bool>, Vec<String>) {
         let owned = self.projects.iter().find(|p| p.root_path == path).map(|p| p.owned);

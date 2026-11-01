@@ -1,11 +1,11 @@
 //! The app-editable daemon config (`get_daemon_config` / `set_daemon_config`),
-//! persisted in `daemon-config.json`. paseo-lite acts on:
+//! persisted in `daemon-config.json`. feiyi acts on:
 //! - `providers.<id>.additionalModels`: custom models added to that
 //!   provider's model list (snapshot, model picker),
 //! - `providers.<id>.enabled`: shown as the provider's enabled flag,
 //! - `appendSystemPrompt`: added to every agent's instructions.
 //! Everything else is stored and echoed back so the settings screen
-//! round-trips, but paseo-lite's own settings come from environment variables.
+//! round-trips, but feiyi's own settings come from environment variables.
 
 use crate::config::Config;
 use serde_json::{json, Map, Value};
@@ -152,7 +152,7 @@ impl DaemonConfig {
                         }
                     }
                 }
-                // Environment-controlled in paseo-lite; not stored.
+                // Environment-controlled in feiyi; not stored.
                 "mcp" | "hostnames" | "app" | "relay" => {}
                 _ => {
                     self.stored.insert(key.clone(), value.clone());
@@ -168,7 +168,7 @@ mod tests {
     use super::*;
 
     fn config() -> DaemonConfig {
-        let dir = std::env::temp_dir().join(format!("paseo-lite-cfg-{}", crate::util::new_id()));
+        let dir = std::env::temp_dir().join(format!("feiyi-cfg-{}", crate::util::new_id()));
         std::fs::create_dir_all(&dir).unwrap();
         DaemonConfig::load(&dir)
     }
@@ -212,7 +212,7 @@ mod tests {
 
     #[test]
     fn append_system_prompt_round_trip_and_persistence() {
-        let dir = std::env::temp_dir().join(format!("paseo-lite-cfg-{}", crate::util::new_id()));
+        let dir = std::env::temp_dir().join(format!("feiyi-cfg-{}", crate::util::new_id()));
         std::fs::create_dir_all(&dir).unwrap();
         let mut c = DaemonConfig::load(&dir);
         assert!(c.append_system_prompt().is_none());

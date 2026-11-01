@@ -1,4 +1,4 @@
-paseo-lite licensing
+feiyi licensing
 ====================
 
 This repository contains two layers of work, under different terms.
@@ -28,7 +28,7 @@ This repository contains two layers of work, under different terms.
    https://github.com/sudtanj (GitHub profile / sponsors page).
 
 2. Upstream-derived code: Apache License 2.0
-   paseo-lite is derived from Paseo (https://github.com/getpaseo/paseo),
+   feiyi is derived from Paseo (https://github.com/getpaseo/paseo),
    Copyright (c) 2025-present Mohamed Boudra. The portions derived from
    Paseo (the relay transport, the E2EE channel, the wire-protocol shapes
    and anything else ported from it) remain under the Apache License,

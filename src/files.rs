@@ -3,7 +3,7 @@
 //!
 //! - `file_explorer_request`: list a directory (newest first, dangling links
 //!   skipped) or read a file (text inline, images base64, binaries as
-//!   metadata only). paseo-lite has no outbound binary channel, so
+//!   metadata only). feiyi has no outbound binary channel, so
 //!   `acceptBinary` gets the inline JSON fallback, as upstream does for such clients;
 //! - `file_download_token_request`, redeemed once within 60 s at
 //!   `GET /api/files/download?token=…` on the direct HTTP listener (see server.rs);
@@ -671,7 +671,7 @@ mod tests {
 
     /// A temp dir holding `ws/` (the workspace) and `outside/`.
     fn setup() -> (Tmp, String) {
-        let dir = std::env::temp_dir().join(format!("paseo-lite-files-{}", crate::util::new_id()));
+        let dir = std::env::temp_dir().join(format!("feiyi-files-{}", crate::util::new_id()));
         std::fs::create_dir_all(dir.join("ws/src")).unwrap();
         std::fs::create_dir_all(dir.join("outside")).unwrap();
         std::fs::write(dir.join("outside/secret.txt"), "secret").unwrap();

@@ -557,9 +557,9 @@ impl StreamState {
             return json!({});
         }
         let reason = if cap == 0 {
-            "Sub-agent not started: the machine is low on memory or CPU right now. Do this part yourself if it is small; otherwise tell the user it is on hold and launch it after a running sub-agent reports back or in a later turn.".to_string()
+            "Sub-agent not started: the machine is low on memory or CPU right now. This is temporary, not a failure: do not drop the work. Do this part yourself if it is small; otherwise start a background shell `sleep 90` (run_in_background: true), end the turn, and when it reports back launch the sub-agent again. Repeat until it starts, and keep going with any other parts meanwhile.".to_string()
         } else {
-            format!("Sub-agent not started: {running} sub-agent(s) are already running, the most this machine allows at once. Launch it after one of them reports back (its notification starts a new turn), or do this part yourself if it is small. Do not wait or poll for them.")
+            format!("Sub-agent not started: {running} sub-agent(s) are already running, the most this machine allows at once. This is temporary, not a failure: do not drop the work. Do this part yourself if it is small; otherwise end the turn and launch it again when one of them reports back (its notification starts a new turn). Do not wait or poll for them.")
         };
         crate::log!("claude {}: sub-agent launch refused ({running} running, cap {cap})", self.agent_id);
         json!({ "hookSpecificOutput": { "hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason } })

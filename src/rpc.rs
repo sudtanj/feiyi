@@ -178,6 +178,9 @@ impl Manager {
                 } else {
                     let model = s(&msg, "modelId");
                     if let Some(a) = self.agents.get_mut(&id) {
+                        if let Some(m) = model.as_deref().filter(|m| !m.is_empty()) {
+                            self.daemon_config.remember_model(&a.rec.provider, m);
+                        }
                         a.rec.model = model;
                     }
                     self.claude.restart_on_next_prompt(&id);
@@ -544,6 +547,9 @@ impl Manager {
             pending_queue: Vec::new(),
         };
         let id = rec.id.clone();
+        if let Some(model) = rec.model.clone() {
+            self.daemon_config.remember_model(&rec.provider, &model);
+        }
         let mut agent = Agent::new(rec);
         agent.timeline = Some(Vec::new());
         self.agents.insert(id.clone(), agent);

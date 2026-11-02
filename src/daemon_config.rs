@@ -56,7 +56,8 @@ impl ProviderOverrides {
                     .collect()
             })
             .unwrap_or_default();
-        if extra.iter().any(|m| m.get("isDefault").is_some()) {
+        let custom_default = extra.iter().any(|m| m.get("isDefault").is_some());
+        if custom_default {
             for m in models.iter_mut() {
                 if let Some(obj) = m.as_object_mut() {
                     obj.remove("isDefault");
@@ -74,6 +75,18 @@ impl ProviderOverrides {
                     }
                 }
                 None => models.push(m),
+            }
+        }
+        // The model last picked for a chat becomes the default for new ones,
+        // unless the user set a custom default.
+        let last = self.provider(id).and_then(|p| p.get("lastModel")).and_then(|v| v.as_str());
+        if let Some(last) = last.filter(|l| !custom_default && models.iter().any(|m| m["id"] == *l)) {
+            for m in models.iter_mut().filter_map(|m| m.as_object_mut()) {
+                if m.get("id").and_then(|v| v.as_str()) == Some(last) {
+                    m.insert("isDefault".into(), json!(true));
+                } else {
+                    m.remove("isDefault");
+                }
             }
         }
         Value::Array(models)
@@ -100,6 +113,22 @@ impl DaemonConfig {
 
     pub fn overrides(&self) -> ProviderOverrides {
         ProviderOverrides { stored: self.stored.get("providers").and_then(|p| p.as_object()).cloned().unwrap_or_default() }
+    }
+
+    /// Remember `model` as the one new `provider` chats start on.
+    pub fn remember_model(&mut self, provider: &str, model: &str) {
+        let providers = self.stored.entry("providers").or_insert_with(|| json!({}));
+        if !providers.is_object() {
+            *providers = json!({});
+        }
+        let entry = providers.as_object_mut().expect("object").entry(provider.to_string()).or_insert_with(|| json!({}));
+        if !entry.is_object() {
+            *entry = json!({});
+        }
+        if entry.get("lastModel").and_then(|v| v.as_str()) != Some(model) {
+            entry["lastModel"] = json!(model);
+            self.save();
+        }
     }
 
     pub fn append_system_prompt(&self) -> Option<String> {
@@ -171,6 +200,19 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("feiyi-cfg-{}", crate::util::new_id()));
         std::fs::create_dir_all(&dir).unwrap();
         DaemonConfig::load(&dir)
+    }
+
+    #[test]
+    fn last_picked_model_becomes_default() {
+        let mut c = config();
+        let builtin = json!([{ "id": "sonnet", "isDefault": true }, { "id": "opus" }]);
+        c.remember_model("claude", "opus");
+        let models = c.overrides().merge_models("claude", builtin.clone());
+        assert_eq!(models[1]["isDefault"], true);
+        assert!(models[0].get("isDefault").is_none());
+        assert_eq!(DaemonConfig::load(c.path.parent().unwrap()).overrides().merge_models("claude", builtin.clone())[1]["isDefault"], true, "saved");
+        c.remember_model("claude", "gone");
+        assert_eq!(c.overrides().merge_models("claude", builtin)[0]["isDefault"], true, "unknown model keeps the built-in default");
     }
 
     #[test]

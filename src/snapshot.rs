@@ -172,7 +172,7 @@ pub fn timeline_entry(provider: &str, row: &Row) -> Value {
 }
 
 pub fn cursor(seq: u64) -> Value {
-    json!({ "epoch": EPOCH, "seq": seq })
+    json!({ "epoch": EPOCH.as_str(), "seq": seq })
 }
 
 pub fn workspace_descriptor(ws: &crate::store::WorkspaceRecord, agents: &[&Agent]) -> Value {

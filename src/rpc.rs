@@ -562,11 +562,15 @@ impl Manager {
         let direction = s(msg, "direction").unwrap_or_else(|| "tail".into());
         let projection = s(msg, "projection").unwrap_or_else(|| "projected".into());
         let limit = msg.get("limit").and_then(|v| v.as_u64()).unwrap_or(200) as usize;
-        let cursor_seq = msg.pointer("/cursor/seq").and_then(|v| v.as_u64());
+        // A cursor from before a restart: its seq numbers may name other rows
+        // now, so answer with the tail and tell the app to replace its copy.
+        let stale = msg.pointer("/cursor/epoch").and_then(|v| v.as_str()).is_some_and(|e| e != crate::manager::EPOCH.as_str());
+        let cursor_seq = msg.pointer("/cursor/seq").and_then(|v| v.as_u64()).filter(|_| !stale);
+        let direction = if stale { "tail".to_string() } else { direction };
         let Some(id) = self.resolve(agent_key) else {
             return reply(out, json!({ "type": "fetch_agent_timeline_response", "payload": {
                 "requestId": rid, "agentId": agent_key, "agent": null, "direction": direction, "projection": projection,
-                "epoch": crate::manager::EPOCH, "reset": false, "staleCursor": false, "gap": false,
+                "epoch": crate::manager::EPOCH.as_str(), "reset": false, "staleCursor": false, "gap": false,
                 "window": { "minSeq": 0, "maxSeq": 0, "nextSeq": 0 }, "startCursor": null, "endCursor": null,
                 "hasOlder": false, "hasNewer": false, "entries": [], "error": "agent not found" } }));
         };
@@ -613,9 +617,9 @@ impl Manager {
             "agent": agent.snapshot(),
             "direction": direction,
             "projection": projection,
-            "epoch": crate::manager::EPOCH,
-            "reset": false,
-            "staleCursor": false,
+            "epoch": crate::manager::EPOCH.as_str(),
+            "reset": stale,
+            "staleCursor": stale,
             "gap": false,
             "window": { "minSeq": min_seq, "maxSeq": max_seq, "nextSeq": agent.rec.next_seq },
             "startCursor": start_cursor,

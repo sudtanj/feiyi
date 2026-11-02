@@ -16,7 +16,10 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 
 pub type Out = mpsc::UnboundedSender<Arc<str>>;
 
-pub const EPOCH: &str = "e1";
+/// Timeline epoch, new on every start. Apps drop timelines cached under an
+/// older one: rows streamed but never saved (a full disk) left seq numbers the
+/// restarted daemon hands out again, and apps skipped those rows as seen.
+pub static EPOCH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| format!("e{}", unix_now()));
 
 /// Minimum gap between attempts to (re)start a keep-warm process, so a
 /// broken binary or a vanished session can't spin in a restart loop.
@@ -523,7 +526,7 @@ impl Manager {
         }
         self.broadcast(json!({
             "type": "agent_stream",
-            "payload": { "agentId": agent_id, "event": event, "timestamp": ts, "seq": seq, "epoch": EPOCH },
+            "payload": { "agentId": agent_id, "event": event, "timestamp": ts, "seq": seq, "epoch": EPOCH.as_str() },
         }));
     }
 

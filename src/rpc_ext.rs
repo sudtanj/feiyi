@@ -326,7 +326,7 @@ impl Manager {
     }
 
     fn list_prompts(&mut self, agent_key: &str, rid: &str, out: &Out) {
-        let not_found = || json!({ "type": "agent.timeline.list_prompts.response", "payload": { "requestId": rid, "agentId": agent_key, "epoch": EPOCH, "prompts": [], "error": "agent not found" } });
+        let not_found = || json!({ "type": "agent.timeline.list_prompts.response", "payload": { "requestId": rid, "agentId": agent_key, "epoch": EPOCH.as_str(), "prompts": [], "error": "agent not found" } });
         let Some(id) = self.resolve(agent_key) else { return reply(out, not_found()) };
         let store = &self.store;
         let Some(a) = self.agents.get_mut(&id) else { return reply(out, not_found()) };
@@ -339,7 +339,7 @@ impl Manager {
             .filter(|r| r.item.get("type").and_then(|t| t.as_str()) == Some("user_message"))
             .map(|r| json!({ "seq": r.seq_start, "timestamp": r.timestamp, "preview": truncate(r.item.get("text").and_then(|t| t.as_str()).unwrap_or("").trim(), 160) }))
             .collect();
-        reply(out, json!({ "type": "agent.timeline.list_prompts.response", "payload": { "requestId": rid, "agentId": a.rec.id, "epoch": EPOCH, "prompts": prompts, "error": null } }));
+        reply(out, json!({ "type": "agent.timeline.list_prompts.response", "payload": { "requestId": rid, "agentId": a.rec.id, "epoch": EPOCH.as_str(), "prompts": prompts, "error": null } }));
     }
 }
 

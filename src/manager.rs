@@ -107,6 +107,9 @@ pub struct Agent {
     pub attempts: u32,
     /// The turn produced output (assistant text, reasoning or a tool call).
     pub produced: bool,
+    /// A user turn that began while background work already ran: its reply
+    /// answers the user, so it notifies even if that work is still running.
+    pub answers_during_background: bool,
     /// Last sign of life from the provider, for the stall watchdog.
     pub last_event: Instant,
     /// A retry is scheduled: when to re-dispatch and with which prompt.
@@ -572,9 +575,11 @@ impl Manager {
     fn start_turn(&mut self, agent_id: &str, messages: Vec<(String, Option<String>)>) {
         let text = merged_prompt(&messages);
         let turn_id = new_id();
+        let background = self.claude.working_in_background(agent_id);
         let provider = {
             let Some(agent) = self.agents.get_mut(agent_id) else { return };
             agent.status = "running";
+            agent.answers_during_background = background;
             agent.turn_text = text.clone();
             agent.attempts = 0;
             agent.produced = false;
@@ -854,8 +859,11 @@ impl Manager {
             }
         }
         // A turn that ends with background work still running is a pause, not
-        // the end of the task: no "finished" notice until the last turn.
-        let background = matches!(outcome, Ok(None)) && self.claude.working_in_background(agent_id);
+        // the end of the task: no "finished" notice until the last turn. Unless
+        // the user asked something while that work ran: the reply is the answer.
+        // Taken, so the CLI's own later turns don't inherit it.
+        let answered = self.agents.get_mut(agent_id).is_some_and(|a| std::mem::take(&mut a.answers_during_background));
+        let background = matches!(outcome, Ok(None)) && !answered && self.claude.working_in_background(agent_id);
         let (provider, turn_id) = {
             let Some(agent) = self.agents.get_mut(agent_id) else { return };
             let turn_id = agent.active_turn.take().map(|t| t.0);
@@ -1498,7 +1506,7 @@ impl Manager {
 
 impl Agent {
     pub fn new(rec: AgentRecord) -> Agent {
-        Agent { rec, status: "idle", active_turn: None, queue: VecDeque::new(), permissions: Vec::new(), timeline: None, dirty_rows: BTreeSet::new(), last_touch: Instant::now(), compacting: false, turn_text: String::new(), attempts: 0, produced: false, last_event: Instant::now(), retry_at: None, retry_text: String::new(), limit_hit: None, limit_wait: false, limit_since: None }
+        Agent { rec, status: "idle", active_turn: None, queue: VecDeque::new(), permissions: Vec::new(), timeline: None, dirty_rows: BTreeSet::new(), last_touch: Instant::now(), compacting: false, turn_text: String::new(), attempts: 0, produced: false, answers_during_background: false, last_event: Instant::now(), retry_at: None, retry_text: String::new(), limit_hit: None, limit_wait: false, limit_since: None }
     }
 
     pub fn ensure_timeline(&mut self, store: &Store) {

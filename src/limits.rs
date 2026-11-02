@@ -160,13 +160,14 @@ fn custom_endpoint(provider: &str) -> bool {
             const KEYS: [&str; 5] = ["ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX"];
             let dir = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from).unwrap_or_else(|| home.join(".claude"));
             let settings: Value = std::fs::read(dir.join("settings.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
-            KEYS.iter().any(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty()) || settings.pointer(&format!("/env/{k}")).is_some_and(|v| v.as_str() != Some("")))
-                || settings.get("apiKeyHelper").is_some()
+            let set = |k: &str| std::env::var(k).ok().or_else(|| settings.pointer(&format!("/env/{k}")).and_then(|v| v.as_str()).map(String::from)).filter(|v| !v.is_empty());
+            // A subscription token (`claude setup-token`, sk-ant-oat…) passed as a key is still the subscription.
+            KEYS.iter().filter_map(|k| set(k)).any(|v| !v.starts_with("sk-ant-oat")) || settings.get("apiKeyHelper").is_some()
         }
         "codex" => {
             let dir = std::env::var_os("CODEX_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".codex"));
             let config = std::fs::read_to_string(dir.join("config.toml")).unwrap_or_default();
-            std::env::var_os("OPENAI_BASE_URL").is_some_and(|v| !v.is_empty()) || codex_custom(&config)
+            ["OPENAI_BASE_URL", "CODEX_BASE_URL"].iter().any(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty())) || codex_custom(&config)
         }
         _ => true,
     }

@@ -60,6 +60,8 @@ pub struct StreamState {
 /// The `PreToolUse` hook callback id the daemon registers for Agent/Task
 /// calls, so it decides how many sub-agents run at once.
 pub const SUBAGENT_HOOK: &str = "paseo-subagent-gate";
+/// The `PreToolUse` hook on Read: whole reads of long files go through `outline` first.
+pub const READ_HOOK: &str = "paseo-read-guard";
 /// An admitted launch counts as running this long even before its Task call
 /// shows up in the stream.
 const ADMIT_GRACE: Duration = Duration::from_secs(30);
@@ -575,6 +577,16 @@ impl StreamState {
         let req = msg.get("request").cloned().unwrap_or(Value::Null);
         if s(&req, "subtype").as_deref() == Some("hook_callback") && s(&req, "callback_id").as_deref() == Some(SUBAGENT_HOOK) {
             let resp = json!({ "type": "control_response", "response": { "subtype": "success", "request_id": request_id, "response": self.gate_subagent(&req) } });
+            let _ = self.stdin.send(resp.to_string());
+            return;
+        }
+        if s(&req, "subtype").as_deref() == Some("hook_callback") && s(&req, "callback_id").as_deref() == Some(READ_HOOK) {
+            let reason = req.pointer("/input/tool_input").and_then(crate::outline::read_guard);
+            let decision = match reason {
+                Some(reason) => json!({ "hookSpecificOutput": { "hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason } }),
+                None => json!({}),
+            };
+            let resp = json!({ "type": "control_response", "response": { "subtype": "success", "request_id": request_id, "response": decision } });
             let _ = self.stdin.send(resp.to_string());
             return;
         }

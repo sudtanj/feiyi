@@ -18,7 +18,7 @@
 //! With `claude_keep_warm` the idle child is never reaped, and the manager
 //! pre-starts one (`prewarm`) so the next prompt skips the cold start.
 
-use super::claude_stream::{StreamState, SubAgents, SUBAGENT_HOOK};
+use super::claude_stream::{StreamState, SubAgents, READ_HOOK, SUBAGENT_HOOK};
 use super::{AgentSpec, EventTx, ProviderEvent};
 use crate::config::Config;
 use serde_json::json;
@@ -327,6 +327,11 @@ impl ClaudePool {
         if std::env::var_os("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC").is_none() {
             cmd.env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
         }
+        // Sub-agents on Sonnet: most of their work doesn't need Opus. Set it
+        // in the daemon's environment to override.
+        if std::env::var_os("CLAUDE_CODE_SUBAGENT_MODEL").is_none() {
+            cmd.env("CLAUDE_CODE_SUBAGENT_MODEL", "sonnet");
+        }
         // A subscription token (sk-ant-oat…) in ANTHROPIC_AUTH_TOKEN runs as
         // "API Usage Billing": no plan limits, no rate_limit_event. Hand it
         // over where Claude Code expects a subscription token.
@@ -352,7 +357,7 @@ impl ClaudePool {
             let _ = self.events.send(ProviderEvent::SessionStarted { agent_id: spec.id.clone(), session_id: session_id.clone() });
         }
         // Every sub-agent launch asks the daemon first (claude_stream's gate).
-        let hooks = json!({ "PreToolUse": [{ "matcher": "Agent|Task", "hookCallbackIds": [SUBAGENT_HOOK] }] });
+        let hooks = json!({ "PreToolUse": [{ "matcher": "Agent|Task", "hookCallbackIds": [SUBAGENT_HOOK] }, { "matcher": "Read", "hookCallbackIds": [READ_HOOK] }] });
         let init = json!({ "type": "control_request", "request_id": format!("init-{generation}"), "request": { "subtype": "initialize", "hooks": hooks } });
         let _ = in_tx.send(init.to_string());
 

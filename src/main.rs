@@ -9,6 +9,7 @@ mod files;
 mod git_actions;
 mod limits;
 mod manager;
+mod outline;
 mod mcp;
 mod mcp_server;
 mod projects;

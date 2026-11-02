@@ -115,7 +115,7 @@ pub fn claude_models() -> Value {
             .iter()
             .map(|(id, label, description, context)| {
                 let mut m = serde_json::json!({ "provider": "claude", "id": id, "label": label, "description": description, "contextWindowMaxTokens": context });
-                if *id == "claude-opus-5-5" {
+                if *id == "claude-sonnet-5-5" {
                     m["isDefault"] = serde_json::json!(true);
                 }
                 // Haiku models are offered without effort levels.

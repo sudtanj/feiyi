@@ -408,7 +408,11 @@ impl Ledger {
             details.push(json!({ "id": format!("model-{model}"), "label": model, "value": format!("{} tok · {}", short(c.tokens()), usd(c.cost)) }));
         }
         details.extend(self.trend(provider, &month));
-        card(provider, label, provider, None, balances, details)
+        let (windows, as_of) = crate::limits::windows(provider);
+        details.extend(as_of);
+        let mut entry = card(provider, label, provider, None, balances, details);
+        entry["report"]["windows"] = json!(windows);
+        entry
     }
 
     /// One card per model `provider` has used, most expensive first: cost and

@@ -7,6 +7,7 @@ mod e2ee;
 mod egress;
 mod files;
 mod git_actions;
+mod limits;
 mod manager;
 mod mcp;
 mod mcp_server;

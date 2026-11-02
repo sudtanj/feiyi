@@ -240,7 +240,12 @@ impl StreamState {
                 }
                 self.handle_tool_results(&msg);
             }
-            "rate_limit_event" => self.limit_info = msg.get("rate_limit_info").cloned(),
+            "rate_limit_event" => {
+                self.limit_info = msg.get("rate_limit_info").cloned();
+                if let Some(info) = &self.limit_info {
+                    crate::limits::claude(info);
+                }
+            }
             "result" => self.handle_result(&msg),
             "control_request" => self.handle_control_request(&msg),
             _ => {}

@@ -10,6 +10,7 @@ impl Codex {
         if method == "account/rateLimits/updated" {
             // Account-wide, so it names no thread.
             if let Some(limits) = params.get("rateLimits") {
+                crate::limits::codex(limits);
                 self.inner.state.lock().unwrap().rate_limits = Some(limits.clone());
             }
             return;

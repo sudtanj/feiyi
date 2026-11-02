@@ -213,6 +213,7 @@ impl Manager {
         let workspaces = store.load_workspaces();
         let push_tokens = crate::push::TokenStore::load(&cfg.home);
         let daemon_config = crate::daemon_config::DaemonConfig::load(&cfg.home);
+        crate::limits::load(&cfg.home);
         let usage = crate::usage::Ledger::load(&cfg.home);
         for p in &projects {
             crate::snapshot::set_project_name(&p.root_path, p.custom_name.as_deref());

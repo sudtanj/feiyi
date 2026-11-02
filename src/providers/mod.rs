@@ -307,3 +307,52 @@ mod tests {
         assert_eq!(reset_in_text("You've hit your session limit"), None);
     }
 }
+
+/// Background task output past this is emptied: nobody reads hundreds of MB
+/// of tool output, and a command reading its own output file grows forever.
+const TASK_OUTPUT_MAX: u64 = 256 << 20;
+
+/// Empty oversized Claude background task outputs (`<tmp>/claude-<uid>/<project>/<session>/tasks/*.output`).
+/// Truncating, not deleting, frees the space while the writer still holds the
+/// file, and a `cat` reading its own output hits end of file and stops.
+/// Returns the paths emptied.
+#[cfg(unix)]
+pub fn trim_task_outputs() -> Vec<std::path::PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let tmp = std::env::var_os("CLAUDE_CODE_TMPDIR").map(std::path::PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    // SAFETY: getuid has no preconditions.
+    let root = tmp.join(format!("claude-{}", unsafe { libc::getuid() }));
+    let dirs = |p: &std::path::Path| std::fs::read_dir(p).into_iter().flatten().flatten().map(|e| e.path());
+    let mut trimmed = Vec::new();
+    for project in dirs(root.as_path()) {
+        for session in dirs(project.as_path()) {
+            for file in dirs(session.join("tasks").as_path()) {
+                // Blocks, not length: a writer past the cut leaves a sparse file.
+                let big = std::fs::metadata(&file).is_ok_and(|m| m.is_file() && m.blocks() * 512 > TASK_OUTPUT_MAX);
+                if big && std::fs::OpenOptions::new().write(true).open(&file).and_then(|f| f.set_len(0)).is_ok() {
+                    trimmed.push(file);
+                }
+            }
+        }
+    }
+    trimmed
+}
+
+#[cfg(all(test, unix))]
+mod trim_tests {
+    #[test]
+    fn trims_only_oversized_task_outputs() {
+        let tmp = std::env::temp_dir().join(format!("feiyi-trim-{}", std::process::id()));
+        let tasks = tmp.join(format!("claude-{}", unsafe { libc::getuid() })).join("p/s/tasks");
+        std::fs::create_dir_all(&tasks).unwrap();
+        std::fs::write(tasks.join("small.output"), "ok").unwrap();
+        std::fs::write(tasks.join("big.output"), vec![b'x'; (super::TASK_OUTPUT_MAX + 4096) as usize]).unwrap();
+        std::env::set_var("CLAUDE_CODE_TMPDIR", &tmp);
+        let trimmed = super::trim_task_outputs();
+        std::env::remove_var("CLAUDE_CODE_TMPDIR");
+        assert_eq!(trimmed, vec![tasks.join("big.output")]);
+        assert_eq!(std::fs::metadata(tasks.join("big.output")).unwrap().len(), 0);
+        assert_eq!(std::fs::read(tasks.join("small.output")).unwrap(), b"ok");
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+}

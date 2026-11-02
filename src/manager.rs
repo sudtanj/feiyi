@@ -294,6 +294,10 @@ impl Manager {
         self.send_ready(ready);
         self.codex.reap();
         self.update_capacity();
+        #[cfg(unix)]
+        for file in crate::providers::trim_task_outputs() {
+            crate::warn!("emptied runaway background task output {} (over 256 MB)", file.display());
+        }
         self.keep_warm();
         self.run_retries_and_watchdog();
         self.flush_all();

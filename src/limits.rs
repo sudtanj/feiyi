@@ -56,17 +56,21 @@ fn record(provider: &str, entries: Vec<(String, Window)>) {
 }
 
 /// A Claude Code `rate_limit_info`.
+/// `unifiedWindows` names every window (`five_hour`, `seven_day`, …) with its
+/// `utilization`; older builds only the binding one in `rateLimitType`.
 pub fn claude(info: &Value) {
-    let Some(kind) = info.get("rateLimitType").and_then(|v| v.as_str()) else { return };
-    // `utilization` is a 0..1 share; accept a percent too.
-    let used = info.get("utilization").and_then(|v| v.as_f64()).map(|u| if u <= 1.0 { u * 100.0 } else { u });
-    let w = Window {
-        used_pct: used,
-        resets_at: info.get("resetsAt").and_then(|v| v.as_u64()),
-        status: info.get("status").and_then(|v| v.as_str()).map(String::from),
+    let window = |w: &Value| Window {
+        // A 0..1 share; accept a percent too.
+        used_pct: w.get("utilization").and_then(|v| v.as_f64()).map(|u| if u <= 1.0 { u * 100.0 } else { u }),
+        resets_at: w.get("resetsAt").and_then(|v| v.as_u64()),
+        status: w.get("status").and_then(|v| v.as_str()).map(String::from),
         seen: now(),
     };
-    record("claude", vec![(kind.to_string(), w)]);
+    let mut entries: Vec<(String, Window)> = info.get("unifiedWindows").and_then(|v| v.as_object()).into_iter().flatten().map(|(k, w)| (k.clone(), window(w))).collect();
+    if let Some(kind) = info.get("rateLimitType").and_then(|v| v.as_str()).filter(|k| !entries.iter().any(|(id, _)| id == k)) {
+        entries.push((kind.to_string(), window(info)));
+    }
+    record("claude", entries);
 }
 
 /// A Codex `rateLimits` snapshot: `primary` (5 h) and `secondary` (weekly).
@@ -204,6 +208,8 @@ mod tests {
         let later = now() + 3600;
         claude(&json!({ "status": "allowed_warning", "rateLimitType": "five_hour", "resetsAt": later, "utilization": 0.85 }));
         claude(&json!({ "status": "allowed_warning", "rateLimitType": "five_hour", "resetsAt": later }));
+        claude(&json!({ "status": "allowed", "rateLimitType": "five_hour", "resetsAt": later, "unifiedWindows": { "seven_day": { "utilization": 0.24, "resetsAt": later, "status": "allowed" } } }));
+        assert_eq!(WINDOWS.lock().unwrap()["claude/seven_day"].used_pct, Some(24.0));
         codex(&json!({ "primary": { "usedPercent": 40.0, "windowDurationMins": 300, "resetsAt": later }, "secondary": { "usedPercent": 100.0, "windowDurationMins": 10080, "resetsAt": 1 } }));
         let w = WINDOWS.lock().unwrap().clone();
         assert_eq!(w["claude/five_hour"].used_pct, Some(85.0), "share kept across events of the same window");

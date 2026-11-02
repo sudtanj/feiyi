@@ -327,6 +327,13 @@ impl ClaudePool {
         if std::env::var_os("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC").is_none() {
             cmd.env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
         }
+        // A subscription token (sk-ant-oat…) in ANTHROPIC_AUTH_TOKEN runs as
+        // "API Usage Billing": no plan limits, no rate_limit_event. Hand it
+        // over where Claude Code expects a subscription token.
+        let oat = std::env::var("ANTHROPIC_AUTH_TOKEN").ok().filter(|t| t.starts_with("sk-ant-oat"));
+        if let Some(token) = oat.filter(|_| std::env::var_os("CLAUDE_CODE_OAUTH_TOKEN").is_none() && std::env::var_os("ANTHROPIC_BASE_URL").is_none()) {
+            cmd.env("CLAUDE_CODE_OAUTH_TOKEN", token).env_remove("ANTHROPIC_AUTH_TOKEN");
+        }
         cmd.current_dir(&spec.cwd).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
         super::deprioritize(&mut cmd, &self.cfg);
         let mut child = cmd.spawn().map_err(|e| format!("failed to start {}: {e}", self.cfg.claude_bin))?;

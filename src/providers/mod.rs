@@ -137,8 +137,11 @@ pub fn is_supported(provider: &str) -> bool {
     provider == "claude" || provider == "codex"
 }
 
-/// Run an agent CLI below the daemon: lower CPU and I/O priority and a higher
-/// OOM score. Children (tool commands, builds, test runs) inherit all three,
+/// Largest file an agent or its tool commands may write.
+const AGENT_MAX_FILE: libc::rlim_t = 2 << 30;
+
+/// Run an agent CLI below the daemon: lower CPU and I/O priority, a higher
+/// OOM score and a file size cap. Children (tool commands, builds, test runs) inherit them,
 /// so a heavy agent task slows itself down instead of starving the daemon.
 pub fn deprioritize(cmd: &mut tokio::process::Command, cfg: &crate::config::Config) {
     #[cfg(unix)]
@@ -157,6 +160,11 @@ pub fn deprioritize(cmd: &mut tokio::process::Command, cfg: &crate::config::Conf
                 if nice > 0 {
                     libc::setpriority(libc::PRIO_PROCESS, 0, nice);
                 }
+                // No single file past AGENT_MAX_FILE: a runaway write (a
+                // background `cat tasks/*.output` reading its own output
+                // grew to 19.7 GB once) fails instead of filling the disk.
+                let limit = libc::rlimit { rlim_cur: AGENT_MAX_FILE, rlim_max: AGENT_MAX_FILE };
+                libc::setrlimit(libc::RLIMIT_FSIZE, &limit);
                 #[cfg(target_os = "linux")]
                 {
                     if low_io {

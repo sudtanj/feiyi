@@ -342,7 +342,7 @@ impl ClaudePool {
         for var in ["PASEO_ZILONG_API_KEY", "PASEO_PASSWORD", "PASEO_LITE_MCP_TOKEN", "CODEX_API_KEY"] {
             cmd.env_remove(var);
         }
-        cmd.env("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB", "1");
+        cmd.env("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB", "0");
         // A subscription token (sk-ant-oat…) in ANTHROPIC_AUTH_TOKEN runs as
         // "API Usage Billing": no plan limits, no rate_limit_event. Hand it
         // over where Claude Code expects a subscription token.

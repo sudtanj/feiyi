@@ -6,11 +6,20 @@
 //! instructions and filled through the `remember` MCP tool. daemon-config
 //! `roles` adds or replaces roles (`{"name": {"description", "prompt",
 //! "tools"?}}`, `null` removes a built-in one); `"company": false` turns it off.
+//! While on, the built-in anti-slop skills (`skills/*/SKILL.md`) are written
+//! to `~/.claude/skills` and `$CODEX_HOME/skills` as `feiyi-<name>`.
 
 use serde_json::{json, Map, Value};
 use std::path::{Path, PathBuf};
 
-const SHARED: &str = "You are part of a one-person company, working for the lead who briefed you. The user is not watching you: do not ask questions, make the sensible call and say which call you made. Finish the whole brief. End with a short report: what you did, what you checked, anything left or risky.";
+const SHARED: &str = "You are part of a one-person company, working for the lead who briefed you. The user is not watching you: do not ask questions, make the sensible call and say which call you made. Finish the whole brief. Before writing prose, code or UI, load the matching skill (feiyi-anti-slop-writing, feiyi-anti-slop-code, feiyi-anti-slop-ui) and follow it. End with a short report: what you did, what you checked, anything left or risky.";
+
+/// Built-in skills, adapted from MIT anti-slop skills (sources in each file).
+const SKILLS: &[(&str, &str)] = &[
+    ("anti-slop-writing", include_str!("../skills/anti-slop-writing/SKILL.md")),
+    ("anti-slop-code", include_str!("../skills/anti-slop-code/SKILL.md")),
+    ("anti-slop-ui", include_str!("../skills/anti-slop-ui/SKILL.md")),
+];
 
 // Prompts paraphrase role files from msitarzewski/agency-agents (MIT).
 fn builtin() -> Map<String, Value> {
@@ -138,7 +147,7 @@ pub fn roles(stored: &Map<String, Value>, home: &Path) -> Option<Map<String, Val
             "{prompt}\n\nYour memory, notes you saved on earlier jobs:\n{memory}\nWhen you learn something worth keeping for future jobs (the user's preferences, a project's conventions, a mistake to avoid), save it as one short line with the feiyi `remember` tool (role: \"{name}\"); start project-specific notes with the project name. Don't save what the code or git history already shows."
         ));
         if let Some(tools) = role.get_mut("tools").and_then(Value::as_array_mut) {
-            tools.push(json!("mcp__feiyi__remember"));
+            tools.extend([json!("mcp__feiyi__remember"), json!("Skill")]);
         }
     }
     (!roles.is_empty()).then_some(roles)
@@ -200,6 +209,38 @@ fn sync_codex_in(dir: &Path, roles: Option<&Map<String, Value>>) {
     }
 }
 
+/// Write the built-in skills for Claude and Codex, or remove them when off.
+pub fn sync_skills(on: bool) {
+    let env = |k: &str| std::env::var_os(k).map(PathBuf::from);
+    let home = env("HOME");
+    let claude = env("CLAUDE_CONFIG_DIR").or_else(|| home.as_ref().map(|h| h.join(".claude")));
+    let codex = env("CODEX_HOME").or_else(|| home.as_ref().map(|h| h.join(".codex")));
+    for dir in [claude, codex].into_iter().flatten() {
+        sync_skills_in(&dir.join("skills"), on);
+    }
+}
+
+fn sync_skills_in(dir: &Path, on: bool) {
+    let wanted = |d: &str| on && SKILLS.iter().any(|(n, _)| d == format!("feiyi-{n}"));
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let d = e.file_name().to_string_lossy().to_string();
+        if d.starts_with("feiyi-") && !wanted(&d) {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
+    for (name, text) in SKILLS.iter().filter(|_| on) {
+        // Prefixed so they can't clash with the user's own skills.
+        let text = text.replacen("name: ", "name: feiyi-", 1);
+        let path = dir.join(format!("feiyi-{name}")).join("SKILL.md");
+        if std::fs::read_to_string(&path).ok().as_deref() != Some(text.as_str()) {
+            let r = std::fs::create_dir_all(path.parent().expect("parent")).and_then(|_| crate::util::write_atomic(&path, text.as_bytes(), false));
+            if let Err(e) = r {
+                crate::warn!("failed to write skill {name}: {e}");
+            }
+        }
+    }
+}
+
 fn codex_toml(name: &str, role: &Value) -> String {
     // A JSON string is a valid TOML basic string, except for a raw DEL.
     let s = |k: &str| json!(role.get(k).and_then(Value::as_str).unwrap_or_default().replace('\u{7f}', "")).to_string();
@@ -210,7 +251,7 @@ fn codex_toml(name: &str, role: &Value) -> String {
 pub fn lead_prompt(roles: &Map<String, Value>) -> String {
     let names: Vec<&str> = roles.keys().map(String::as_str).collect();
     format!(
-        "You lead a one-person company. Your team, sub-agents you spawn by name: {}. When the user gives a goal instead of exact steps, act as the lead: work out the concrete requirements yourself from the code and context (ask the user only for decisions that are truly theirs, all in one batch, before starting), split the goal into tasks, give each to the right role with a self-contained brief (goal, files, acceptance criteria), run independent tasks in parallel, have the reviewer or qa (and security for auth, payments or user data) check the engineer's work and send fixes back until it passes; for business goals (launch, pricing, outreach, support, legal) use pm, marketer, sales, support, finance and legal the same way. Nothing leaves the company without the user: roles only draft emails, posts, payments and contracts. Then report the result to the user briefly. Small or exact requests: just do them yourself.",
+        "You lead a one-person company. Your team, sub-agents you spawn by name: {}. When the user gives a goal instead of exact steps, act as the lead: work out the concrete requirements yourself from the code and context (ask the user only for decisions that are truly theirs, all in one batch, before starting), split the goal into tasks, give each to the right role with a self-contained brief (goal, files, acceptance criteria), run independent tasks in parallel, have the reviewer or qa (and security for auth, payments or user data) check the engineer's work and send fixes back until it passes; for business goals (launch, pricing, outreach, support, legal) use pm, marketer, sales, support, finance and legal the same way. Nothing leaves the company without the user: roles only draft emails, posts, payments and contracts. Then report the result to the user briefly. Small or exact requests: just do them yourself. Before writing prose, code or UI yourself, load the matching feiyi-anti-slop skill.",
         names.join(", ")
     )
 }
@@ -235,6 +276,7 @@ mod tests {
         assert!(!r.contains_key("reviewer") && !r.contains_key("bad") && !r.contains_key("../x"));
         assert!(lead_prompt(&r).contains("designer"));
         assert!(r["qa"]["tools"].as_array().unwrap().contains(&json!("mcp__feiyi__remember")));
+        assert!(r["qa"]["tools"].as_array().unwrap().contains(&json!("Skill")));
         assert!(roles(json!({ "company": false }).as_object().unwrap(), &h).is_none());
     }
 
@@ -287,6 +329,23 @@ mod tests {
         assert!(qa.starts_with("# Written by feiyi") && qa.contains("name = \"qa\"") && qa.contains("You are QA."));
         sync_codex_in(&dir, None);
         assert!(!dir.join("feiyi-qa.toml").exists() && dir.join("mine.toml").exists(), "company off removes only feiyi's files");
+    }
+
+    #[test]
+    fn skills_sync() {
+        let dir = home().join("skills");
+        std::fs::create_dir_all(dir.join("mine")).unwrap();
+        std::fs::create_dir_all(dir.join("feiyi-gone")).unwrap();
+        sync_skills_in(&dir, true);
+        assert!(!dir.join("feiyi-gone").exists() && dir.join("mine").exists());
+        for (name, text) in SKILLS {
+            assert!(text.starts_with(&format!("---\nname: {name}\n")) && text.contains("\ndescription: ") && text.len() <= 8192, "{name}");
+            let file = std::fs::read_to_string(dir.join(format!("feiyi-{name}/SKILL.md"))).unwrap();
+            assert!(file.starts_with(&format!("---\nname: feiyi-{name}\n")), "{name}");
+            assert!(SHARED.contains(&format!("feiyi-{name}")), "{name}");
+        }
+        sync_skills_in(&dir, false);
+        assert!(!dir.join("feiyi-anti-slop-code").exists() && dir.join("mine").exists());
     }
 
     #[test]

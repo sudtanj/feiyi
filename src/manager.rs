@@ -538,6 +538,7 @@ impl Manager {
             // Codex reads roles from files: keep them in step with the config.
             crate::company::sync_codex(roles.as_ref());
         }
+        crate::company::sync_skills(roles.is_some());
         Some(AgentSpec {
             id: a.rec.id.clone(),
             cwd: a.rec.cwd.clone(),

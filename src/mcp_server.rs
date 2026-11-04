@@ -28,7 +28,7 @@ use tokio::sync::{mpsc, oneshot};
 /// Supported protocol revisions, newest first (the default).
 const PROTOCOL_VERSIONS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
 
-const INSTRUCTIONS: &str = "Inspect the feiyi daemon that runs this agent: its status, capacity and memory (daemon_status), agents and their queues (list_agents, agent_timeline), the claude/codex processes (agent_processes), its recent log (daemon_logs) and projects (list_projects). `outline` lists a source file's declarations with line ranges: use it before reading a long file. `rpc` sends one app-protocol request as the Paseo app would and can change state.";
+const INSTRUCTIONS: &str = "Inspect the feiyi daemon that runs this agent: its status, capacity and memory (daemon_status), agents and their queues (list_agents, agent_timeline), the claude/codex processes (agent_processes), its recent log (daemon_logs) and projects (list_projects). `outline` lists a source file's declarations with line ranges: use it before reading a long file. `remember` saves a note to a company role's memory. `rpc` sends one app-protocol request as the Paseo app would and can change state.";
 
 /// How long a manager-backed tool waits for the manager.
 const MANAGER_WAIT: Duration = Duration::from_secs(15);
@@ -150,6 +150,7 @@ fn tools() -> Vec<Value> {
         tool("daemon_logs", "Recent daemon log lines (info and warnings since start; the last 2000 are kept, long lines cut), oldest first.", json!({ "lines": { "type": "integer", "description": "How many lines from the end (default 200, max 2000).", "minimum": 1, "maximum": 2000 }, "filter": { "type": "string", "description": "Only lines containing this text (case-insensitive)." } }), &[], true),
         tool("list_projects", "Projects (registered directories) and workspaces as the daemon knows them, with agent counts, plus agent directories that belong to no project.", json!({}), &[], true),
         tool("outline", "Declarations of a source file (functions, types, impls, classes, methods) with their line ranges, nested ones indented: `start-end  signature`. Use it before reading a long file, then Read only the ranges you need with offset/limit. Rust, Python, Go, JS/TS, C/C++, shell.", json!({ "path": { "type": "string", "description": "Absolute path of the file." } }), &["path"], true),
+        tool("remember", "Save one short note to a company role's memory (engineer, reviewer, qa, researcher, writer or a custom role). It is added to that role's instructions on later jobs. One line; start project-specific notes with the project name.", json!({ "role": { "type": "string", "description": "Your role name." }, "note": { "type": "string", "description": "The note, one line (max 500 characters)." } }), &["role", "note"], false),
         tool("rpc", "Escape hatch: send one Paseo app-protocol session message (the inner `message` of a `session` frame, e.g. {\"type\":\"fetch_agents_request\"} or {\"type\":\"daemon.get_status.request\"}) through the same handler the app's websocket uses, and return the reply messages it produces. A requestId is added when missing. CAN MUTATE STATE (create/archive agents, send prompts, change config): prefer the read-only tools.", json!({ "message": { "type": "object", "description": "The session message, with at least `type`." } }), &["message"], false),
     ]
 }
@@ -159,6 +160,16 @@ fn tools() -> Vec<Value> {
 async fn call_tool(ctx: &Arc<Ctx>, params: &Value) -> Result<Value, (i64, String)> {
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
     let args = params.get("arguments").filter(|a| a.is_object()).cloned().unwrap_or_else(|| json!({}));
+    if name == "remember" {
+        let arg = |k: &str| args.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+        let (home, role, note) = (ctx.home.clone(), arg("role"), arg("note"));
+        let outcome = tokio::task::spawn_blocking(move || crate::company::remember(&home, &role, &note)).await.unwrap_or_else(|e| Err(format!("remember failed: {e}")));
+        let (text, is_error) = match outcome {
+            Ok(t) => (t, false),
+            Err(e) => (e, true),
+        };
+        return Ok(json!({ "content": [{ "type": "text", "text": text }], "isError": is_error }));
+    }
     if name == "outline" {
         // Plain text: JSON-quoting the lines would cost the tokens it saves.
         let path = args.get("path").and_then(Value::as_str).unwrap_or("").to_string();
@@ -684,7 +695,7 @@ mod tests {
         let (ctx, _rx) = ctx();
         let r = dispatch(&ctx, json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" })).await.unwrap();
         let names: Vec<&str> = r["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert_eq!(names, ["daemon_status", "list_agents", "agent_timeline", "agent_processes", "daemon_logs", "list_projects", "outline", "rpc"]);
+        assert_eq!(names, ["daemon_status", "list_agents", "agent_timeline", "agent_processes", "daemon_logs", "list_projects", "outline", "remember", "rpc"]);
         for t in r["result"]["tools"].as_array().unwrap() {
             assert_eq!(t["inputSchema"]["type"], "object");
         }

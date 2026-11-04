@@ -132,7 +132,7 @@ impl DaemonConfig {
     }
 
     pub fn roles(&self) -> Option<Map<String, Value>> {
-        crate::company::roles(&self.stored)
+        crate::company::roles(&self.stored, self.path.parent().unwrap_or(std::path::Path::new(".")))
     }
 
     pub fn append_system_prompt(&self) -> Option<String> {

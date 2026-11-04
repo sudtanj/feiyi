@@ -533,7 +533,11 @@ impl Manager {
 
     fn spec(&self, agent_id: &str) -> Option<AgentSpec> {
         let a = self.agents.get(agent_id)?;
-        let roles = (a.rec.provider == "claude").then(|| self.daemon_config.roles()).flatten();
+        let roles = self.daemon_config.roles();
+        if a.rec.provider == "codex" {
+            // Codex reads roles from files: keep them in step with the config.
+            crate::company::sync_codex(roles.as_ref());
+        }
         Some(AgentSpec {
             id: a.rec.id.clone(),
             cwd: a.rec.cwd.clone(),
@@ -553,7 +557,7 @@ impl Manager {
                 (!parts.is_empty()).then(|| parts.join("\n\n"))
             },
             thinking: a.rec.thinking_option_id.clone(),
-            agents: roles.map(|r| serde_json::Value::Object(r).to_string()),
+            agents: roles.filter(|_| a.rec.provider == "claude").map(|r| serde_json::Value::Object(r).to_string()),
         })
     }
 

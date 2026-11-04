@@ -8,6 +8,7 @@ mod e2ee;
 mod egress;
 mod files;
 mod git_actions;
+mod guard;
 mod limits;
 mod manager;
 mod outline;
@@ -55,6 +56,7 @@ ENVIRONMENT (selection):
     PASEO_CLAUDE_SUBAGENT_PROMPT  extra instructions for Claude Code agents (default: hand work to background sub-agents and stay free; set empty to disable)
     PASEO_CLAUDE_MAX_SUBAGENTS    sub-agents one Claude Code agent may run at once; none start while the machine is strained (default 3)
     PASEO_DEBUG_MCP=0        do not give agents the built-in feiyi debug MCP server
+    PASEO_SECRET_GUARD=0     do not deny Claude Code tool calls that read secret files or environment variables
     PASEO_CAVEMAN            Token Saver terse-answer prompt level (always on): lite|full|ultra|wenyan-lite|wenyan|wenyan-ultra (default ultra)
     PASEO_PONYTAIL           Token Saver minimal-code prompt level (always on): lite|full|ultra (default ultra)
 ";
@@ -83,6 +85,7 @@ fn main() {
     // First, so the wrapped command's own `-h` is not taken for ours.
     match args.first().map(String::as_str) {
         Some(token_saver::HOOK_CMD) => return token_saver::hook_main(),
+        Some(guard::HOOK_CMD) => return guard::hook_main(),
         Some(token_saver::RUN_CMD) => token_saver::run_main(&args[1..]),
         _ => {}
     }

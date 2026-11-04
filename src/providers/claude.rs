@@ -335,6 +335,14 @@ impl ClaudePool {
         if std::env::var_os("CLAUDE_CODE_SUBAGENT_MODEL").is_none() {
             cmd.env("CLAUDE_CODE_SUBAGENT_MODEL", "sonnet");
         }
+        // Claude reads the router key from the --mcp-config file; it and the
+        // daemon's other secrets stay out of its environment. Its own token
+        // is kept, but stripped from the Bash tool, hooks and MCP servers
+        // (GitHub tokens stay: agents push). GH_TOKEN stays reachable: residual risk.
+        for var in ["PASEO_ZILONG_API_KEY", "PASEO_PASSWORD", "PASEO_LITE_MCP_TOKEN", "CODEX_API_KEY"] {
+            cmd.env_remove(var);
+        }
+        cmd.env("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB", "1");
         // A subscription token (sk-ant-oat…) in ANTHROPIC_AUTH_TOKEN runs as
         // "API Usage Billing": no plan limits, no rate_limit_event. Hand it
         // over where Claude Code expects a subscription token.

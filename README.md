@@ -105,7 +105,7 @@ feiyi speaks Paseo's core WebSocket protocol subset with the upstream message na
 - agent controls: `update_agent` (rename, labels), `set_agent_thinking` (`claude --effort` / Codex `effort`),
   `refresh_agent`, `resume_agent`, `list_commands` (built-ins plus `.claude/commands` and `.claude/skills`),
   `wait_for_finish`, `agent.timeline.list_prompts`, `list_provider_features`, `set_agent_feature` (declined);
-- daemon and projects: `daemon.get_status`, `get_daemon_config` / `set_daemon_config` (custom models via `providers.<id>.additionalModels`, `appendSystemPrompt`, company `roles` and `company: false`; saved in `daemon-config.json`; role memory in `roles/<role>.md`, Codex role files in `~/.codex/agents/feiyi-<role>.toml`, anti-slop skills from `skills/` in `~/.claude/skills` and `~/.codex/skills` as `feiyi-<name>`), `diagnostics`,
+- daemon and projects: `daemon.get_status`, `get_daemon_config` / `set_daemon_config` (custom models via `providers.<id>.additionalModels`, `appendSystemPrompt`, company `roles` and `company: false`; saved in `daemon-config.json`; role memory in `roles/<role>.md`, Codex role files in `~/.codex/agents/feiyi-<role>.toml`, built-in skills (anti-slop, verification, debugging) from `skills/` in `~/.claude/skills` and `~/.codex/skills` as `feiyi-<name>`), `diagnostics`,
   `project.rename`, `project.remove` / `archive_workspace` (archive the agents and clean up the folder, see below), `workspace.title.set`,
   `workspace.clear_attention`.
 - git actions for the Changes panel (no agent turn needed): commit (with an auto-written message when empty), push, pull, switch/rename/validate branch, branch suggestions, discard changes, refresh (fetch), commit history with per-file stats and diffs, stash save/pop/list, merge into base / merge from base, and pull request status/create/merge through the `gh` CLI.
@@ -204,6 +204,7 @@ PASEO_LISTEN=0.0.0.0:6768 PASEO_PASSWORD=secret feiyi
 | `PASEO_DEBUG_MCP` | on | `0`/`false`/`off` stops giving agents the built-in `feiyi` debug MCP server. See [MCP: feiyi](#mcp-feiyi) |
 | `PASEO_CAVEMAN` | `ultra` | Token Saver terse-answer prompt level (always on): `lite`, `full`, `ultra`, `wenyan-lite`, `wenyan`, `wenyan-ultra`. See [Token Saver](#token-saver) |
 | `PASEO_PONYTAIL` | `ultra` | Token Saver minimal-code prompt level (always on): `lite`, `full`, `ultra` |
+| `PASEO_SECRET_GUARD` | on | `0` turns off the Claude Code hook that denies tool calls reading secret files (`~/.paseo-lite` except `roles/` and `uploads/`, Claude/Codex credentials, `~/.ssh`, `/proc/*/environ`) or secret environment variables. Agents also start without the daemon's secrets in their environment (`GH_TOKEN` stays for git). String matching, not a sandbox |
 
 A systemd unit is in `contrib/feiyi.service`.
 

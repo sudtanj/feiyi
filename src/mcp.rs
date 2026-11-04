@@ -23,6 +23,9 @@ pub const KEY_ENV: &str = "PASEO_ZILONG_API_KEY";
 pub const DEBUG_NAME: &str = "feiyi";
 pub const DEBUG_TOKEN_ENV: &str = "PASEO_LITE_MCP_TOKEN";
 
+/// Codex shell commands (and their snapshots) must not inherit the daemon's secrets; GH_TOKEN stays for git/gh.
+const CODEX_SHELL_EXCLUDE: &str = r#"["PASEO_*", "CLAUDE_CODE_*", "ANTHROPIC_*", "*API_KEY*", "*SECRET*", "*PASSWORD*"]"#;
+
 /// The daemon's own MCP server: where agents reach it and the token they need.
 #[derive(Clone)]
 pub struct DebugMcp {
@@ -155,9 +158,11 @@ pub fn claude_config(cfg: &Config) -> Option<PathBuf> {
     Some(claude_path(cfg)).filter(|p| p.exists())
 }
 
-/// `-c` overrides for `codex app-server`.
+/// `-c` overrides for `codex app-server`: the MCP servers, the secrets kept
+/// out of agent shells, and no shell snapshots (they record exported variables).
 pub fn codex_args(cfg: &Config) -> Vec<String> {
-    let mut args = Vec::new();
+    let mut args: Vec<String> = ["-c", "features.shell_snapshot=false", "-c", "shell_environment_policy.ignore_default_excludes=true", "-c"].map(String::from).into();
+    args.push(format!("shell_environment_policy.exclude={CODEX_SHELL_EXCLUDE}"));
     if let Some(url) = &cfg.zilong_mcp_url {
         args.extend(["-c".to_string(), format!("mcp_servers.{NAME}.url={}", toml_str(url))]);
         if cfg.zilong_api_key.is_some() {
@@ -194,12 +199,12 @@ mod tests {
         let mut cfg = Config::load(&[]);
         cfg.zilong_mcp_url = None;
         cfg.debug_mcp = None;
-        assert!(codex_args(&cfg).is_empty());
+        assert_eq!(codex_args(&cfg).join(" "), format!("-c features.shell_snapshot=false -c shell_environment_policy.ignore_default_excludes=true -c shell_environment_policy.exclude={CODEX_SHELL_EXCLUDE}"));
         assert!(codex_env(&cfg).is_empty());
         cfg.zilong_mcp_url = Some("http://pi:20128/mcp".into());
         cfg.zilong_api_key = Some("sk-secret".into());
         let args = codex_args(&cfg).join(" ");
-        assert_eq!(args, r#"-c mcp_servers.zilong-router.url="http://pi:20128/mcp" -c mcp_servers.zilong-router.bearer_token_env_var="PASEO_ZILONG_API_KEY""#);
+        assert!(args.ends_with(r#"-c mcp_servers.zilong-router.url="http://pi:20128/mcp" -c mcp_servers.zilong-router.bearer_token_env_var="PASEO_ZILONG_API_KEY""#));
         assert!(!args.contains("sk-secret"));
     }
 
@@ -209,7 +214,7 @@ mod tests {
         cfg.zilong_mcp_url = None;
         cfg.debug_mcp = Some(debug("http://127.0.0.1:6768/mcp"));
         let args = codex_args(&cfg).join(" ");
-        assert_eq!(args, r#"-c mcp_servers.feiyi.url="http://127.0.0.1:6768/mcp" -c mcp_servers.feiyi.bearer_token_env_var="PASEO_LITE_MCP_TOKEN""#);
+        assert!(args.ends_with(r#"-c mcp_servers.feiyi.url="http://127.0.0.1:6768/mcp" -c mcp_servers.feiyi.bearer_token_env_var="PASEO_LITE_MCP_TOKEN""#));
         assert!(!args.contains("t0ken"));
         assert_eq!(codex_env(&cfg), vec![(DEBUG_TOKEN_ENV, "t0ken".to_string())]);
     }

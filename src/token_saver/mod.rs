@@ -8,7 +8,8 @@
 //!   (manager.rs builds it; Claude gets it
 //!   through `--append-system-prompt`, Codex as `developerInstructions`).
 //! - RTK (always on) is a Claude Code `PreToolUse` hook on
-//!   the Bash tool, given through `--settings <home>/claude-settings.json`.
+//!   the Bash tool, given through `--settings <home>/claude-settings.json`
+//!   (which also carries the secret guard hook, guard.rs).
 //!   The hook (`feiyi rtk-hook`) rewrites simple, well-known commands
 //!   (git status/diff/log/show, grep, find, ls, cargo build, ...) to
 //!   `feiyi rtk -- '<command>'`, which runs the command and prints its
@@ -54,33 +55,42 @@ fn settings_path(cfg: &Config) -> PathBuf {
     cfg.home.join("claude-settings.json")
 }
 
-/// The `--settings` contents: one PreToolUse command hook on Bash.
-fn claude_settings_json(exe: &Path) -> Option<Value> {
-    let command = format!("{} {HOOK_CMD}", shell_quote(exe.to_str()?));
-    Some(json!({ "hooks": { "PreToolUse": [{ "matcher": "Bash", "hooks": [{ "type": "command", "command": command, "timeout": 5 }] }] } }))
+/// The `--settings` contents: PreToolUse command hooks, the secret guard
+/// (unless `PASEO_SECRET_GUARD=0`) and RTK on Bash (Token Saver on).
+fn claude_settings_json(exe: &Path, rtk: bool, guard: bool) -> Option<Value> {
+    let exe = shell_quote(exe.to_str()?);
+    let hook = |matcher: &str, cmd: &str| json!({ "matcher": matcher, "hooks": [{ "type": "command", "command": format!("{exe} {cmd}"), "timeout": 5 }] });
+    let mut hooks = Vec::new();
+    if guard {
+        hooks.push(hook(crate::guard::MATCHER, crate::guard::HOOK_CMD));
+    }
+    if rtk {
+        hooks.push(hook("Bash", HOOK_CMD));
+    }
+    (!hooks.is_empty()).then(|| json!({ "hooks": { "PreToolUse": hooks } }))
 }
 
 /// Writes Claude's `--settings` file at startup, or removes a stale one when
-/// RTK is off.
+/// there is no hook to run.
 pub fn write_claude_settings(cfg: &Config) {
     let path = settings_path(cfg);
-    let settings = if cfg.rtk { current_exe().as_deref().and_then(claude_settings_json) } else { None };
-    let Some(settings) = settings else {
-        if cfg.rtk {
-            crate::warn!("token saver: cannot locate the feiyi binary; Claude Code starts without RTK");
+    let guard = crate::guard::enabled();
+    let Some(settings) = current_exe().and_then(|exe| claude_settings_json(&exe, cfg.rtk, guard)) else {
+        if cfg.rtk || guard {
+            crate::warn!("claude hooks: cannot locate the feiyi binary; Claude Code starts without the secret guard and RTK");
         }
         let _ = std::fs::remove_file(&path);
         return;
     };
     match crate::util::write_atomic(&path, settings.to_string().as_bytes(), false) {
-        Ok(()) => crate::log!("token saver: RTK hook for Claude Code ({})", path.display()),
-        Err(e) => crate::warn!("token saver: cannot write {}: {e}; Claude Code starts without RTK", path.display()),
+        Ok(()) => crate::log!("claude hooks: secret guard {}, RTK {} ({})", if guard { "on" } else { "off" }, if cfg.rtk { "on" } else { "off" }, path.display()),
+        Err(e) => crate::warn!("claude hooks: cannot write {}: {e}; Claude Code starts without the secret guard and RTK", path.display()),
     }
 }
 
-/// `--settings <file>` for `claude`, when RTK is on.
+/// `--settings <file>` for `claude`, when it holds any hook.
 pub fn claude_settings(cfg: &Config) -> Option<PathBuf> {
-    cfg.rtk.then(|| settings_path(cfg)).filter(|p| p.exists())
+    Some(settings_path(cfg)).filter(|p| p.exists())
 }
 
 /// Single-quoted for `sh`.
@@ -364,10 +374,15 @@ mod tests {
     }
 
     #[test]
-    fn settings_hold_one_bash_hook() {
-        let s = claude_settings_json(Path::new("/usr/bin/feiyi")).unwrap();
-        assert_eq!(s["hooks"]["PreToolUse"][0]["matcher"], "Bash");
-        assert_eq!(s["hooks"]["PreToolUse"][0]["hooks"][0]["command"], "'/usr/bin/feiyi' rtk-hook");
+    fn settings_hold_the_guard_and_the_bash_hook() {
+        let exe = Path::new("/usr/bin/feiyi");
+        let s = claude_settings_json(exe, true, true).unwrap();
+        assert_eq!(s["hooks"]["PreToolUse"][0]["matcher"], crate::guard::MATCHER);
+        assert_eq!(s["hooks"]["PreToolUse"][0]["hooks"][0]["command"], "'/usr/bin/feiyi' guard-hook");
+        assert_eq!(s["hooks"]["PreToolUse"][1]["matcher"], "Bash");
+        assert_eq!(s["hooks"]["PreToolUse"][1]["hooks"][0]["command"], "'/usr/bin/feiyi' rtk-hook");
+        assert_eq!(claude_settings_json(exe, false, true).unwrap()["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
+        assert!(claude_settings_json(exe, false, false).is_none());
     }
 
     #[test]

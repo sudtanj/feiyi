@@ -150,7 +150,7 @@ fn tools() -> Vec<Value> {
         tool("daemon_logs", "Recent daemon log lines (info and warnings since start; the last 2000 are kept, long lines cut), oldest first.", json!({ "lines": { "type": "integer", "description": "How many lines from the end (default 200, max 2000).", "minimum": 1, "maximum": 2000 }, "filter": { "type": "string", "description": "Only lines containing this text (case-insensitive)." } }), &[], true),
         tool("list_projects", "Projects (registered directories) and workspaces as the daemon knows them, with agent counts, plus agent directories that belong to no project.", json!({}), &[], true),
         tool("outline", "Declarations of a source file (functions, types, impls, classes, methods) with their line ranges, nested ones indented: `start-end  signature`. Use it before reading a long file, then Read only the ranges you need with offset/limit. Rust, Python, Go, JS/TS, C/C++, shell.", json!({ "path": { "type": "string", "description": "Absolute path of the file." } }), &["path"], true),
-        tool("remember", "Save one short note to a company role's memory (engineer, reviewer, qa, researcher, writer or a custom role). It is added to that role's instructions on later jobs. One line; start project-specific notes with the project name.", json!({ "role": { "type": "string", "description": "Your role name." }, "note": { "type": "string", "description": "The note, one line (max 500 characters)." } }), &["role", "note"], false),
+        tool("remember", "Save one short note to your company role's memory (engineer, qa, pm, devops, legal...). It is added to that role's instructions on later jobs. One line; start project-specific notes with the project name.", json!({ "role": { "type": "string", "description": "Your role name." }, "note": { "type": "string", "description": "The note, one line (max 500 characters)." } }), &["role", "note"], false),
         tool("rpc", "Escape hatch: send one Paseo app-protocol session message (the inner `message` of a `session` frame, e.g. {\"type\":\"fetch_agents_request\"} or {\"type\":\"daemon.get_status.request\"}) through the same handler the app's websocket uses, and return the reply messages it produces. A requestId is added when missing. CAN MUTATE STATE (create/archive agents, send prompts, change config): prefer the read-only tools.", json!({ "message": { "type": "object", "description": "The session message, with at least `type`." } }), &["message"], false),
     ]
 }
@@ -705,6 +705,21 @@ mod tests {
         assert_eq!(r["error"]["code"], -32602);
         assert!(dispatch(&ctx, json!({ "jsonrpc": "2.0", "id": 5, "result": {} })).await.is_none());
         assert_eq!(dispatch(&ctx, json!([1])).await.unwrap()["error"]["code"], -32600);
+    }
+
+    #[tokio::test]
+    async fn remember_saves_to_the_role_memory() {
+        let (cmds, _rx) = mpsc::unbounded_channel();
+        let (bcast, _) = broadcast::channel(4);
+        let home = std::env::temp_dir().join(format!("feiyi-mcp-{}", crate::util::new_id()));
+        let ctx = Arc::new(Ctx { cmds, bcast, server_id: "s".into(), hostname: "h".into(), password: None, home: home.clone() });
+        let call = |role: &str| json!({ "jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": { "name": "remember", "arguments": { "role": role, "note": "acme: deploy on fridays is banned" } } });
+        let r = dispatch(&ctx, call("devops")).await.unwrap();
+        assert_eq!(r["result"]["isError"], false, "{r}");
+        assert_eq!(std::fs::read_to_string(home.join("roles/devops.md")).unwrap(), "- acme: deploy on fridays is banned\n");
+        let r = dispatch(&ctx, call("../x")).await.unwrap();
+        assert_eq!(r["result"]["isError"], true);
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[tokio::test]

@@ -89,6 +89,8 @@ done
         "tool" => tool.to_string(),
         "stream" => stream,
         "limit" => limit,
+        // Like "ok", and saves its arguments (one per line) for the test to check.
+        "args" => format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n{}", dir.join("claude-args").display(), script.trim_start_matches("#!/bin/sh\n")),
         _ => script.to_string(),
     };
     std::fs::write(&path, body).unwrap();
@@ -689,4 +691,43 @@ async fn usage_limit_waits_and_continues() {
     .await;
     assert!(noted, "the wait was not announced");
     assert!(d.dir.join("limit-hit").exists());
+}
+
+/// Start a claude chat and wait for its first turn to finish.
+async fn run_chat(ws: &mut Ws, cwd: &std::path::Path, id: &str) {
+    std::fs::create_dir_all(cwd).unwrap();
+    let config = json!({ "provider": "claude", "cwd": cwd.to_string_lossy(), "modeId": "bypassPermissions" });
+    send(ws, session(json!({ "type": "create_agent_request", "requestId": id, "config": config, "initialPrompt": "hi" }))).await;
+    recv_until(ws, |v| (v["message"]["type"] == "agent_stream" && v["message"]["payload"]["event"]["type"] == "turn_completed").then_some(())).await;
+}
+
+#[tokio::test]
+async fn company_roles_reach_claude_with_memory_and_switch_off() {
+    let dir = unique_dir("company");
+    std::fs::create_dir_all(dir.join("home/roles")).unwrap();
+    std::fs::write(dir.join("home/roles/engineer.md"), "- acme: tabs not spaces\n").unwrap();
+    let d = start_at(dir, None, "args");
+    let args_file = d.dir.join("claude-args");
+    let mut ws = connect(d.port).await;
+    hello(&mut ws, None).await;
+    let roles = json!({ "roles": { "legal": null, "tester": { "description": "Tests things.", "prompt": "You test." } } });
+    send(&mut ws, session(json!({ "type": "set_daemon_config_request", "requestId": "c1", "config": roles }))).await;
+    recv_until(&mut ws, |v| (v["message"]["type"] == "set_daemon_config_response").then_some(())).await;
+
+    run_chat(&mut ws, &d.dir.join("w1"), "a1").await;
+    let args = std::fs::read_to_string(&args_file).unwrap();
+    let lines: Vec<&str> = args.lines().collect();
+    let at = lines.iter().position(|l| *l == "--agents").expect("--agents passed");
+    let agents: Value = serde_json::from_str(lines[at + 1]).unwrap();
+    assert!(agents["engineer"]["prompt"].as_str().unwrap().contains("- acme: tabs not spaces"), "memory injected");
+    assert!(agents["tester"]["prompt"].as_str().unwrap().starts_with("You test."), "custom role added");
+    assert!(agents.get("legal").is_none(), "null removes a built-in role");
+    assert!(agents["qa"]["tools"].as_array().unwrap().contains(&json!("mcp__feiyi__remember")));
+    assert!(args.contains("You lead a one-person company") && args.contains("tester"), "lead prompt names the team");
+
+    send(&mut ws, session(json!({ "type": "set_daemon_config_request", "requestId": "c2", "config": { "company": false } }))).await;
+    recv_until(&mut ws, |v| (v["message"]["type"] == "set_daemon_config_response").then_some(())).await;
+    run_chat(&mut ws, &d.dir.join("w2"), "a2").await;
+    let args = std::fs::read_to_string(&args_file).unwrap();
+    assert!(!args.lines().any(|l| l == "--agents") && !args.contains("one-person company"), "company: false turns it off");
 }

@@ -171,7 +171,10 @@ pub fn remember(home: &Path, role: &str, note: &str) -> Result<String, String> {
 /// wanted (all of them when `roles` is None).
 pub fn sync_codex(roles: Option<&Map<String, Value>>) {
     let Some(home) = std::env::var_os("CODEX_HOME").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".codex"))) else { return };
-    let dir = home.join("agents");
+    sync_codex_in(&home.join("agents"), roles);
+}
+
+fn sync_codex_in(dir: &Path, roles: Option<&Map<String, Value>>) {
     let empty = Map::new();
     let roles = roles.unwrap_or(&empty);
     if let Ok(entries) = std::fs::read_dir(&dir) {
@@ -249,6 +252,41 @@ mod tests {
         }
         let memory = std::fs::read_to_string(memory_path(&h, "engineer")).unwrap();
         assert!(memory.len() <= MEMORY_MAX_BYTES && memory.ends_with("x\n") && !memory.contains("feiyi: run"));
+    }
+
+    #[test]
+    fn every_builtin_role_is_complete() {
+        let b = builtin();
+        assert_eq!(b.len(), 15);
+        for (name, r) in &b {
+            assert!(valid_name(name), "{name}");
+            assert!(!r["description"].as_str().unwrap().is_empty(), "{name}");
+            assert!(r["prompt"].as_str().unwrap().ends_with(SHARED), "{name}");
+        }
+        // Outward-facing roles only draft; review roles can't edit.
+        for name in ["marketer", "sales", "support", "finance", "legal"] {
+            assert!(b[name]["prompt"].as_str().unwrap().contains("never send"), "{name}");
+        }
+        for name in ["reviewer", "qa", "security", "researcher", "analyst"] {
+            let tools = b[name]["tools"].as_array().unwrap();
+            assert!(!tools.contains(&json!("Edit")) && !tools.contains(&json!("Write")), "{name}");
+        }
+    }
+
+    #[test]
+    fn codex_role_files_sync() {
+        let dir = home().join("agents");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("mine.toml"), "x").unwrap();
+        std::fs::write(dir.join("feiyi-gone.toml"), "x").unwrap();
+        let r = roles(&Map::new(), &home()).unwrap();
+        sync_codex_in(&dir, Some(&r));
+        assert!(!dir.join("feiyi-gone.toml").exists(), "stale role removed");
+        assert!(dir.join("mine.toml").exists(), "the user's own agents are kept");
+        let qa = std::fs::read_to_string(dir.join("feiyi-qa.toml")).unwrap();
+        assert!(qa.starts_with("# Written by feiyi") && qa.contains("name = \"qa\"") && qa.contains("You are QA."));
+        sync_codex_in(&dir, None);
+        assert!(!dir.join("feiyi-qa.toml").exists() && dir.join("mine.toml").exists(), "company off removes only feiyi's files");
     }
 
     #[test]

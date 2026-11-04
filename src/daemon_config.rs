@@ -131,6 +131,10 @@ impl DaemonConfig {
         }
     }
 
+    pub fn roles(&self) -> Option<Map<String, Value>> {
+        crate::company::roles(&self.stored)
+    }
+
     pub fn append_system_prompt(&self) -> Option<String> {
         self.stored.get("appendSystemPrompt").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()).map(String::from)
     }

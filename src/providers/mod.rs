@@ -22,6 +22,8 @@ pub struct AgentSpec {
     pub system_prompt: Option<String>,
     /// Reasoning effort; None = provider default.
     pub thinking: Option<String>,
+    /// Role sub-agents as `--agents` JSON (Claude only).
+    pub agents: Option<String>,
 }
 
 pub enum ProviderEvent {

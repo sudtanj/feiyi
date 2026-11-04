@@ -317,6 +317,9 @@ impl ClaudePool {
         if let Some(effort) = spec.thinking.as_deref().filter(|e| !e.is_empty() && *e != "default") {
             cmd.args(["--effort", effort]);
         }
+        if let Some(agents) = &spec.agents {
+            cmd.arg("--agents").arg(agents);
+        }
         let prompt: Vec<&str> = [spec.system_prompt.as_deref(), self.cfg.claude_subagent_prompt.as_deref()].into_iter().flatten().filter(|p| !p.trim().is_empty()).collect();
         if !prompt.is_empty() {
             cmd.args(["--append-system-prompt", prompt.join("\n\n").as_str()]);

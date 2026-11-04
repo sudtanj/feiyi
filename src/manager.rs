@@ -533,6 +533,7 @@ impl Manager {
 
     fn spec(&self, agent_id: &str) -> Option<AgentSpec> {
         let a = self.agents.get(agent_id)?;
+        let roles = (a.rec.provider == "claude").then(|| self.daemon_config.roles()).flatten();
         Some(AgentSpec {
             id: a.rec.id.clone(),
             cwd: a.rec.cwd.clone(),
@@ -540,9 +541,11 @@ impl Manager {
             mode_id: a.rec.mode_id.clone(),
             session_id: a.rec.session_id.clone(),
             // Built-in default, then the app's appendSystemPrompt, then the
-            // agent's own, then the Token Saver's Caveman / Ponytail prompts.
+            // agent's own, the company lead's, then the Token Saver's Caveman /
+            // Ponytail prompts.
             system_prompt: {
-                let parts: Vec<String> = [self.cfg.default_system_prompt.clone(), self.daemon_config.append_system_prompt(), a.rec.system_prompt.clone(), crate::token_saver::system_prompt(&self.cfg)]
+                let lead = roles.as_ref().map(crate::company::lead_prompt);
+                let parts: Vec<String> = [self.cfg.default_system_prompt.clone(), self.daemon_config.append_system_prompt(), a.rec.system_prompt.clone(), lead, crate::token_saver::system_prompt(&self.cfg)]
                     .into_iter()
                     .flatten()
                     .filter(|p| !p.trim().is_empty())
@@ -550,6 +553,7 @@ impl Manager {
                 (!parts.is_empty()).then(|| parts.join("\n\n"))
             },
             thinking: a.rec.thinking_option_id.clone(),
+            agents: roles.map(|r| serde_json::Value::Object(r).to_string()),
         })
     }
 

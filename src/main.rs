@@ -1,6 +1,7 @@
 mod capacity;
 mod checkout;
 mod cleanup;
+mod company;
 mod config;
 mod daemon_config;
 mod e2ee;

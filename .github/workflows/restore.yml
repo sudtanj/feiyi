@@ -1,0 +1,53 @@
+name: restore
+
+# Emergency rollback. Adds one commit on top of main whose files are exactly those of
+# the chosen commit, so there is nothing to merge and no conflict, and history is kept
+# (the rollback can itself be rolled back). .github/workflows stays as on main: CI keeps
+# working, and GITHUB_TOKEN may not change workflow files anyway. Then it starts the
+# build; deploy the new main commit as usual once it is green.
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: Commit on main to restore (full or short hash)
+        required: true
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency: restore
+
+jobs:
+  restore:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Restore
+        env:
+          SHA: ${{ inputs.sha }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          target=$(git rev-parse --verify --quiet "$SHA^{commit}") || { echo "::error::unknown commit $SHA"; exit 1; }
+          git merge-base --is-ancestor "$target" origin/main || { echo "::error::$SHA is not on main"; exit 1; }
+          # Retry: the benchmark job may push to main at the same moment.
+          for i in 1 2 3; do
+            git fetch -q origin main && git reset -q --hard origin/main
+            git read-tree -u --reset "$target"
+            git rm -rq --ignore-unmatch .github/workflows
+            git checkout origin/main -- .github/workflows
+            if git diff --cached --quiet; then echo "main already matches $target"; break; fi
+            git commit -qm "Restore $target (emergency rollback by $GITHUB_ACTOR)"
+            git push -q origin HEAD:main && break
+            [ "$i" = 3 ] && exit 1
+            sleep 10
+          done
+          echo "main is now $(git rev-parse HEAD), files of $target" >> "$GITHUB_STEP_SUMMARY"
+      - name: Build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run build.yml -R "$GITHUB_REPOSITORY" --ref main

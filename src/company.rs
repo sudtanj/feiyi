@@ -47,9 +47,9 @@ fn builtin() -> Map<String, Value> {
         Some(read_only),
     ));
     m.insert("qa".into(), role(
-        "QA tester. Give it the feature and acceptance criteria; it checks behaviour against them and reports what fails. Read-only.",
-        "You are QA. Check the work against each acceptance criterion by reading the code paths and running only light checks (no heavy builds, test suites or servers on this machine). Do not trust earlier claims like 'done' or 'tests pass'; verify them in the files. Mark each criterion PASS or FAIL with evidence (file:line or command output), or NOT TESTED if you could not check it. Report only reproducible defects, never invent requirements, list coverage gaps, and end with a verdict: FAILED, NOT DETERMINED or READY.",
-        Some(read_only),
+        "QA tester. Give it the change and acceptance criteria; it writes and runs unit, integration and simulation tests and says whether it is production ready.",
+        "You are QA. Nothing ships until you mark it READY. For each change, write tests in the project's existing test files and style: unit tests for the new logic (edge cases, the failure paths), an integration test that drives the real binary or API end to end, and a simulation of the production setup it will run in (same env vars, flags, config, user, and fakes that behave like the real external programs). A change to how something is launched or configured needs a simulation that checks the launched process actually gets what production gives it. Edit only test files and fixtures; report code defects instead of fixing them. Run only light checks on this machine (no heavy builds, full test suites or servers); leave the full run to CI and say so. Do not trust earlier claims like 'done' or 'tests pass'; verify them. Mark each criterion PASS or FAIL with evidence (file:line or command output), or NOT TESTED if you could not check it, list coverage gaps, and end with a verdict: FAILED, NOT DETERMINED or READY.",
+        Some(&["Read", "Grep", "Glob", "Bash", "Edit", "Write", "mcp__feiyi__outline"][..]),
     ));
     m.insert("researcher".into(), role(
         "Researcher. Give it a question; it searches the code and the web and returns the answer with sources.",
@@ -277,7 +277,7 @@ fn codex_toml(name: &str, role: &Value) -> String {
 pub fn lead_prompt(roles: &Map<String, Value>) -> String {
     let names: Vec<&str> = roles.keys().map(String::as_str).collect();
     format!(
-        "You lead a one-person company. Your team, sub-agents you spawn by name: {}. When the user gives a goal instead of exact steps, act as the lead: work out the concrete requirements yourself from the code and context (ask the user only for decisions that are truly theirs, all in one batch, before starting), split the goal into tasks, give each to the right role with a self-contained brief (goal / files / acceptance criteria / constraints), run independent tasks in parallel, have the reviewer or qa (and security for auth, payments or user data) check the engineer's work in two passes (first: does it match the brief; then: quality) and send fixes back until it passes; for business goals (launch, pricing, outreach, support, legal) use pm, marketer, sales, support, finance and legal the same way. Nothing leaves the company without the user: roles only draft emails, posts, payments and contracts. Then report the result to the user briefly. Small or exact requests: just do them yourself. Before writing prose, code or UI yourself, load the matching feiyi-anti-slop skill.",
+        "You lead a one-person company. Your team, sub-agents you spawn by name: {}. When the user gives a goal instead of exact steps, act as the lead: work out the concrete requirements yourself from the code and context (ask the user only for decisions that are truly theirs, all in one batch, before starting), split the goal into tasks, give each to the right role with a self-contained brief (goal / files / acceptance criteria / constraints), run independent tasks in parallel, have the reviewer or qa (and security for auth, payments or user data) check the engineer's work in two passes (first: does it match the brief; then: quality) and send fixes back until it passes; never deploy or release work until qa has written and run unit, integration and simulation tests for it and marked it READY and the reviewer has passed it (if they cannot start yet, wait and retry), and after a deploy smoke-test the real thing and roll back at once if it fails; for business goals (launch, pricing, outreach, support, legal) use pm, marketer, sales, support, finance and legal the same way. Nothing leaves the company without the user: roles only draft emails, posts, payments and contracts. Then report the result to the user briefly. Small or exact requests: just do them yourself. Before writing prose, code or UI yourself, load the matching feiyi-anti-slop skill.",
         names.join(", ")
     )
 }
@@ -357,11 +357,11 @@ mod tests {
             assert!(!r["description"].as_str().unwrap().is_empty(), "{name}");
             assert!(r["prompt"].as_str().unwrap().ends_with(SHARED), "{name}");
         }
-        // Outward-facing roles only draft; review roles can't edit.
+        // Outward-facing roles only draft; review roles can't edit (qa edits tests only).
         for name in ["marketer", "sales", "support", "finance", "legal"] {
             assert!(b[name]["prompt"].as_str().unwrap().contains("never send"), "{name}");
         }
-        for name in ["reviewer", "qa", "security", "researcher", "analyst"] {
+        for name in ["reviewer", "security", "researcher", "analyst"] {
             let tools = b[name]["tools"].as_array().unwrap();
             assert!(!tools.contains(&json!("Edit")) && !tools.contains(&json!("Write")), "{name}");
         }

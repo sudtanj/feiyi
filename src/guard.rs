@@ -36,7 +36,7 @@ pub fn hook_main() {
     }
     let Ok(event) = serde_json::from_str::<Value>(&input) else { return };
     let Some(home) = std::env::var("HOME").ok().filter(|h| !h.is_empty()) else { return };
-    let state = std::env::var("PASEO_LITE_HOME").unwrap_or_else(|_| format!("{home}/.paseo-lite"));
+    let state = std::env::var("PASEO_LITE_HOME").ok().filter(|s| !s.trim_end_matches('/').is_empty()).unwrap_or_else(|| format!("{home}/.paseo-lite"));
     if let Some(reason) = denied(&event, &home, &state) {
         let out = json!({ "hookSpecificOutput": { "hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason } });
         let mut stdout = std::io::stdout();
@@ -74,11 +74,15 @@ fn names_secret_path(text: &str, state: &str) -> bool {
 }
 
 fn reads_secret_env(command: &str) -> bool {
-    if SECRET_VARS.iter().any(|v| command.contains(v)) {
+    // Expansions only: grepping or committing a variable's name is fine.
+    if SECRET_VARS.iter().any(|v| command.contains(&format!("${v}")) || command.contains(&format!("${{{v}"))) {
         return true;
     }
-    command.split(|c| matches!(c, ';' | '|' | '&' | '\n' | '(' | ')' | '`' | '{' | '}')).any(|segment| {
-        let words: Vec<&str> = segment.split_whitespace().collect();
+    // Commands start after a separator or a `$(`/backtick; bare parentheses
+    // are left alone so `grep 'env(' src` is not read as a lone `env`.
+    let command = command.replace("$(", "\n").replace('`', "\n");
+    command.split(|c| matches!(c, ';' | '|' | '&' | '\n')).any(|segment| {
+        let words: Vec<&str> = segment.split_whitespace().map(|w| w.trim_start_matches(['(', '{']).trim_end_matches(')')).filter(|w| !w.is_empty()).collect();
         match words.as_slice() {
             ["printenv", ..] | ["export" | "declare" | "typeset" | "set" | "env"] => true,
             ["env", rest @ ..] | ["export" | "declare" | "typeset" | "compgen", rest @ ..] => rest.iter().all(|w| w.starts_with('-')),
@@ -105,6 +109,10 @@ mod tests {
         assert!(deny("Bash", "command", "cat /proc/self/environ"));
         assert!(deny("Bash", "command", "ls && printenv"));
         assert!(deny("Bash", "command", "env | grep KEY"));
+        assert!(deny("Bash", "command", "echo ${CLAUDE_CODE_OAUTH_TOKEN}"));
+        assert!(deny("Bash", "command", "echo $(env)"));
+        assert!(deny("Bash", "command", "x=`printenv`"));
+        assert!(deny("Bash", "command", "(env)"));
     }
 
     #[test]
@@ -117,5 +125,9 @@ mod tests {
         assert!(!deny("Read", "file_path", "~/.paseo-lite/uploads/ab12/shot.png"));
         assert!(!deny("Read", "file_path", "src/environment.rs"));
         assert!(!deny("Write", "content", "~/.ssh/id_rsa"));
+        assert!(!deny("Bash", "command", "grep -n 'env(' src/config.rs"));
+        assert!(!deny("Bash", "command", "git commit -m \"fix env (again)\""));
+        assert!(!deny("Bash", "command", "set -euo pipefail; export FOO=bar"));
+        assert!(!deny("Bash", "command", "grep -rn PASEO_ZILONG_API_KEY src"));
     }
 }

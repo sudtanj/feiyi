@@ -91,6 +91,13 @@ done
         "limit" => limit,
         // Like "ok", and saves its arguments (one per line) for the test to check.
         "args" => format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n{}", dir.join("claude-args").display(), script.trim_start_matches("#!/bin/sh\n")),
+        // Like "args", and also saves the environment it was started with.
+        "env" => format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n/usr/bin/env > '{}'\n{}",
+            dir.join("claude-args").display(),
+            dir.join("claude-env").display(),
+            script.trim_start_matches("#!/bin/sh\n")
+        ),
         _ => script.to_string(),
     };
     std::fs::write(&path, body).unwrap();
@@ -109,6 +116,11 @@ fn start(tag: &str, password: Option<&str>) -> Daemon {
 /// Start (or restart) the daemon on an existing directory. `hang`: the fake
 /// claude accepts a prompt and never answers, to simulate a turn in flight.
 fn start_at(dir: PathBuf, password: Option<&str>, mode: &str) -> Daemon {
+    start_with(dir, password, mode, &[])
+}
+
+/// `start_at` plus extra daemon environment variables (they override the defaults).
+fn start_with(dir: PathBuf, password: Option<&str>, mode: &str, extra_env: &[(&str, &str)]) -> Daemon {
     let claude = fake_claude(&dir, mode);
     // free_port() can hand two parallel tests the same port; a daemon that
     // lost the race exits, so retry on a fresh port rather than talk to the
@@ -129,6 +141,7 @@ fn start_at(dir: PathBuf, password: Option<&str>, mode: &str) -> Daemon {
         if let Some(p) = password {
             cmd.env("PASEO_PASSWORD", p);
         }
+        cmd.envs(extra_env.iter().copied());
         let mut child = cmd.spawn().expect("start feiyi");
         let deadline = Instant::now() + Duration::from_secs(20);
         let mut exited = false;
@@ -730,4 +743,142 @@ async fn company_roles_reach_claude_with_memory_and_switch_off() {
     run_chat(&mut ws, &d.dir.join("w2"), "a2").await;
     let args = std::fs::read_to_string(&args_file).unwrap();
     assert!(!args.lines().any(|l| l == "--agents") && !args.contains("one-person company"), "company: false turns it off");
+}
+
+/// Run `cmd` with `input` on stdin; returns the exit code and stdout.
+fn pipe(mut cmd: Command, input: &str) -> (Option<i32>, String) {
+    let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().expect("spawn");
+    child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    (out.status.code(), String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+fn hook_event(tool: &str, key: &str, value: &str) -> String {
+    json!({ "hook_event_name": "PreToolUse", "tool_name": tool, "tool_input": { (key): value } }).to_string()
+}
+
+fn guard_hook(home: &std::path::Path, input: &str) -> (Option<i32>, String) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_feiyi"));
+    cmd.arg("guard-hook").env("HOME", home).env("PASEO_LITE_HOME", home.join(".paseo-lite")).env_remove("PASEO_SECRET_GUARD");
+    pipe(cmd, input)
+}
+
+fn assert_denied(out: (Option<i32>, String), what: &str) {
+    assert_eq!(out.0, Some(0), "{what}");
+    let v: Value = serde_json::from_str(&out.1).unwrap_or_else(|e| panic!("{what}: not JSON ({e}): {:?}", out.1));
+    assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "deny", "{what}");
+    assert_eq!(v["hookSpecificOutput"]["hookEventName"], "PreToolUse", "{what}");
+}
+
+fn assert_allowed(out: (Option<i32>, String), what: &str) {
+    assert_eq!(out, (Some(0), String::new()), "{what}");
+}
+
+#[test]
+fn guard_hook_denies_secrets_and_allows_ordinary_work() {
+    let home = unique_dir("guard");
+    let creds = home.join(".claude/.credentials.json");
+    let upload = home.join(".paseo-lite/uploads/ab12/shot.png");
+    for (tool, key, value) in [
+        ("Read", "file_path", "~/.claude/.credentials.json"),
+        ("Read", "file_path", creds.to_str().unwrap()),
+        ("Bash", "command", "printenv"),
+        ("Bash", "command", "echo $(env)"),
+    ] {
+        assert_denied(guard_hook(&home, &hook_event(tool, key, value)), value);
+    }
+    for (tool, key, value) in [
+        ("Bash", "command", "grep -n 'env(' src/x.rs"),
+        ("Bash", "command", "set -euo pipefail; ps aux"),
+        ("Read", "file_path", "/work/src/main.rs"),
+        ("Read", "file_path", upload.to_str().unwrap()),
+    ] {
+        assert_allowed(guard_hook(&home, &hook_event(tool, key, value)), value);
+    }
+    // Garbage on stdin never blocks a tool call.
+    assert_allowed(guard_hook(&home, "not json"), "garbage");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// The daemon as deployed holds every secret in its environment. Claude must
+/// get none of the removed ones, no PID-namespace scrub flag, and a `--settings`
+/// file whose guard hook command works when run exactly as written.
+#[tokio::test]
+async fn claude_child_gets_no_daemon_secrets_and_a_working_guard_hook() {
+    let dir = unique_dir("prodenv");
+    let env = [
+        ("PASEO_ZILONG_API_KEY", "dummy-zilong"),
+        ("PASEO_LITE_MCP_TOKEN", "dummy-mcp"),
+        ("CODEX_API_KEY", "dummy-codex"),
+        ("CLAUDE_CODE_OAUTH_TOKEN", "dummy-oauth"),
+        ("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB", "1"),
+    ];
+    let d = start_with(dir, Some("dummy-password"), "env", &env);
+    let mut ws = connect(d.port).await;
+    hello(&mut ws, Some("dummy-password")).await;
+    run_chat(&mut ws, &d.dir.join("w1"), "a1").await;
+
+    let child_env = std::fs::read_to_string(d.dir.join("claude-env")).unwrap();
+    let keys: Vec<&str> = child_env.lines().filter_map(|l| l.split_once('=').map(|(k, _)| k)).collect();
+    assert!(child_env.lines().any(|l| l == "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=0"), "scrub must be off: it breaks Bash on Linux");
+    for gone in ["PASEO_ZILONG_API_KEY", "PASEO_PASSWORD", "PASEO_LITE_MCP_TOKEN", "CODEX_API_KEY"] {
+        assert!(!keys.contains(&gone), "{gone} leaked into the claude child");
+    }
+    for value in ["dummy-zilong", "dummy-password", "dummy-mcp", "dummy-codex"] {
+        assert!(!child_env.contains(value), "{value} leaked into the claude child");
+    }
+    assert!(keys.contains(&"PATH") && keys.contains(&"HOME"), "{keys:?}");
+    assert!(child_env.lines().any(|l| l == "CLAUDE_CODE_OAUTH_TOKEN=dummy-oauth"), "claude keeps its own token");
+
+    let args = std::fs::read_to_string(d.dir.join("claude-args")).unwrap();
+    let lines: Vec<&str> = args.lines().collect();
+    let at = lines.iter().position(|l| *l == "--settings").expect("--settings passed");
+    let settings: Value = serde_json::from_str(&std::fs::read_to_string(lines[at + 1]).unwrap()).unwrap();
+    let command = settings["hooks"]["PreToolUse"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|h| h["hooks"].as_array().unwrap())
+        .filter_map(|h| h["command"].as_str())
+        .find(|c| c.contains("guard-hook"))
+        .expect("guard hook wired")
+        .to_string();
+
+    // Run the wired command string through a shell, as Claude Code does.
+    let home = d.dir.join("hookhome");
+    std::fs::create_dir_all(&home).unwrap();
+    let wired = |input: &str| {
+        let mut sh = Command::new("sh");
+        sh.args(["-c", &command]).env("HOME", &home).env("PASEO_LITE_HOME", home.join(".paseo-lite"));
+        pipe(sh, input)
+    };
+    assert_denied(wired(&hook_event("Bash", "command", "printenv")), "wired hook, printenv");
+    assert_allowed(wired(&hook_event("Bash", "command", "ls -la")), "wired hook, ls");
+}
+
+/// The codex app-server gets the shell exclude policy. The fake codex records
+/// its arguments and exits; the daemon spawns it when a codex agent is created.
+#[tokio::test]
+async fn codex_gets_the_shell_environment_exclude() {
+    let dir = unique_dir("codexargs");
+    let codex = dir.join("fake-codex.sh");
+    std::fs::write(&codex, format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n", dir.join("codex-args").display())).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let d = start_with(dir, None, "ok", &[("PASEO_CODEX_BIN", codex.to_str().unwrap())]);
+    let mut ws = connect(d.port).await;
+    hello(&mut ws, None).await;
+    let cwd = d.dir.join("w1");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let config = json!({ "provider": "codex", "cwd": cwd.to_string_lossy() });
+    send(&mut ws, session(json!({ "type": "create_agent_request", "requestId": "x1", "config": config, "initialPrompt": "hi" }))).await;
+    let file = d.dir.join("codex-args");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !file.exists() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let args = std::fs::read_to_string(&file).expect("codex was started");
+    assert!(args.lines().any(|l| l.starts_with("shell_environment_policy.exclude=") && l.contains("PASEO_*") && l.contains("*API_KEY*")), "{args}");
 }

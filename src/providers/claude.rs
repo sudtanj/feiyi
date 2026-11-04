@@ -336,9 +336,10 @@ impl ClaudePool {
             cmd.env("CLAUDE_CODE_SUBAGENT_MODEL", "sonnet");
         }
         // Claude reads the router key from the --mcp-config file; it and the
-        // daemon's other secrets stay out of its environment. Its own token
-        // is kept, but stripped from the Bash tool, hooks and MCP servers
-        // (GitHub tokens stay: agents push). GH_TOKEN stays reachable: residual risk.
+        // daemon's other secrets stay out of its environment; the guard hook
+        // (guard.rs) denies reading the rest. CLAUDE_CODE_SUBPROCESS_ENV_SCRUB
+        // is pinned to 0, even if the daemon has it: on Linux it also runs Bash
+        // in a PID namespace, which broke the Bash tool in the deployed container.
         for var in ["PASEO_ZILONG_API_KEY", "PASEO_PASSWORD", "PASEO_LITE_MCP_TOKEN", "CODEX_API_KEY"] {
             cmd.env_remove(var);
         }

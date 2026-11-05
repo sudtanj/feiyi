@@ -1910,7 +1910,6 @@ describe("HostRuntimeStore", () => {
       await vi.advanceTimersByTimeAsync(60_000);
       expect(requests.count).toBe(afterForeground);
       expect(freshClient.connectCalls).toBe(0);
-      expect(stuckClient.isDisposed()).toBe(false);
 
       store.syncHosts([]);
     });

@@ -195,7 +195,8 @@ pub fn workspace_descriptor(ws: &crate::store::WorkspaceRecord, agents: &[&Agent
         .and_then(|a| a.rec.title.clone());
     let name = ws.title.clone().or(topic).or_else(|| probe.as_ref().and_then(|(_, b)| b.clone())).unwrap_or_else(|| basename(dir));
     let custom = project_custom_name(root);
-    json!({
+    let worktree = ws.main_repo_root.is_some();
+    let mut descriptor = json!({
         "id": ws.id,
         "projectId": ws.project_id,
         "projectDisplayName": custom.clone().unwrap_or_else(|| basename(root)),
@@ -203,7 +204,7 @@ pub fn workspace_descriptor(ws: &crate::store::WorkspaceRecord, agents: &[&Agent
         "projectRootPath": root,
         "workspaceDirectory": dir,
         "projectKind": project_kind(root),
-        "workspaceKind": if probe.is_some() { "local_checkout" } else { "directory" },
+        "workspaceKind": if worktree { "worktree" } else if probe.is_some() { "local_checkout" } else { "directory" },
         "name": name,
         "title": ws.title,
         "pinnedAt": ws.pinned_at,
@@ -212,10 +213,14 @@ pub fn workspace_descriptor(ws: &crate::store::WorkspaceRecord, agents: &[&Agent
         "statusEnteredAt": null,
         "activityAt": activity,
         "scripts": [],
-        "gitRuntime": probe.as_ref().map(|(_, branch)| json!({ "currentBranch": branch, "isPaseoOwnedWorktree": false })),
+        "gitRuntime": probe.as_ref().map(|(_, branch)| json!({ "currentBranch": branch, "isPaseoOwnedWorktree": worktree })),
         "githubRuntime": null,
         "project": project_for(root),
-    })
+    });
+    if worktree {
+        descriptor["worktreeSlug"] = json!(basename(dir));
+    }
+    descriptor
 }
 
 #[cfg(test)]

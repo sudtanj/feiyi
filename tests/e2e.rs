@@ -938,3 +938,60 @@ async fn codex_gets_the_shell_environment_exclude() {
     let args = std::fs::read_to_string(&file).expect("codex was started");
     assert!(args.lines().any(|l| l.starts_with("shell_environment_policy.exclude=") && l.contains("PASEO_*") && l.contains("*API_KEY*")), "{args}");
 }
+
+#[tokio::test]
+async fn worktree_workspace_create_list_and_guarded_archive() {
+    let d = start("worktree", None);
+    let repo = d.dir.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    git(&repo, &["config", "user.name", "Test"]);
+    std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-q", "-m", "initial"]);
+    let cwd = repo.to_string_lossy().to_string();
+    let mut ws = connect(d.port).await;
+    hello(&mut ws, None).await;
+
+    let r = rpc(&mut ws, json!({ "type": "workspace.create.request", "requestId": "w1", "source": { "kind": "worktree", "cwd": cwd, "worktreeSlug": "brave-fox" } }), "workspace.create.response").await;
+    assert!(r["error"].is_null(), "{r}");
+    let workspace = &r["workspace"];
+    assert_eq!(workspace["workspaceKind"], "worktree");
+    assert_eq!(workspace["worktreeSlug"], "brave-fox");
+    assert_eq!(workspace["name"], "brave-fox");
+    assert_eq!(workspace["gitRuntime"]["isPaseoOwnedWorktree"], true);
+    let dir = std::path::PathBuf::from(workspace["workspaceDirectory"].as_str().unwrap());
+    assert!(dir.starts_with(d.dir.join("home").join("worktrees")), "{dir:?}");
+    assert_eq!(git(&dir, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(), "brave-fox");
+    let id = workspace["id"].as_str().unwrap().to_string();
+
+    let r = rpc(&mut ws, json!({ "type": "fetch_workspaces_request", "requestId": "w2" }), "fetch_workspaces_response").await;
+    assert!(r["entries"].as_array().unwrap().iter().any(|e| e["id"] == id.as_str()), "{r}");
+    let r = rpc(&mut ws, json!({ "type": "paseo_worktree_list_request", "requestId": "w3", "cwd": cwd }), "paseo_worktree_list_response").await;
+    assert!(r["error"].is_null(), "{r}");
+    assert_eq!(r["worktrees"].as_array().unwrap().len(), 1, "{r}");
+    assert_eq!(r["worktrees"][0]["branchName"], "brave-fox");
+
+    let r = rpc(&mut ws, json!({ "type": "workspace.create.request", "requestId": "w4", "source": { "kind": "worktree", "cwd": cwd, "branchName": "bad..name" } }), "workspace.create.response").await;
+    assert!(r["workspace"].is_null() && r["error"].as_str().unwrap().contains("Invalid branch name"), "{r}");
+    let r = rpc(&mut ws, json!({ "type": "workspace.create.request", "requestId": "w5", "source": { "kind": "worktree", "cwd": cwd, "action": "checkout", "refName": "nope" } }), "workspace.create.response").await;
+    assert_eq!(r["errorCode"], "unknown_branch", "{r}");
+
+    // Uncommitted work blocks the archive and nothing changes; once clean the directory goes, the branch stays.
+    std::fs::write(dir.join("draft.txt"), "wip\n").unwrap();
+    let r = rpc(&mut ws, json!({ "type": "archive_workspace_request", "requestId": "w6", "workspaceId": id }), "archive_workspace_response").await;
+    assert!(r["error"].as_str().unwrap().contains("uncommitted"), "{r}");
+    assert!(dir.join("draft.txt").exists());
+    let r = rpc(&mut ws, json!({ "type": "paseo_worktree_archive_request", "requestId": "w7", "worktreePath": dir.to_string_lossy(), "scope": "worktree" }), "paseo_worktree_archive_response").await;
+    assert_eq!(r["success"], false, "{r}");
+    assert_eq!(r["error"]["code"], "NOT_ALLOWED");
+
+    std::fs::remove_file(dir.join("draft.txt")).unwrap();
+    let r = rpc(&mut ws, json!({ "type": "paseo_worktree_archive_request", "requestId": "w8", "worktreePath": dir.to_string_lossy(), "scope": "worktree" }), "paseo_worktree_archive_response").await;
+    assert_eq!(r["success"], true, "{r}");
+    assert!(!dir.exists());
+    assert!(git(&repo, &["branch", "--list", "brave-fox"]).contains("brave-fox"));
+    let r = rpc(&mut ws, json!({ "type": "paseo_worktree_list_request", "requestId": "w9", "cwd": cwd }), "paseo_worktree_list_response").await;
+    assert!(r["worktrees"].as_array().unwrap().is_empty(), "{r}");
+}

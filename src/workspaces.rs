@@ -1,8 +1,7 @@
 //! Workspaces: a named place inside a project where agents run. The app's
 //! new-workspace screen creates one (`workspace.create`) before its first
 //! agent, and the sidebar lists them via `fetch_workspaces` + `workspace_update`.
-//! Only local (directory) workspaces are supported; git worktree isolation is
-//! not, so the app keeps its default "local" isolation.
+//! A workspace is a plain directory or a worktree feiyi created (worktrees.rs).
 
 use crate::manager::Manager;
 use crate::snapshot::{project_descriptor, workspace_descriptor};
@@ -17,7 +16,7 @@ fn new_workspace_id() -> String {
 impl Manager {
     /// Project root a directory belongs to: the longest registered project
     /// containing it, else the directory itself (registered quietly).
-    fn project_root_for(&mut self, dir: &str) -> String {
+    pub(crate) fn project_root_for(&mut self, dir: &str) -> String {
         let found = self
             .projects
             .iter()
@@ -42,6 +41,7 @@ impl Manager {
             pinned_at: None,
             created_at: now_iso(),
             archived_at: None,
+            main_repo_root: None,
         });
         self.store.save_workspaces(&self.workspaces);
         id

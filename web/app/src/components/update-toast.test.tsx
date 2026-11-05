@@ -9,6 +9,9 @@ vi.hoisted(() => {
   (globalThis as unknown as { __DEV__: boolean }).__DEV__ = false;
 });
 
+// update-toast.tsx is compiled with the classic JSX runtime here and does not import React.
+(globalThis as unknown as { React: typeof React }).React = React;
+
 const { hasNewBuild, platform, build } = vi.hoisted(() => ({
   hasNewBuild: vi.fn<(builtId: string) => Promise<boolean>>(),
   platform: { isWeb: true },

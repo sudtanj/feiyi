@@ -1814,6 +1814,108 @@ describe("HostRuntimeStore", () => {
     store.syncHosts([]);
   });
 
+  describe("foreground retry", () => {
+    async function createStuckHost() {
+      const connection: HostConnection = {
+        id: "relay:relay.paseo.sh:443",
+        type: "relay",
+        relayEndpoint: "relay.paseo.sh:443",
+        daemonPublicKeyB64: "pk_stuck",
+      };
+      const host = makeHost({
+        serverId: "srv_stuck",
+        connections: [connection],
+        preferredConnectionId: connection.id,
+      });
+      const stuckClient = new FakeDaemonClient();
+      stuckClient.setConnectionState({ status: "connected" });
+      const freshClient = new FakeDaemonClient();
+      const store = new HostRuntimeStore({
+        storage: createMemoryHostRuntimeStorage(),
+        deps: {
+          createClient: () => freshClient as unknown as DaemonClient,
+          connectToDaemon: async () => ({
+            client: makeConnectedProbeClient(5) as unknown as DaemonClient,
+            serverId: host.serverId,
+            hostname: "stuck",
+          }),
+          getClientId: async () => "cid_test_runtime",
+        },
+      });
+      store.syncHosts([host], {
+        initialConnectionByServerId: new Map([
+          [
+            host.serverId,
+            { connectionId: connection.id, existingClient: stuckClient as unknown as DaemonClient },
+          ],
+        ]),
+      });
+      await waitForHostOnline(store, host.serverId);
+      const requests = { count: 0 };
+      stuckClient.ensureConnected = () => {
+        requests.count++;
+      };
+      return { host, store, stuckClient, freshClient, requests };
+    }
+
+    it("stops retrying once the host is online again", async () => {
+      const { store, stuckClient, freshClient, requests } = await createStuckHost();
+      stuckClient.setConnectionState({ status: "disconnected", reason: "backgrounded" });
+
+      useHostRuntimeClock();
+      store.setAppVisible(true);
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(requests.count).toBe(2);
+
+      stuckClient.setConnectionState({ status: "connected" });
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(requests.count).toBe(2);
+      expect(freshClient.connectCalls).toBe(0);
+      expect(stuckClient.isDisposed()).toBe(false);
+
+      store.syncHosts([]);
+    });
+
+    it("cancels the retries when the app goes to the background", async () => {
+      const { store, stuckClient, freshClient, requests } = await createStuckHost();
+      stuckClient.setConnectionState({ status: "disconnected", reason: "backgrounded" });
+
+      useHostRuntimeClock();
+      store.setAppVisible(true);
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(requests.count).toBe(2);
+
+      store.setAppVisible(false);
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(requests.count).toBe(2);
+      expect(freshClient.connectCalls).toBe(0);
+      expect(stuckClient.isDisposed()).toBe(false);
+
+      store.syncHosts([]);
+    });
+
+    it("leaves hosts with an authentication failure alone", async () => {
+      const { host, store, stuckClient, freshClient, requests } = await createStuckHost();
+      stuckClient.authFailureReason = "incorrect_password";
+      stuckClient.setConnectionState({ status: "disconnected", reason: "Incorrect password" });
+      await onceHostSnapshotMatches(
+        store,
+        host.serverId,
+        (snapshot) => snapshot?.authFailureReason === "incorrect_password",
+      );
+
+      useHostRuntimeClock();
+      store.setAppVisible(true);
+      const afterForeground = requests.count;
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(requests.count).toBe(afterForeground);
+      expect(freshClient.connectCalls).toBe(0);
+      expect(stuckClient.isDisposed()).toBe(false);
+
+      store.syncHosts([]);
+    });
+  });
+
   it("revokes push notifications before removing a host", async () => {
     const host = makeHost({ connections: [makeHost().connections[0]!] });
     const revocation = createDeferred<void>();

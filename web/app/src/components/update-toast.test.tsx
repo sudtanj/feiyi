@@ -206,7 +206,7 @@ describe("UpdateToast", () => {
     expect(reload).toHaveBeenCalledTimes(1);
   });
 
-  it("hides the notice on dismiss and keeps it hidden after later checks", async () => {
+  it("hides the notice on dismiss and stops checking once an update is found", async () => {
     hasNewBuild.mockResolvedValue(true);
     await mountToast();
     await advance(CHECK_INTERVAL_MS);
@@ -219,7 +219,7 @@ describe("UpdateToast", () => {
     expect(container.textContent).toBe("");
 
     await advance(CHECK_INTERVAL_MS);
-    expect(hasNewBuild).toHaveBeenCalledTimes(2);
+    expect(hasNewBuild).toHaveBeenCalledTimes(1);
     expect(container.textContent).toBe("");
   });
 

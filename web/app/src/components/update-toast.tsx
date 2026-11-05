@@ -17,7 +17,7 @@ export function UpdateToast() {
   const [dismissed, setDismissed] = useState(false);
 
   useEffect(() => {
-    if (!isWeb || !BUILT_ID) return undefined;
+    if (!isWeb || !BUILT_ID || available) return undefined;
     const check = () => {
       if (document.visibilityState !== "visible") return;
       void hasNewBuild(BUILT_ID).then((newer) => {
@@ -30,7 +30,7 @@ export function UpdateToast() {
       document.removeEventListener("visibilitychange", check);
       clearInterval(interval);
     };
-  }, []);
+  }, [available]);
 
   const containerStyle = useMemo(
     () => [styles.container, { bottom: theme.spacing[4] + insets.bottom }],
@@ -48,7 +48,7 @@ export function UpdateToast() {
 
   return (
     <View style={containerStyle} pointerEvents="box-none">
-      <View style={styles.toast}>
+      <View style={styles.toast} accessibilityLiveRegion="polite">
         <Text style={styles.title}>{t("desktop.updates.callout.availableTitle")}</Text>
         <Pressable
           onPress={handleUpdate}

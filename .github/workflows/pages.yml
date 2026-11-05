@@ -115,6 +115,33 @@ jobs:
             echo "::warning::Mermaid runtime left inline ($f changed upstream)"
           fi
 
+      # The welcome, splash and onboarding screens draw the logo from this component.
+      - name: Use the feiyi logo in the app
+        working-directory: upstream/packages/app/src/components/icons
+        run: |
+          grep -q 'export function PaseoLogo' paseo-logo.tsx || { echo "::error::PaseoLogo moved upstream"; exit 1; }
+          cat > paseo-logo.tsx <<'EOF'
+          import Svg, { Path } from "react-native-svg";
+          import { useUnistyles } from "react-native-unistyles";
+
+          interface PaseoLogoProps {
+            size?: number;
+            color?: string;
+          }
+
+          // feiyi's mark (web/logo.svg in feiyi) without its background.
+          export function PaseoLogo({ size = 64, color }: PaseoLogoProps) {
+            const { theme } = useUnistyles();
+            const fill = color ?? theme.colors.foreground;
+
+            return (
+              <Svg width={size} height={size} viewBox="120 124 272 272" fill="none">
+                <Path d="M144 176H192V344L144 392Z M144 176H328L368 128L344 224H144Z M192 272H280L312 240L296 312H192Z" fill={fill} />
+              </Svg>
+            );
+          }
+          EOF
+
       - name: Build
         working-directory: upstream
         env:
@@ -188,7 +215,7 @@ jobs:
             const urls = new Set([...html.matchAll(/(?:src|href)="([^"]*\/_expo\/static\/[^"]+)"/g)].map((m) => m[1])); // the CSS is both preloaded and linked
             const c = await caches.open(CACHE);
             await c.put(shell, res);
-            await c.addAll([...urls]);
+            await c.addAll([...urls].map((u) => new Request(u, { cache: "reload" }))); // not a stale copy from the HTTP cache
             await self.skipWaiting();
           })()));
           self.addEventListener("activate", (e) => e.waitUntil((async () => {

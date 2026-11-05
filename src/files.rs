@@ -700,7 +700,11 @@ fn duplicate_entry(cwd: &str, rel: &str) -> Result<String, String> {
             Err(e) => return Err(e.to_string()),
         }
     };
-    copy_tree(&source.requested, &target, &meta).map_err(gone)?;
+    if let Err(e) = copy_tree(&source.requested, &target, &meta) {
+        // Leave no half-made copy behind; the target did not exist before.
+        let _ = if meta.is_dir() { std::fs::remove_dir_all(&target) } else { std::fs::remove_file(&target) };
+        return Err(gone(e));
+    }
     let parent_rel = Path::new(&source.rel).parent().map(|p| p.to_string_lossy().into_owned()).filter(|p| !p.is_empty()).unwrap_or_else(|| ".".into());
     Ok(join_rel(&parent_rel, &copy))
 }

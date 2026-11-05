@@ -60,6 +60,7 @@ fn server_info(ctx: &Ctx) -> Arc<str> {
                 "providerRemoval": true,
                 "checkoutRefresh": true,
                 "checkoutDiscardChanges": true,
+                "fsEntryOps": true,
                 "fsEntryDuplicate": true,
                 "commitsList": true,
                 "commitBaseClassification": true,

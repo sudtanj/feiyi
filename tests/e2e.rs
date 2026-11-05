@@ -1250,3 +1250,110 @@ async fn schedules_persist_and_a_full_daemon_records_a_skipped_run() {
     assert_eq!(saved[0]["id"], id.as_str());
     assert_eq!(saved[0]["runs"][0]["status"], "failed");
 }
+
+#[tokio::test]
+async fn entries_duplicate_copies_a_directory_tree() {
+    let d = start("dupdir", None);
+    let cwd = d.dir.join("work");
+    std::fs::create_dir_all(cwd.join("src/sub")).unwrap();
+    std::fs::write(cwd.join("src/sub/b.txt"), "two").unwrap();
+    let cwd_s = cwd.to_string_lossy().into_owned();
+    let mut ws = connect(d.port).await;
+    hello(&mut ws, None).await;
+
+    let dup = rpc(&mut ws, json!({ "type": "fs.entry.duplicate.request", "requestId": "d1", "cwd": cwd_s, "path": "src" }), "fs.entry.duplicate.response").await;
+    assert_eq!((dup["success"].as_bool(), dup["duplicatedPath"].as_str()), (Some(true), Some("src copy")), "{dup}");
+    assert_eq!(std::fs::read_to_string(cwd.join("src copy/sub/b.txt")).unwrap(), "two");
+    let again = rpc(&mut ws, json!({ "type": "fs.entry.duplicate.request", "requestId": "d2", "cwd": cwd_s, "path": "src" }), "fs.entry.duplicate.response").await;
+    assert_eq!(again["duplicatedPath"], "src copy 2", "{again}");
+    let root = rpc(&mut ws, json!({ "type": "fs.entry.duplicate.request", "requestId": "d3", "cwd": cwd_s, "path": "." }), "fs.entry.duplicate.response").await;
+    assert_eq!(root["success"], false, "{root}");
+}
+
+#[tokio::test]
+async fn worktree_archive_succeeds_when_its_directory_was_deleted_by_hand() {
+    let d = start("wtgone", None);
+    let repo = d.dir.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    git(&repo, &["config", "user.name", "Test"]);
+    std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-q", "-m", "initial"]);
+    let cwd = repo.to_string_lossy().to_string();
+    let mut ws = connect(d.port).await;
+    hello(&mut ws, None).await;
+
+    let r = rpc(&mut ws, json!({ "type": "workspace.create.request", "requestId": "w1", "source": { "kind": "worktree", "cwd": cwd, "worktreeSlug": "gone-fox" } }), "workspace.create.response").await;
+    assert!(r["error"].is_null(), "{r}");
+    let dir = std::path::PathBuf::from(r["workspace"]["workspaceDirectory"].as_str().unwrap());
+    let id = r["workspace"]["id"].as_str().unwrap().to_string();
+    std::fs::remove_dir_all(&dir).unwrap();
+
+    let r = rpc(&mut ws, json!({ "type": "paseo_worktree_archive_request", "requestId": "w2", "worktreePath": dir.to_string_lossy(), "scope": "worktree" }), "paseo_worktree_archive_response").await;
+    assert_eq!(r["success"], true, "{r}");
+    assert!(!git(&repo, &["worktree", "list", "--porcelain"]).contains("gone-fox"), "stale worktree entry was not pruned");
+    assert!(git(&repo, &["branch", "--list", "gone-fox"]).contains("gone-fox"));
+    let r = rpc(&mut ws, json!({ "type": "paseo_worktree_list_request", "requestId": "w3", "cwd": cwd }), "paseo_worktree_list_response").await;
+    assert!(r["worktrees"].as_array().unwrap().is_empty(), "{r}");
+    let r = rpc(&mut ws, json!({ "type": "fetch_workspaces_request", "requestId": "w4" }), "fetch_workspaces_response").await;
+    assert!(!r["entries"].as_array().unwrap().iter().any(|e| e["id"] == id.as_str()), "{r}");
+}
+
+#[tokio::test]
+async fn archiving_a_workspace_ends_its_terminals() {
+    let d = start_with(unique_dir("termarch"), None, "ok", &[("SHELL", "/bin/sh")]);
+    let proj = d.dir.join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let cwd = proj.to_string_lossy().into_owned();
+    let mut ws = connect(d.port).await;
+    hello(&mut ws, None).await;
+
+    let r = rpc(&mut ws, json!({ "type": "workspace.create.request", "requestId": "w1", "source": { "kind": "directory", "path": cwd } }), "workspace.create.response").await;
+    assert!(r["error"].is_null(), "{r}");
+    let workspace_id = r["workspace"]["id"].as_str().unwrap().to_string();
+
+    send(&mut ws, session(json!({ "type": "create_terminal_request", "requestId": "t1", "cwd": cwd, "workspaceId": workspace_id }))).await;
+    let created = terminal_payload(&mut ws, "create_terminal_response").await;
+    assert!(created["error"].is_null(), "{created}");
+    let id = created["terminal"]["id"].as_str().unwrap().to_string();
+    send(&mut ws, session(json!({ "type": "subscribe_terminal_request", "requestId": "s1", "terminalId": id, "restore": { "mode": "visible-snapshot" } }))).await;
+    let sub = terminal_payload(&mut ws, "subscribe_terminal_response").await;
+    assert!(sub["error"].is_null(), "{sub}");
+
+    send(&mut ws, session(json!({ "type": "archive_workspace_request", "requestId": "a1", "workspaceId": workspace_id }))).await;
+    let exit = terminal_payload(&mut ws, "terminal_stream_exit").await;
+    assert_eq!(exit["terminalId"], id.as_str());
+
+    send(&mut ws, session(json!({ "type": "list_terminals_request", "requestId": "l1", "workspaceId": workspace_id }))).await;
+    let listed = terminal_payload(&mut ws, "list_terminals_response").await;
+    assert!(listed["terminals"].as_array().unwrap().is_empty(), "{listed}");
+
+    send(&mut ws, session(json!({ "type": "create_terminal_request", "requestId": "t2", "cwd": cwd, "workspaceId": workspace_id }))).await;
+    let refused = terminal_payload(&mut ws, "create_terminal_response").await;
+    assert!(refused["terminal"].is_null() && refused["error"].is_string(), "{refused}");
+}
+
+#[tokio::test]
+async fn schedule_create_rejects_an_interval_under_one_minute() {
+    let d = start("schedmin", None);
+    let cwd = d.dir.join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let mut ws = connect(d.port).await;
+    hello(&mut ws, None).await;
+
+    for (request_id, every_ms) in [("s1", 59_999u64), ("s2", 0)] {
+        let mut msg = new_agent_schedule(request_id, &cwd);
+        msg["cadence"]["everyMs"] = json!(every_ms);
+        send(&mut ws, session(msg)).await;
+        let err = recv_until(&mut ws, |v| (v["message"]["type"] == "rpc_error").then(|| v["message"]["payload"].clone())).await;
+        assert_eq!(err["requestId"], request_id, "{err}");
+        assert!(err["error"].as_str().unwrap().contains("everyMs must be between 1 minute"), "{err}");
+    }
+    let listed = rpc(&mut ws, json!({ "type": "schedule/list", "requestId": "s3" }), "schedule/list/response").await;
+    assert!(listed["schedules"].as_array().unwrap().is_empty(), "{listed}");
+
+    let ok = rpc(&mut ws, { let mut m = new_agent_schedule("s4", &cwd); m["cadence"]["everyMs"] = json!(60_000); m }, "schedule/create/response").await;
+    assert!(ok["error"].is_null(), "{ok}");
+}

@@ -430,6 +430,12 @@ impl Manager {
                 reply(out, json!({ "type": "daemon.get_pairing_offer.response", "payload": { "requestId": rid, "url": url, "qr": qr, "relayEnabled": self.pairing_url.is_some() } }));
             }
             "client_heartbeat" => self.client_heartbeat(&msg, out),
+            // The PWA's connection log, sent once it is connected again (web/app/src/runtime/connection-log.ts).
+            "feiyi.client_log" => {
+                for line in msg.get("lines").and_then(|v| v.as_array()).into_iter().flatten().filter_map(|v| v.as_str()).take(200) {
+                    crate::log!("pwa {}", line.replace(['\r', '\n'], " "));
+                }
+            }
             "register_push_token" => {
                 if let Some(token) = s(&msg, "token") {
                     self.push_tokens.renew(&token);

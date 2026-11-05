@@ -30,6 +30,7 @@ import {
 } from "@/utils/daemon-endpoints";
 import { resolveAppVersion } from "@/utils/app-version";
 import { ConnectionOfferSchema, type ConnectionOffer } from "@getpaseo/protocol/connection-offer";
+import { connectionLogger, flushConnectionLog, logConnection } from "./connection-log";
 import { HostConfirmations, type HostConfirmationRequest } from "./host-confirmation";
 import { shouldUseDesktopDaemon } from "@/desktop/daemon/desktop-daemon";
 import { isWeb } from "@/constants/platform";
@@ -559,6 +560,7 @@ function createDefaultDeps(): HostRuntimeControllerDeps {
       const webSocketConfig = { webSocketFactory: createAppWebSocketFactory() };
       const base = {
         suppressSendErrors: true,
+        logger: connectionLogger,
         clientId,
         clientType: "mobile",
         appVersion: resolveAppVersion() ?? undefined,
@@ -1352,6 +1354,7 @@ export class HostRuntimeController {
 
     const failConnection = async (error: unknown) => {
       if (!this.isCurrentSwitchRequest(requestVersion) || this.activeClient !== client) return;
+      logConnection("connect failed", { error: toErrorMessage(error) });
       const authFailure = getConnectionAuthFailureReason(error);
       if (authFailure) this.authRejectedConnectionIds.add(connection.id);
       this.unsubscribeClientStatus?.();
@@ -1398,6 +1401,7 @@ export class HostRuntimeController {
           void failConnection(new DaemonAuthenticationError(client.authFailureReason));
           return;
         }
+        logConnection(`client state ${state.status}`, { lastError: client.lastError });
         this.applyConnectionEvent({ type: "client_state", state, lastError: client.lastError });
         this.updateSnapshot({
           ...toSnapshotConnectionPatch(this.connectionMachineState, this.connectionEpoch),
@@ -1405,6 +1409,7 @@ export class HostRuntimeController {
           client,
           authFailureReason: null,
         });
+        if (state.status === "connected") flushConnectionLog(client);
       });
     } catch (error) {
       await failConnection(error);
@@ -2587,6 +2592,7 @@ export class HostRuntimeStore {
   private foregroundWatchdog: ReturnType<typeof setTimeout> | null = null;
 
   setAppVisible(visible: boolean): void {
+    logConnection(visible ? "foreground" : "background", { statuses: this.connectionStatuses() });
     if (this.foregroundWatchdog) {
       clearTimeout(this.foregroundWatchdog);
       this.foregroundWatchdog = null;
@@ -2604,6 +2610,10 @@ export class HostRuntimeStore {
 
   // An Android PWA can resume with a client that never reconnects; only killing the
   // app recovered it. Do the same in steps: a new client, then a page reload.
+  private connectionStatuses(): string[] {
+    return [...this.controllers.values()].map((controller) => controller.getSnapshot().connectionStatus);
+  }
+
   private watchForegroundReconnect(step: "new_client" | "reload"): void {
     this.foregroundWatchdog = setTimeout(
       () => {
@@ -2617,6 +2627,7 @@ export class HostRuntimeStore {
           );
         });
         if (stuck.length === 0) return;
+        logConnection(`watchdog ${step}`, { statuses: this.connectionStatuses() });
         if (step === "new_client") {
           for (const controller of stuck) controller.reconnectWithNewClient();
           this.watchForegroundReconnect("reload");

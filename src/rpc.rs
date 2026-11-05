@@ -30,6 +30,15 @@ pub(crate) fn normalize_dir(path: &str) -> Result<String, String> {
     Ok(canon.to_string_lossy().into_owned())
 }
 
+pub(crate) fn pong(msg: &Value) -> Value {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+    let mut payload = json!({ "requestId": s(msg, "requestId").unwrap_or_default(), "serverReceivedAt": now, "serverSentAt": now });
+    if let Some(sent) = msg.get("clientSentAt") {
+        payload["clientSentAt"] = sent.clone();
+    }
+    json!({ "type": "pong", "payload": payload })
+}
+
 impl Manager {
     pub(crate) fn resolve(&self, key: &str) -> Option<String> {
         if self.agents.contains_key(key) {
@@ -448,14 +457,7 @@ impl Manager {
             }
             "abort_request" => {}
             k if k.starts_with("schedule/") => self.schedule_rpc(k, &msg, &rid, out),
-            "ping" => {
-                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
-                let mut payload = json!({ "requestId": rid, "serverReceivedAt": now, "serverSentAt": now });
-                if let Some(sent) = msg.get("clientSentAt") {
-                    payload["clientSentAt"] = sent.clone();
-                }
-                reply(out, json!({ "type": "pong", "payload": payload }));
-            }
+            "ping" => reply(out, pong(&msg)),
             _ => {
                 let git = crate::git_actions::GitCtx { watcher: self.checkout.clone(), bcast: self.bcast.clone() };
                 // File explorer, downloads, saves and entry edits (files.rs).

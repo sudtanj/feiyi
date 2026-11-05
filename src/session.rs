@@ -176,6 +176,12 @@ pub async fn run(ctx: Arc<Ctx>, mut inbound: mpsc::Receiver<Inbound>, outbound: 
                             }
                             continue;
                         }
+                        // The app's foreground connection check allows 3 s; a busy manager
+                        // must not fail it and force a full reconnect and resync.
+                        if inner.get("type").and_then(|t| t.as_str()) == Some("ping") {
+                            crate::manager::reply(&reply_tx, crate::rpc::pong(&inner));
+                            continue;
+                        }
                         if watches.handle(inner.get("type").and_then(|t| t.as_str()).unwrap_or(""), &inner, &reply_tx) {
                             continue;
                         }

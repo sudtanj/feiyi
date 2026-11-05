@@ -90,6 +90,7 @@ jobs:
   # Published as a rolling "latest" release so the image build downloads the
   # binaries instead of compiling.
   release:
+    if: github.ref == 'refs/heads/main'
     needs: [musl]
     runs-on: ubuntu-latest
     permissions:

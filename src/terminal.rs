@@ -16,11 +16,13 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::unix::AsyncFd;
 use tokio::sync::{mpsc, oneshot, watch};
 
 const MAX_TERMINALS: usize = 4;
+/// A terminal nobody is subscribed to is ended after this long.
+const IDLE_LIMIT: Duration = Duration::from_secs(30 * 60);
 const RING_BYTES: usize = 256 * 1024;
 const FRAME_BYTES: usize = 64 * 1024;
 const OP_OUTPUT: u8 = 0x01;
@@ -261,11 +263,14 @@ impl Term {
         .await;
     }
 
+    /// Once the shell is reaped the child is dropped, so `end` never signals a recycled pid.
     fn gone(&self) -> bool {
-        match self.child.lock().unwrap().as_mut() {
-            Some(child) => !matches!(child.try_wait(), Ok(None)),
-            None => true,
+        let mut child = self.child.lock().unwrap();
+        let alive = child.as_mut().is_some_and(|c| matches!(c.try_wait(), Ok(None)));
+        if !alive {
+            child.take();
         }
+        !alive
     }
 
     /// Kill the whole process group, reap the shell, mark the terminal exited.
@@ -282,7 +287,8 @@ impl Term {
 /// Reads the shell's output into the ring until it exits, then cleans up.
 async fn pump(term: Arc<Term>) {
     let mut buf = vec![0u8; 16 * 1024];
-    let mut tick = tokio::time::interval(Duration::from_millis(500));
+    let mut tick = tokio::time::interval(Duration::from_secs(2));
+    let mut idle_since = Instant::now();
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
@@ -298,6 +304,12 @@ async fn pump(term: Arc<Term>) {
             }
             _ = tick.tick() => {
                 if term.gone() {
+                    break;
+                }
+                // The registry and this task hold two references; any more are subscribers.
+                if Arc::strong_count(&term) > 2 {
+                    idle_since = Instant::now();
+                } else if idle_since.elapsed() >= IDLE_LIMIT {
                     break;
                 }
             }
@@ -355,6 +367,13 @@ impl Manager {
         }
         let workspace = workspace_id.map(String::from).or_else(|| live().find(|w| w.directory == dir).map(|w| w.id.clone()));
         Ok((dir, workspace))
+    }
+}
+
+/// End every terminal of a workspace that is being archived.
+pub fn end_workspace(workspace_id: &str) {
+    for term in matching(None, Some(workspace_id)) {
+        term.end();
     }
 }
 

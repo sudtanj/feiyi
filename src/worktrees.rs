@@ -14,6 +14,7 @@ use crate::git_actions::{branch_slug_error, resolve_branch, safe_ref};
 use crate::manager::{reply, Cmd, Manager, Out};
 use crate::projects::run;
 use crate::rpc::{normalize_dir, s};
+use crate::terminal;
 use crate::util::{new_id, now_iso};
 use serde_json::{json, Value};
 use std::path::{Component, Path, PathBuf};
@@ -460,6 +461,7 @@ impl Manager {
         let mut at = now_iso();
         for id in ids {
             at = self.archive_workspace(id).map_err(|e| fail("UNKNOWN", e))?;
+            terminal::end_workspace(id);
         }
         Ok((at, agents))
     }
@@ -475,7 +477,8 @@ impl Manager {
         };
         let (policy, cmds) = (self.cfg.delete_project_files, self.cmds_tx.clone());
         tokio::spawn(async move {
-            let refused = if policy == Policy::Safe { refusal(Path::new(&path)).await } else { None };
+            let missing = !Path::new(&path).exists();
+            let refused = if policy == Policy::Safe && !missing { refusal(Path::new(&path)).await } else { None };
             let _ = cmds.send(Cmd::Run(Box::new(move |m: &mut Manager| {
                 if let Some(reason) = refused {
                     return done(m, Err(fail("NOT_ALLOWED", format!("Worktree not archived: {reason}"))));
@@ -483,7 +486,8 @@ impl Manager {
                 let archived = m.archive_ids(&ids);
                 let cmds = m.cmds_tx.clone();
                 tokio::spawn(async move {
-                    match remove(&repo, &path, policy == Policy::All).await {
+                    let removed = if missing { git(Path::new(&repo), &["worktree", "prune"]).await.map(|_| ()) } else { remove(&repo, &path, policy == Policy::All).await };
+                    match removed {
                         Ok(()) => crate::log!("removed worktree {path}"),
                         Err(e) => crate::warn!("kept worktree {path}: {e}"),
                     }

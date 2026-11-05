@@ -14,9 +14,12 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-/// Finished runs kept per schedule (more when `maxRuns` is higher).
+/// Finished runs kept per schedule.
 const RUN_HISTORY: usize = 100;
 const OUTPUT_MAX: usize = 16 * 1024;
+const MAX_SCHEDULES: usize = 64;
+const MAX_NAME: usize = 200;
+const MAX_PROMPT: usize = 64 * 1024;
 const MAX_SLEEP_MS: i64 = 24 * 3600 * 1000;
 
 pub fn now_ms() -> i64 {
@@ -63,6 +66,9 @@ pub struct Schedule {
     pub paused_at: Option<String>,
     pub expires_at: Option<String>,
     pub max_runs: Option<u64>,
+    /// Runs that have ended; the history is trimmed, this is not.
+    #[serde(default)]
+    pub completed: u64,
     pub runs: Vec<Run>,
 }
 
@@ -76,7 +82,7 @@ impl Schedule {
     }
 
     fn completed_runs(&self) -> u64 {
-        self.runs.iter().filter(|r| r.status != "running").count() as u64
+        self.completed
     }
 
     fn finished(&self, now: i64) -> bool {
@@ -92,8 +98,7 @@ impl Schedule {
 
     fn push_run(&mut self, run: Run) {
         self.runs.push(run);
-        let keep = RUN_HISTORY.max(self.max_runs.unwrap_or(0) as usize);
-        let mut excess = self.runs.len().saturating_sub(keep);
+        let mut excess = self.runs.len().saturating_sub(RUN_HISTORY);
         self.runs.retain(|r| {
             let remove = excess > 0 && r.status != "running";
             excess -= usize::from(remove);
@@ -106,6 +111,7 @@ impl Schedule {
         let mut v = serde_json::to_value(self).unwrap_or_default();
         if let Some(o) = v.as_object_mut() {
             o.remove("runs");
+            o.remove("completed");
         }
         v
     }
@@ -182,8 +188,18 @@ fn parse_target(target: Option<&Value>) -> Result<Value, String> {
     }
 }
 
+fn check_len(text: Option<&str>, max: usize, what: &str) -> Result<(), String> {
+    match text {
+        Some(t) if t.len() > max => Err(format!("{what} is longer than {max} bytes")),
+        _ => Ok(()),
+    }
+}
+
 fn new_schedule(msg: &Value, now: i64) -> Result<Schedule, String> {
     let prompt = msg.get("prompt").and_then(trimmed).ok_or("Schedule prompt is required")?;
+    check_len(Some(&prompt), MAX_PROMPT, "Schedule prompt")?;
+    let name = msg.get("name").and_then(trimmed);
+    check_len(name.as_deref(), MAX_NAME, "Schedule name")?;
     let cadence: Cadence = serde_json::from_value(msg.get("cadence").cloned().unwrap_or_default()).map_err(|e| format!("Invalid cadence: {e}"))?;
     cadence.validate()?;
     let target = parse_target(msg.get("target"))?;
@@ -191,7 +207,7 @@ fn new_schedule(msg: &Value, now: i64) -> Result<Schedule, String> {
     let next = if run_now { now } else { cadence.next_run(now, now)? };
     Ok(Schedule {
         id: new_id(),
-        name: msg.get("name").and_then(trimmed),
+        name,
         prompt,
         cadence,
         target,
@@ -203,6 +219,7 @@ fn new_schedule(msg: &Value, now: i64) -> Result<Schedule, String> {
         paused_at: None,
         expires_at: parse_expires(msg.get("expiresAt"))?,
         max_runs: parse_max_runs(msg.get("maxRuns"))?,
+        completed: 0,
         runs: Vec::new(),
     })
 }
@@ -233,7 +250,7 @@ fn patch_config(config: &mut serde_json::Map<String, Value>, patch: &Value) -> R
 impl Schedules {
     pub fn load(home: &Path, now: i64) -> Schedules {
         let path = home.join("schedules.json");
-        let list = match std::fs::read(&path) {
+        let mut list: Vec<Schedule> = match std::fs::read(&path) {
             Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
                 crate::warn!("schedules.json unreadable ({e}); kept as schedules.json.bad, starting empty");
                 let _ = std::fs::rename(&path, home.join("schedules.json.bad"));
@@ -241,6 +258,9 @@ impl Schedules {
             }),
             Err(_) => Vec::new(),
         };
+        for s in list.iter_mut().filter(|s| s.completed == 0) {
+            s.completed = s.runs.iter().filter(|r| r.status != "running").count() as u64;
+        }
         let mut schedules = Schedules { path, list, in_flight: Vec::new() };
         if schedules.recover(now) {
             schedules.save();
@@ -255,6 +275,7 @@ impl Schedules {
             let mut touched = false;
             for run in s.runs.iter_mut().filter(|r| r.status == "running") {
                 run.status = "failed".into();
+                s.completed += 1;
                 run.ended_at = Some(iso(now));
                 run.error = Some("Daemon restarted before the scheduled run completed".into());
                 touched = true;
@@ -352,9 +373,11 @@ impl Schedules {
         let mut s = self.get(id)?.clone();
         if let Some(prompt) = msg.get("prompt") {
             s.prompt = trimmed(prompt).ok_or("Schedule prompt is required")?;
+            check_len(Some(&s.prompt), MAX_PROMPT, "Schedule prompt")?;
         }
         if let Some(name) = msg.get("name") {
             s.name = trimmed(name);
+            check_len(s.name.as_deref(), MAX_NAME, "Schedule name")?;
         }
         if let Some(c) = msg.get("cadence") {
             let mut cadence: Cadence = serde_json::from_value(c.clone()).map_err(|e| format!("Invalid cadence: {e}"))?;
@@ -428,7 +451,11 @@ impl Schedules {
         let s = self.list.iter_mut().find(|s| s.id == id)?;
         let slot = s.next_run_ms().filter(|slot| *slot <= now && s.status == "active" && !s.finished(now))?;
         let last = s.max_runs.is_some_and(|m| s.completed_runs() + 1 >= m);
-        s.next_run_at = if last { None } else { s.cadence.next_run(slot, now).ok().map(iso) };
+        let next = if last { Ok(None) } else { s.cadence.next_run(slot, now).map(Some) };
+        match next {
+            Ok(next) => s.next_run_at = next.map(iso),
+            Err(_) => s.complete(now),
+        }
         let run = start_run(slot, now);
         let run_id = run.id.clone();
         s.push_run(run);
@@ -472,6 +499,9 @@ impl Schedules {
         let mut scheduled_for = now;
         if let Some(run) = s.runs.iter_mut().find(|r| r.id == run_id) {
             scheduled_for = parse_iso(&run.scheduled_for).unwrap_or(now);
+            if run.status == "running" {
+                s.completed += 1;
+            }
             run.status = if outcome.error.is_none() { "succeeded" } else { "failed" }.into();
             run.ended_at = Some(stamp.clone());
             if outcome.agent_id.is_some() {
@@ -612,6 +642,7 @@ impl Manager {
         let now = now_ms();
         let id = s(msg, "scheduleId").unwrap_or_default();
         let result = match kind {
+            "schedule/create" if self.schedules.list.len() >= MAX_SCHEDULES => Err(format!("Schedule limit reached ({MAX_SCHEDULES})")),
             "schedule/create" => new_schedule(msg, now).map(|schedule| json!({ "schedule": self.schedules.add(schedule).summary() })),
             "schedule/list" => Ok(json!({ "schedules": self.schedules.list.iter().map(Schedule::summary).collect::<Vec<_>>() })),
             "schedule/inspect" => self.schedules.get(&id).map(|schedule| json!({ "schedule": schedule })),
@@ -671,7 +702,7 @@ mod tests {
         let cron = new_schedule(&request(json!({})), T0 + 2 * MIN).unwrap();
         assert_eq!(cron.next_run_at.as_deref(), Some(iso(T0 + 5 * MIN).as_str()));
         assert_eq!((cron.status.as_str(), cron.name, cron.max_runs), ("active", None, None));
-        let every = new_schedule(&request(json!({ "cadence": { "type": "every", "everyMs": 1000 } })), T0).unwrap();
+        let every = new_schedule(&request(json!({ "cadence": { "type": "every", "everyMs": 60_000 } })), T0).unwrap();
         assert_eq!(every.next_run_at.as_deref(), Some(iso(T0).as_str()));
         let now = new_schedule(&request(json!({ "runOnCreate": true })), T0 + 2 * MIN).unwrap();
         assert_eq!(now.next_run_at.as_deref(), Some(iso(T0 + 2 * MIN).as_str()));
@@ -689,6 +720,14 @@ mod tests {
         assert_eq!(bad(json!({ "target": { "type": "new-agent", "config": { "provider": "claude", "cwd": " " } } })), "cwd is required");
         assert!(bad(json!({ "target": { "type": "new-agent", "config": { "provider": "claude", "cwd": "/tmp", "isolation": "worktree" } } })).contains("worktrees"));
         assert_eq!(bad(json!({ "target": { "type": "agent" } })), "agentId is required");
+    }
+
+    #[test]
+    fn create_enforces_floors_and_limits() {
+        let bad = |extra: Value| new_schedule(&request(extra), T0).unwrap_err();
+        assert!(bad(json!({ "cadence": { "type": "every", "everyMs": 1000 } })).contains("everyMs"));
+        assert!(bad(json!({ "name": "n".repeat(MAX_NAME + 1) })).contains("name"));
+        assert!(bad(json!({ "prompt": "p".repeat(MAX_PROMPT + 1) })).contains("prompt"));
     }
 
     #[test]
@@ -845,7 +884,7 @@ mod tests {
     #[test]
     fn run_history_is_capped_but_never_drops_a_running_run() {
         let mut st = store("history");
-        let id = st.add(new_schedule(&request(json!({ "cadence": { "type": "every", "everyMs": 1000 } })), T0).unwrap()).id;
+        let id = st.add(new_schedule(&request(json!({ "cadence": { "type": "every", "everyMs": 60_000 }, "maxRuns": 1000 })), T0).unwrap()).id;
         for i in 0..(RUN_HISTORY as i64 + 20) {
             let (_, run_id) = st.claim_manual(&id, T0 + i).unwrap();
             st.finish(&id, &run_id, outcome(None), true, T0 + i);
@@ -853,6 +892,7 @@ mod tests {
         let (s, _) = st.claim_manual(&id, T0 + 1000).unwrap();
         assert_eq!(s.runs.len(), RUN_HISTORY);
         assert_eq!(s.runs.last().unwrap().status, "running");
+        assert_eq!(s.completed, RUN_HISTORY as u64 + 20);
     }
 
     #[test]
@@ -879,6 +919,29 @@ mod tests {
         let reread = Schedules::load(&dir, T0 + 61 * MIN);
         assert_eq!(reread.get(&id).unwrap().runs.len(), 1);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn files_without_a_run_counter_count_their_finished_runs() {
+        let dir = std::env::temp_dir().join(format!("feiyi-schedules-old-{}", new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut st = Schedules::load(&dir, T0);
+        let id = st.add(new_schedule(&request(json!({})), T0).unwrap()).id;
+        let (_, run_id) = st.claim(&id, T0 + 5 * MIN).unwrap();
+        st.finish(&id, &run_id, outcome(None), false, T0 + 5 * MIN);
+        let mut files: Vec<Value> = serde_json::from_slice(&std::fs::read(dir.join("schedules.json")).unwrap()).unwrap();
+        files[0].as_object_mut().unwrap().remove("completed");
+        std::fs::write(dir.join("schedules.json"), serde_json::to_vec(&files).unwrap()).unwrap();
+        assert_eq!(Schedules::load(&dir, T0 + 6 * MIN).get(&id).unwrap().completed, 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_slot_that_cannot_be_computed_completes_the_schedule() {
+        let mut st = store("nonext");
+        let id = st.add(new_schedule(&request(json!({ "cadence": { "type": "cron", "expression": "0 0 30 2 *" }, "runOnCreate": true })), T0).unwrap()).id;
+        let (s, _) = st.claim(&id, T0).unwrap();
+        assert_eq!((s.status.as_str(), s.next_run_at), ("completed", None));
     }
 
     #[test]

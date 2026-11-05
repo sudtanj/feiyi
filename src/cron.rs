@@ -20,12 +20,13 @@ pub enum Cadence {
 
 /// 100 years: keeps every computed timestamp inside what RFC 3339 can print.
 const MAX_EVERY_MS: u64 = 3_155_760_000_000;
+const MIN_EVERY_MS: u64 = 60_000;
 const SEARCH_MINUTES: i64 = 366 * 24 * 60;
 
 impl Cadence {
     pub fn validate(&self) -> Result<(), String> {
         match self {
-            Cadence::Every { every_ms } if *every_ms == 0 || *every_ms > MAX_EVERY_MS => Err("everyMs must be between 1 and 100 years".into()),
+            Cadence::Every { every_ms } if !(MIN_EVERY_MS..=MAX_EVERY_MS).contains(every_ms) => Err("everyMs must be between 1 minute and 100 years".into()),
             Cadence::Every { .. } => Ok(()),
             Cadence::Cron { expression, timezone } => {
                 Cron::parse(expression)?;
@@ -119,6 +120,11 @@ fn parse_field(source: &str, min: u32, max: u32, name: &str) -> Result<u64, Stri
     Ok(bits)
 }
 
+/// Day-of-week 7 is Sunday, like 0.
+fn sunday_is_seven(weekday: u64) -> u64 {
+    weekday | weekday >> 7 & 1
+}
+
 impl Cron {
     fn parse(expression: &str) -> Result<Cron, String> {
         let parts: Vec<&str> = expression.split_whitespace().collect();
@@ -130,7 +136,7 @@ impl Cron {
             hour: parse_field(hour, 0, 23, "hour")?,
             day: parse_field(day, 1, 31, "day-of-month")?,
             month: parse_field(month, 1, 12, "month")?,
-            weekday: parse_field(weekday, 0, 6, "day-of-week")?,
+            weekday: sunday_is_seven(parse_field(weekday, 0, 7, "day-of-week")?),
         })
     }
 
@@ -437,6 +443,13 @@ mod tests {
     }
 
     #[test]
+    fn weekday_seven_is_sunday() {
+        let saturday = ms(2024, 1, 6, 9, 0);
+        assert_eq!(cron("0 9 * * 7", None).next_run(saturday, saturday), Ok(ms(2024, 1, 7, 9, 0)));
+        assert_eq!(cron("0 9 * * 7", None).next_run(saturday, saturday), cron("0 9 * * 0", None).next_run(saturday, saturday));
+    }
+
+    #[test]
     fn cron_search_is_bounded_to_a_year() {
         let from = ms(2023, 3, 1, 0, 0);
         assert_eq!(cron("0 0 29 2 *", None).next_run(from, from), Ok(ms(2024, 2, 29, 0, 0)));
@@ -446,10 +459,10 @@ mod tests {
 
     #[test]
     fn cron_rejects_what_upstream_rejects() {
-        for bad in ["* * * *", "* * * * * *", "60 * * * *", "* 24 * * *", "* * 0 * *", "* * * 13 *", "* * * * 7", "*/0 * * * *", "*/05 * * * *", "5-1 * * * *", "1,,2 * * * *", "1/2/3 * * * *", "a * * * *", "-1 * * * *", "1- * * * *", ""] {
+        for bad in ["* * * *", "* * * * * *", "60 * * * *", "* 24 * * *", "* * 0 * *", "* * * 13 *", "* * * * 8", "*/0 * * * *", "*/05 * * * *", "5-1 * * * *", "1,,2 * * * *", "1/2/3 * * * *", "a * * * *", "-1 * * * *", "1- * * * *", ""] {
             assert!(cron(bad, None).validate().is_err(), "{bad}");
         }
-        for good in ["* * * * *", "0 0 1 1 *", " 0  9 * * 1-5 ", "*/5 0-6/2 1,15 */3 0,6", "5/2 * * * *"] {
+        for good in ["* * * * *", "0 0 1 1 *", " 0  9 * * 1-5 ", "*/5 0-6/2 1,15 */3 0,6", "0 9 * * 7", "0 9 * * 5-7", "5/2 * * * *"] {
             assert_eq!(cron(good, None).validate(), Ok(()), "{good}");
         }
     }
@@ -464,8 +477,9 @@ mod tests {
     #[test]
     fn every_must_be_positive_and_bounded() {
         assert!(Cadence::Every { every_ms: 0 }.validate().is_err());
+        assert!(Cadence::Every { every_ms: 59_999 }.validate().is_err());
         assert!(Cadence::Every { every_ms: u64::MAX }.validate().is_err());
-        assert_eq!(Cadence::Every { every_ms: 1 }.validate(), Ok(()));
+        assert_eq!(Cadence::Every { every_ms: 60_000 }.validate(), Ok(()));
     }
 
     #[test]

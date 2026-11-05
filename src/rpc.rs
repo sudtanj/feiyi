@@ -452,6 +452,7 @@ impl Manager {
                 reply(out, json!({ "type": "read_project_config_response", "payload": payload }));
             }
             "abort_request" => {}
+            k if k.starts_with("schedule/") => self.schedule_rpc(k, &msg, &rid, out),
             "ping" => {
                 let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
                 let mut payload = json!({ "requestId": rid, "serverReceivedAt": now, "serverSentAt": now });
@@ -499,7 +500,7 @@ impl Manager {
         });
     }
 
-    fn create_agent(&mut self, msg: &Value, rid: &str, out: &Out) {
+    pub(crate) fn create_agent(&mut self, msg: &Value, rid: &str, out: &Out) {
         let config = msg.get("config").cloned().unwrap_or(Value::Null);
         let provider = s(&config, "provider").unwrap_or_default();
         let fail = |error: String| reply(out, json!({ "type": "status", "payload": { "status": "agent_create_failed", "requestId": rid, "error": error } }));

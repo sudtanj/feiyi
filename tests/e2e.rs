@@ -938,3 +938,132 @@ async fn codex_gets_the_shell_environment_exclude() {
     let args = std::fs::read_to_string(&file).expect("codex was started");
     assert!(args.lines().any(|l| l.starts_with("shell_environment_policy.exclude=") && l.contains("PASEO_*") && l.contains("*API_KEY*")), "{args}");
 }
+
+/// Poll `schedule/inspect` until the schedule has `runs` runs and none is running.
+async fn schedule_settled(ws: &mut Ws, id: &str, runs: usize) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let r = rpc(ws, json!({ "type": "schedule/inspect", "requestId": "poll", "scheduleId": id }), "schedule/inspect/response").await;
+        let list = r["schedule"]["runs"].as_array().expect("runs").clone();
+        if list.len() >= runs && list.iter().all(|run| run["status"] != "running") {
+            return r["schedule"].clone();
+        }
+        assert!(Instant::now() < deadline, "schedule runs did not finish: {r}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+fn new_agent_schedule(request_id: &str, cwd: &std::path::Path) -> Value {
+    json!({
+        "type": "schedule/create",
+        "requestId": request_id,
+        "name": "build check",
+        "prompt": "say hi",
+        "cadence": { "type": "every", "everyMs": 3_600_000 },
+        "target": { "type": "new-agent", "config": { "provider": "claude", "cwd": cwd.to_string_lossy(), "modeId": "bypassPermissions" } },
+    })
+}
+
+#[tokio::test]
+async fn schedules_create_list_run_now_pause_update_delete() {
+    let d = start("schedules", None);
+    let cwd = d.dir.join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let mut ws = connect(d.port).await;
+    hello(&mut ws, None).await;
+
+    let created = rpc(&mut ws, new_agent_schedule("s1", &cwd), "schedule/create/response").await;
+    assert!(created["error"].is_null(), "{created}");
+    let schedule = &created["schedule"];
+    assert_eq!((schedule["status"].as_str(), schedule["name"].as_str(), schedule["maxRuns"].is_null()), (Some("active"), Some("build check"), true), "{created}");
+    assert!(schedule.get("runs").is_none(), "{created}");
+    let id = schedule["id"].as_str().unwrap().to_string();
+
+    // An interval schedule runs on creation: a new agent answers, and its output is recorded.
+    let first = schedule_settled(&mut ws, &id, 1).await;
+    let run = &first["runs"][0];
+    assert_eq!(run["status"], "succeeded", "{first}");
+    assert!(run["output"].as_str().unwrap().contains("hello from fake claude"), "{first}");
+    assert!(run["agentId"].is_string() && run["error"].is_null() && run["endedAt"].is_string(), "{first}");
+    assert!(first["lastRunAt"].is_string() && first["nextRunAt"].is_string(), "{first}");
+
+    let listed = rpc(&mut ws, json!({ "type": "schedule/list", "requestId": "s2" }), "schedule/list/response").await;
+    assert_eq!(listed["schedules"].as_array().unwrap().len(), 1, "{listed}");
+    assert_eq!(listed["schedules"][0]["id"], id.as_str());
+    assert!(listed["schedules"][0].get("runs").is_none());
+
+    // Run now adds a run without moving the cadence.
+    let ran = rpc(&mut ws, json!({ "type": "schedule/run-once", "requestId": "s3", "scheduleId": id }), "schedule/run-once/response").await;
+    assert!(ran["error"].is_null(), "{ran}");
+    assert_eq!(ran["schedule"]["runs"].as_array().unwrap().len(), 2, "{ran}");
+    let both = schedule_settled(&mut ws, &id, 2).await;
+    assert!(both["runs"].as_array().unwrap().iter().all(|r| r["status"] == "succeeded"), "{both}");
+    assert_eq!(both["nextRunAt"], first["nextRunAt"]);
+
+    // Each run's agent is archived once it finishes.
+    let live = rpc(&mut ws, json!({ "type": "fetch_agents_request", "requestId": "s4" }), "fetch_agents_response").await;
+    assert!(live["entries"].as_array().unwrap().is_empty(), "{live}");
+    let history = rpc(&mut ws, json!({ "type": "fetch_agent_history_request", "requestId": "s5" }), "fetch_agent_history_response").await;
+    assert_eq!(history["entries"].as_array().unwrap().len(), 2, "{history}");
+    assert!(history["entries"].as_array().unwrap().iter().all(|e| e["agent"]["archivedAt"].is_string()), "{history}");
+
+    let logs = rpc(&mut ws, json!({ "type": "schedule/logs", "requestId": "s6", "scheduleId": id }), "schedule/logs/response").await;
+    assert_eq!(logs["runs"].as_array().unwrap().len(), 2, "{logs}");
+
+    let paused = rpc(&mut ws, json!({ "type": "schedule/pause", "requestId": "s7", "scheduleId": id }), "schedule/pause/response").await;
+    assert_eq!((paused["schedule"]["status"].as_str(), paused["schedule"]["nextRunAt"].is_null(), paused["schedule"]["pausedAt"].is_string()), (Some("paused"), true, true), "{paused}");
+    let resumed = rpc(&mut ws, json!({ "type": "schedule/resume", "requestId": "s8", "scheduleId": id }), "schedule/resume/response").await;
+    assert_eq!((resumed["schedule"]["status"].as_str(), resumed["schedule"]["nextRunAt"].is_string(), resumed["schedule"]["pausedAt"].is_null()), (Some("active"), true, true), "{resumed}");
+
+    let updated = rpc(&mut ws, json!({ "type": "schedule/update", "requestId": "s9", "scheduleId": id, "name": "renamed", "cadence": { "type": "cron", "expression": "0 9 * * 1-5" }, "maxRuns": 5 }), "schedule/update/response").await;
+    assert!(updated["error"].is_null(), "{updated}");
+    assert_eq!((updated["schedule"]["name"].as_str(), updated["schedule"]["maxRuns"].as_u64()), (Some("renamed"), Some(5)), "{updated}");
+    assert_eq!(updated["schedule"]["cadence"], json!({ "type": "cron", "expression": "0 9 * * 1-5" }));
+    assert_eq!(updated["schedule"]["runs"].as_array().unwrap().len(), 2);
+
+    let deleted = rpc(&mut ws, json!({ "type": "schedule/delete", "requestId": "s10", "scheduleId": id }), "schedule/delete/response").await;
+    assert_eq!((deleted["scheduleId"].as_str(), deleted["error"].is_null()), (Some(id.as_str()), true), "{deleted}");
+    let listed = rpc(&mut ws, json!({ "type": "schedule/list", "requestId": "s11" }), "schedule/list/response").await;
+    assert!(listed["schedules"].as_array().unwrap().is_empty(), "{listed}");
+
+    send(&mut ws, session(json!({ "type": "schedule/inspect", "requestId": "s12", "scheduleId": id }))).await;
+    let err = recv_until(&mut ws, |v| (v["message"]["type"] == "rpc_error").then(|| v["message"]["payload"].clone())).await;
+    assert_eq!((err["requestId"].as_str(), err["code"].as_str()), (Some("s12"), Some("schedule_request_failed")), "{err}");
+    assert!(err["error"].as_str().unwrap().contains("not found"), "{err}");
+
+    send(&mut ws, session(json!({ "type": "schedule/create", "requestId": "s13", "prompt": "x", "cadence": { "type": "cron", "expression": "nope" }, "target": { "type": "agent", "agentId": "a" } }))).await;
+    let err = recv_until(&mut ws, |v| (v["message"]["type"] == "rpc_error").then(|| v["message"]["payload"].clone())).await;
+    assert!(err["error"].as_str().unwrap().contains("5 fields"), "{err}");
+}
+
+#[tokio::test]
+async fn schedules_persist_and_a_full_daemon_records_a_skipped_run() {
+    let dir = unique_dir("schedcap");
+    let cwd = dir.join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let d = start_with(dir, None, "hang", &[("PASEO_CLAUDE_MAX_LIVE", "1")]);
+    let mut ws = connect(d.port).await;
+    hello(&mut ws, None).await;
+    // One agent occupies the only slot and never answers.
+    send(&mut ws, session(json!({ "type": "create_agent_request", "requestId": "a1", "config": { "provider": "claude", "cwd": cwd.to_string_lossy() }, "initialPrompt": "wait" }))).await;
+    recv_until(&mut ws, |v| (v["message"]["payload"]["status"] == "agent_created").then_some(())).await;
+
+    let created = rpc(&mut ws, new_agent_schedule("s1", &cwd), "schedule/create/response").await;
+    let id = created["schedule"]["id"].as_str().unwrap().to_string();
+    let settled = schedule_settled(&mut ws, &id, 1).await;
+    let run = &settled["runs"][0];
+    assert_eq!(run["status"], "failed", "{settled}");
+    assert!(run["error"].as_str().unwrap().contains("at capacity"), "{settled}");
+    assert!(run["agentId"].is_null(), "{settled}");
+    assert_eq!(settled["status"], "active");
+    assert!(settled["nextRunAt"].is_string(), "{settled}");
+
+    // A second connection reads the same schedules, and they are on disk for a restart.
+    let mut ws2 = connect(d.port).await;
+    hello(&mut ws2, None).await;
+    let listed = rpc(&mut ws2, json!({ "type": "schedule/list", "requestId": "s2" }), "schedule/list/response").await;
+    assert_eq!(listed["schedules"][0]["id"], id.as_str());
+    let saved: Value = serde_json::from_slice(&std::fs::read(d.dir.join("home").join("schedules.json")).unwrap()).unwrap();
+    assert_eq!(saved[0]["id"], id.as_str());
+    assert_eq!(saved[0]["runs"][0]["status"], "failed");
+}

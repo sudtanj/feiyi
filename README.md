@@ -119,8 +119,10 @@ feiyi speaks Paseo's core WebSocket protocol subset with the upstream message na
   `fs.entry.delete`. Every path must stay inside the request's `cwd`, including through symlinks.
   Live file updates (`fs.file.subscribe`) and `fs.entry.duplicate` are not supported; the file pane then
   reloads the file when you open it instead of updating live.
+- schedules for the app's Schedules screen: `schedule/create`, `list`, `inspect`, `logs`, `pause`, `resume`, `update`,
+  `run-once` and `delete` (see below).
 
-Anything else (live file updates, duplicating files, terminals, plugins, voice, schedules, Hub, worktrees) answers with
+Anything else (live file updates, duplicating files, terminals, plugins, voice, Hub, worktrees) answers with
 `rpc_error` / `unsupported`. The official app is expected to handle the core agent flow. Screens built
 on unsupported features will show errors.
 
@@ -131,6 +133,22 @@ other worktrees, every commit on a remote, and no ignored files beyond regenerab
 that is still empty is deleted without checks. Otherwise the folder is kept and the app is told why.
 Whatever the policy, only folders strictly inside your home directory are deleted, never one that
 holds feiyi's data or another project. See `PASEO_DELETE_PROJECT_FILES`.
+
+**Schedules** use upstream's shapes and rules, stored in `schedules.json`. A cadence is `every` (a fixed
+interval, run on creation) or a five-field `cron` expression (`*`, ranges, lists, `/step`; all five fields must match,
+so a day-of-month and a weekday together mean both). Without a `timezone` cron runs in UTC; IANA names such as
+`Asia/Jakarta` are read from the system tz database (`/usr/share/zoneinfo`, or `TZDIR`), so the host needs tzdata.
+A target is an existing agent (the prompt is sent to it) or a new agent per run (`provider`, `cwd`, `modeId`, `model`,
+`thinkingOptionId`, `systemPrompt`, `archiveOnFinish`; the new agent is archived when its run ends unless
+`archiveOnFinish` is false). Git worktree isolation is not supported. `maxRuns` and `expiresAt` complete a schedule.
+Runs are recorded with their output (`schedule/logs`, newest 100 kept) and end when the agent's turn ends.
+
+- A run starts only if the agent CLI has a free slot right now (see `PASEO_CLAUDE_MAX_LIVE`). Otherwise the run is
+  recorded as failed with "Skipped: the daemon is at capacity" and the schedule moves on; nothing is queued.
+- Runs missed while the daemon was down are not replayed. On start, runs that were in flight are marked failed and
+  overdue schedules jump to their next slot.
+- `schedule/run-once` answers as soon as the run has started, where upstream waits for it to finish.
+- A schedule that targets an archived or deleted agent completes when it next fires.
 
 **Notifications** work like upstream: the app registers its Expo push token, and when an agent
 finishes or needs permission, a client that's looking at that agent gets nothing, the most recently

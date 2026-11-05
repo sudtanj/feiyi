@@ -196,7 +196,25 @@ jobs:
           EOF
           sed -i "s|__VERSION__|${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}|" sw.js
           # CSP allows only 'self' scripts, so registration lives in its own file.
-          echo 'if ("serviceWorker" in navigator) addEventListener("load", () => navigator.serviceWorker.register("'"$BASE"'/sw.js", { scope: "'"$BASE"'/" }));' > sw-register.js
+          # Auto-update: check for a new deploy hourly and on every return to the app; once a
+          # new worker takes over, reload while the app is in the background so it is unseen.
+          cat > sw-register.js <<'EOF'
+          if ("serviceWorker" in navigator) addEventListener("load", async () => {
+            const hadWorker = !!navigator.serviceWorker.controller; // first install also fires controllerchange
+            const reg = await navigator.serviceWorker.register("__BASE__/sw.js", { scope: "__BASE__/" });
+            let stale = false;
+            navigator.serviceWorker.addEventListener("controllerchange", () => {
+              if (!hadWorker) return;
+              stale = true;
+              if (document.hidden) location.reload();
+            });
+            document.addEventListener("visibilitychange", () => {
+              if (document.hidden) { if (stale) location.reload(); } else reg.update().catch(() => {});
+            });
+            setInterval(() => reg.update().catch(() => {}), 60 * 60 * 1000);
+          });
+          EOF
+          sed -i "s|__BASE__|$BASE|g" sw-register.js
           grep -q '</head>' index.html || { echo "::error::index.html has no </head>"; exit 1; }
           sed -i "s|</head>|<script src=\"$BASE/sw-register.js\" defer></script>&|" index.html
           # Pages has no SPA rewrites: unknown paths (deep links, reloads) get the app too.

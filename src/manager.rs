@@ -30,7 +30,7 @@ const WARM_RETRY: Duration = Duration::from_secs(60);
 const COMPACT_COMMAND: &str = "/compact";
 
 /// The CLI that serves a provider.
-fn cli_of(provider: &str) -> &'static str {
+pub(crate) fn cli_of(provider: &str) -> &'static str {
     if provider == "codex" { "codex" } else { "claude" }
 }
 
@@ -175,6 +175,7 @@ pub struct Manager {
     pub daemon_config: crate::daemon_config::DaemonConfig,
     /// Tokens and cost per provider and model.
     pub usage: crate::usage::Ledger,
+    pub schedules: crate::schedules::Schedules,
     /// Streamed text not sent yet, per agent: (kind, text). Deltas arrive a few
     /// tokens at a time; sending them in ~150 ms batches cuts the messages (and
     /// their envelopes) sent to the app by an order of magnitude.
@@ -219,6 +220,7 @@ impl Manager {
         let daemon_config = crate::daemon_config::DaemonConfig::load(&cfg.home);
         crate::limits::load(&cfg.home);
         let usage = crate::usage::Ledger::load(&cfg.home);
+        let schedules = crate::schedules::Schedules::load(&cfg.home, crate::schedules::now_ms());
         for p in &projects {
             crate::snapshot::set_project_name(&p.root_path, p.custom_name.as_deref());
         }
@@ -230,7 +232,7 @@ impl Manager {
         if let crate::capacity::Mode::Fixed(n) = cfg.claude_max_live {
             claude.set_max_live(n);
         }
-        let mut manager = Manager { cfg, server_id, store, agents, claude, codex, active_cli: None, running: HashSet::new(), cli_queue: VecDeque::new(), capacity, claude_warm_at: None, codex_warm_at: None, bcast, events_tx, agents_dirty: false, pairing_url, projects, workspaces, cmds_tx, checkout: crate::checkout::Watcher::start(), started_at: now_iso(), waiters: Vec::new(), push_tokens, clients: Vec::new(), daemon_config, usage, chunks: HashMap::new(), chunk_deadline: None };
+        let mut manager = Manager { cfg, server_id, store, agents, claude, codex, active_cli: None, running: HashSet::new(), cli_queue: VecDeque::new(), capacity, claude_warm_at: None, codex_warm_at: None, bcast, events_tx, agents_dirty: false, pairing_url, projects, workspaces, cmds_tx, checkout: crate::checkout::Watcher::start(), started_at: now_iso(), waiters: Vec::new(), push_tokens, clients: Vec::new(), daemon_config, usage, schedules, chunks: HashMap::new(), chunk_deadline: None };
         manager.migrate_agent_workspaces();
         (manager, events_rx)
     }
@@ -284,9 +286,11 @@ impl Manager {
                 Some(ev) = events.recv() => self.handle_event(ev),
                 _ = tick.tick() => self.housekeeping(),
                 _ = sleep_until_opt(self.chunk_deadline) => self.flush_chunks(),
+                _ = sleep_until_opt(self.schedule_deadline()) => self.run_due_schedules(),
                 _ = &mut shutdown => break,
             }
             self.resolve_waiters();
+            self.settle_schedule_runs();
         }
         // Background sub-agents die with their processes: wait briefly for the
         // failed cards, so they don't show as running after the restart.

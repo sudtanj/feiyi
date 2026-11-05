@@ -121,7 +121,17 @@ feiyi speaks Paseo's core WebSocket protocol subset with the upstream message na
   `fs.file.subscribe` / `fs.file.unsubscribe` push `fs.file.update` when an open file changes on disk. feiyi
   polls the file once a second while it is subscribed (up to 32 per connection) and stops on unsubscribe or disconnect.
 
-Anything else (terminals, plugins, voice, schedules, Hub, worktrees) answers with
+- git worktrees: `workspace.create` with a `worktree` source (new branch cut from `refName`/`baseBranch` or the default
+  branch, or `action: "checkout"` of an existing branch), `create_paseo_worktree`, `paseo_worktree_list`,
+  `paseo_worktree_archive`, and `create_agent` with a `worktree` target or `git.createWorktree`. Worktrees live in
+  `<PASEO_LITE_HOME>/worktrees/<repo hash>/<slug>` (upstream: `~/.paseo/worktrees/...`) and show up in the workspace
+  list as `worktree` workspaces. Archiving the last workspace of a worktree removes the directory with
+  `git worktree remove`, but archives nothing when it holds uncommitted or ignored non-regenerable files or commits on a
+  detached HEAD: the app gets the reason. The branch always stays. `PASEO_DELETE_PROJECT_FILES=never` keeps the
+  directory, `all` removes it with `--force`. Not supported: checking out a pull request into a worktree, setup
+  scripts (`paseo.json`), and the worktree fields of `checkout_status`.
+
+Anything else (terminals, plugins, voice, schedules, Hub) answers with
 `rpc_error` / `unsupported`. The official app is expected to handle the core agent flow. Screens built
 on unsupported features will show errors.
 

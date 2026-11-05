@@ -260,7 +260,7 @@ impl Manager {
                 let source = msg.get("source").cloned().unwrap_or(Value::Null);
                 let fail = |error: String, code: &str| json!({ "type": "workspace.create.response", "payload": { "requestId": rid, "workspace": null, "setupTerminalId": null, "error": error, "errorCode": code } });
                 if s(&source, "kind").as_deref() != Some("directory") {
-                    return reply(out, fail("feiyi does not create git worktrees yet; choose Local isolation".into(), "unsupported"));
+                    return self.create_worktree_workspace(&source, &rid, out);
                 }
                 let dir = match normalize_dir(&s(&source, "path").unwrap_or_default()) {
                     Ok(d) => d,
@@ -463,7 +463,7 @@ impl Manager {
             _ => {
                 let git = crate::git_actions::GitCtx { watcher: self.checkout.clone(), bcast: self.bcast.clone() };
                 // File explorer, downloads, saves and entry edits (files.rs).
-                if !crate::files::handle(&kind, &msg, &rid, out) && !crate::git_actions::handle(&git, &kind, &msg, &rid, out) && !self.handle_ext_rpc(&kind, &msg, &rid, out) && request_id.is_some() {
+                if !crate::files::handle(&kind, &msg, &rid, out) && !crate::git_actions::handle(&git, &kind, &msg, &rid, out) && !self.handle_ext_rpc(&kind, &msg, &rid, out) && !self.handle_worktree_rpc(&kind, &msg, &rid, out) && request_id.is_some() {
                     rpc_error(out, &rid, &kind, "not supported by feiyi");
                 }
             }
@@ -499,7 +499,7 @@ impl Manager {
         });
     }
 
-    fn create_agent(&mut self, msg: &Value, rid: &str, out: &Out) {
+    pub(crate) fn create_agent(&mut self, msg: &Value, rid: &str, out: &Out) {
         let config = msg.get("config").cloned().unwrap_or(Value::Null);
         let provider = s(&config, "provider").unwrap_or_default();
         let fail = |error: String| reply(out, json!({ "type": "status", "payload": { "status": "agent_create_failed", "requestId": rid, "error": error } }));
@@ -510,6 +510,9 @@ impl Manager {
             Ok(c) => c,
             Err(e) => return fail(e),
         };
+        if let Some(spec) = crate::worktrees::agent_spec(msg, &cwd) {
+            return self.create_agent_in_worktree(spec, msg, rid, out);
+        }
         let now = now_iso();
         let labels: BTreeMap<String, String> = msg
             .get("labels")

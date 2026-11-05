@@ -555,17 +555,20 @@ impl Manager {
     pub(crate) fn archive_workspace_request(&mut self, msg: &Value, rid: &str, out: &Out) {
         let id = s(msg, "workspaceId").unwrap_or_default();
         let root = self.workspaces.iter().find(|w| w.id == id).map(|w| w.project_root.clone());
-        let at = match self.archive_workspace(&id) {
-            Ok(at) => at,
-            Err(e) => return reply(out, json!({ "type": "archive_workspace_response", "payload": { "requestId": rid, "workspaceId": id, "archivedAt": null, "error": e } })),
-        };
-        reply(out, json!({ "type": "archive_workspace_response", "payload": { "requestId": rid, "workspaceId": id, "archivedAt": at, "error": null } }));
-        let last = root.filter(|r| self.projects.iter().any(|p| &p.root_path == r) && self.active_workspaces_of(r).is_empty());
-        if let Some(root) = last {
-            let (owned, _) = self.drop_project(&root);
-            // The archive already succeeded; a kept folder is only logged.
-            self.cleanup_dir(root, owned, |_| {});
-        }
+        let (out, rid) = (out.clone(), rid.to_string());
+        self.archive_workspaces_checked(vec![id.clone()], move |m, archived| {
+            let at = match archived {
+                Ok((at, _)) => at,
+                Err((_, e)) => return reply(&out, json!({ "type": "archive_workspace_response", "payload": { "requestId": rid, "workspaceId": id, "archivedAt": null, "error": e } })),
+            };
+            reply(&out, json!({ "type": "archive_workspace_response", "payload": { "requestId": rid, "workspaceId": id, "archivedAt": at, "error": null } }));
+            let last = root.filter(|r| m.projects.iter().any(|p| &p.root_path == r) && m.active_workspaces_of(r).is_empty());
+            if let Some(root) = last {
+                let (owned, _) = m.drop_project(&root);
+                // The archive already succeeded; a kept folder is only logged.
+                m.cleanup_dir(root, owned, |_| {});
+            }
+        });
     }
 }
 

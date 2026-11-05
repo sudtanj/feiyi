@@ -52,7 +52,12 @@ pub fn probe(cwd: &str) -> Option<(PathBuf, Option<String>)> {
     while let Some(d) = dir {
         let dot = d.join(".git");
         if dot.exists() {
-            let branch = std::fs::read_to_string(dot.join("HEAD"))
+            // A linked worktree's `.git` is a file pointing at its own git dir.
+            let git_dir = match std::fs::read_to_string(&dot).ok().and_then(|t| t.strip_prefix("gitdir: ").map(|p| d.join(p.trim()))) {
+                Some(linked) => linked,
+                None => dot,
+            };
+            let branch = std::fs::read_to_string(git_dir.join("HEAD"))
                 .ok()
                 .and_then(|h| h.trim().strip_prefix("ref: refs/heads/").map(String::from));
             return Some((d.to_path_buf(), branch));

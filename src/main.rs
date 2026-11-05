@@ -31,6 +31,7 @@ mod uploads;
 mod usage;
 mod util;
 mod workspaces;
+mod worktrees;
 
 use config::Config;
 use std::sync::Arc;

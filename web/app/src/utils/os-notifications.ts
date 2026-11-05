@@ -151,6 +151,37 @@ function fallbackNavigateToNotificationTarget(data: Record<string, unknown> | un
   }
 }
 
+
+const SERVICE_WORKER_CLICK_MESSAGE = "feiyi:notification-click";
+let serviceWorkerRegistration: Promise<ServiceWorkerRegistration | null> | null = null;
+
+// Installed PWAs on Android reject `new Notification()`; only a service worker can show one.
+// The worker (sw.js, written by the Pages build) forwards clicks back here as messages.
+function getServiceWorkerRegistration(): Promise<ServiceWorkerRegistration | null> {
+  if (serviceWorkerRegistration) {
+    return serviceWorkerRegistration;
+  }
+  const container = (globalThis as { navigator?: { serviceWorker?: ServiceWorkerContainer } })
+    .navigator?.serviceWorker;
+  if (!container) {
+    serviceWorkerRegistration = Promise.resolve(null);
+    return serviceWorkerRegistration;
+  }
+  container.addEventListener("message", (event) => {
+    const message = event.data as { type?: unknown; data?: Record<string, unknown> } | null;
+    if (message?.type !== SERVICE_WORKER_CLICK_MESSAGE || !hasNotificationClickTarget(message.data)) {
+      return;
+    }
+    if (!dispatchWebNotificationClick({ data: message.data })) {
+      fallbackNavigateToNotificationTarget(message.data);
+    }
+  });
+  serviceWorkerRegistration = container
+    .register(`${process.env.EXPO_PUBLIC_PAGES_BASE_PATH || ""}/sw.js`)
+    .then(() => container.ready)
+    .catch(() => null);
+  return serviceWorkerRegistration;
+}
 function attachWebClickHandler(
   notification: WebNotificationInstance,
   data: Record<string, unknown> | undefined,
@@ -178,6 +209,21 @@ export async function sendOsNotification(payload: OsNotificationPayload): Promis
   if (NotificationConstructor) {
     const granted = await ensureNotificationPermission();
     if (granted) {
+      const registration = await getServiceWorkerRegistration();
+      if (registration) {
+        const route = hasNotificationClickTarget(payload.data)
+          ? buildNotificationRoute(payload.data)
+          : "/";
+        await registration.showNotification(payload.title, {
+          body: payload.body,
+          data: {
+            payload: payload.data,
+            url: (process.env.EXPO_PUBLIC_PAGES_BASE_PATH || "") + route,
+          },
+          icon: getWebNotificationIconUrl(),
+        });
+        return true;
+      }
       const notification = new NotificationConstructor(payload.title, {
         body: payload.body,
         data: payload.data,

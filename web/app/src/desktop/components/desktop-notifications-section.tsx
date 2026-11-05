@@ -1,4 +1,4 @@
-import { useCallback, useMemo } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Text, View } from "react-native";
 import { withUnistyles } from "react-native-unistyles";
@@ -11,6 +11,7 @@ import { useDesktopPermissions } from "@/desktop/permissions/use-desktop-permiss
 import { useDesktopSettings } from "@/desktop/settings/desktop-settings";
 import { SettingsSection } from "@/components/settings/headings/settings-section";
 import { settingsStyles } from "@/styles/settings";
+import { ensureOsNotificationPermission, sendOsNotification } from "@/utils/os-notifications";
 
 const ThemedRotateCw = withUnistyles(RotateCw, (theme) => ({
   size: theme.iconSize.md,
@@ -80,7 +81,7 @@ export function DesktopNotificationsSection() {
   );
 
   if (!isDesktopApp) {
-    return null;
+    return <WebNotificationsSection />;
   }
 
   const notificationsGranted = snapshot?.notifications.state === "granted";
@@ -145,6 +146,108 @@ export function DesktopNotificationsSection() {
           title={t("settings.notifications.sendFailedTitle")}
           description={testNotificationState.message}
           testID="desktop-notifications-test-error"
+        />
+      ) : null}
+    </SettingsSection>
+  );
+}
+
+type WebNotificationPermission = "granted" | "denied" | "default" | "unsupported";
+
+function readWebNotificationPermission(): WebNotificationPermission {
+  const permission = (globalThis as { Notification?: { permission?: string } }).Notification
+    ?.permission;
+  return permission === "granted" || permission === "denied" || permission === "default"
+    ? permission
+    : "unsupported";
+}
+
+const WEB_PERMISSION_HINT_KEYS = {
+  granted: "desktop.permissions.notifications.allowed",
+  denied: "desktop.permissions.notifications.denied",
+  default: "desktop.permissions.notifications.notGranted",
+  unsupported: "desktop.permissions.notifications.apiUnavailable",
+} as const;
+
+// Browsers and installed PWAs only show the permission prompt from a tap, so it needs a button.
+function WebNotificationsSection() {
+  const { t } = useTranslation();
+  const [permission, setPermission] = useState(readWebNotificationPermission);
+  const [testState, setTestState] = useState<"idle" | "sending" | "sent" | "failed">("idle");
+
+  const handleRequest = useCallback(() => {
+    void ensureOsNotificationPermission().finally(() =>
+      setPermission(readWebNotificationPermission()),
+    );
+  }, []);
+
+  const handleSendTest = useCallback(() => {
+    setTestState("sending");
+    sendOsNotification({
+      title: t("desktop.permissions.testNotification.title"),
+      body: t("desktop.permissions.testNotification.body"),
+    }).then(
+      (sent) => setTestState(sent ? "sent" : "failed"),
+      () => setTestState("failed"),
+    );
+  }, [t]);
+
+  const granted = permission === "granted";
+
+  return (
+    <SettingsSection title={t("settings.notifications.title")}>
+      <View style={settingsStyles.card}>
+        <View style={settingsStyles.row}>
+          <View style={settingsStyles.rowContent}>
+            <Text style={settingsStyles.rowTitle}>{t("settings.notifications.permission")}</Text>
+            <Text style={settingsStyles.rowHint}>{t(WEB_PERMISSION_HINT_KEYS[permission])}</Text>
+          </View>
+          <Button
+            variant="outline"
+            size="sm"
+            onPress={handleRequest}
+            disabled={permission !== "default"}
+          >
+            {granted
+              ? t("settings.permissions.actions.granted")
+              : t("settings.permissions.actions.request")}
+          </Button>
+        </View>
+        <View style={[settingsStyles.row, settingsStyles.rowBorder]}>
+          <View style={settingsStyles.rowContent}>
+            <Text style={settingsStyles.rowTitle}>{t("settings.notifications.test")}</Text>
+            <Text style={settingsStyles.rowHint}>
+              {granted
+                ? t("settings.notifications.testHint")
+                : t("settings.notifications.permissionRequired")}
+            </Text>
+          </View>
+          <Button
+            variant="outline"
+            size="sm"
+            onPress={handleSendTest}
+            disabled={!granted || testState === "sending"}
+          >
+            {testState === "sending"
+              ? t("settings.notifications.sending")
+              : t("settings.notifications.send")}
+          </Button>
+        </View>
+      </View>
+      {testState === "sent" ? (
+        <Alert
+          size="sm"
+          variant="success"
+          title={t("settings.notifications.sentTitle")}
+          description={t("settings.notifications.sentDescription")}
+        />
+      ) : null}
+      {testState === "failed" ? (
+        <Alert
+          size="sm"
+          variant="error"
+          title={t("settings.notifications.sendFailedTitle")}
+          description={t("desktop.permissions.testNotification.failed")}
         />
       ) : null}
     </SettingsSection>

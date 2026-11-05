@@ -179,16 +179,28 @@ jobs:
           # Installed app: rotate freely (tablets, landscape phones, desktop windows).
           sed -i '/^  "orientation": /d' manifest.json
           node -e 'JSON.parse(require("fs").readFileSync("manifest.json", "utf8"))'
-          # No offline cache: every launch loads the latest deploy. Browsers that installed the
-          # old caching worker fetch this one on their next visit; it wipes the caches,
-          # unregisters itself and reloads open tabs from the network.
+          # No offline cache and no fetch handler: every launch loads the latest deploy. The
+          # worker exists only because installed PWAs can show notifications through it alone.
+          # Browsers still holding the old caching worker swap to this one, which wipes the
+          # caches and reloads those tabs from the network once.
           cat > sw.js <<'SW'
           self.addEventListener("install", () => self.skipWaiting());
           self.addEventListener("activate", (e) => e.waitUntil((async () => {
-            for (const k of await caches.keys()) await caches.delete(k);
-            await self.registration.unregister();
-            for (const c of await self.clients.matchAll({ type: "window" })) c.navigate(c.url).catch(() => {});
+            const stale = await caches.keys();
+            for (const k of stale) await caches.delete(k);
+            await self.clients.claim();
+            if (stale.length) for (const c of await self.clients.matchAll({ type: "window" })) c.navigate(c.url).catch(() => {});
           })()));
+          self.addEventListener("notificationclick", (e) => {
+            e.notification.close();
+            const { payload, url } = e.notification.data || {};
+            e.waitUntil((async () => {
+              const [c] = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+              if (!c) return self.clients.openWindow(url || self.registration.scope);
+              await c.focus();
+              c.postMessage({ type: "feiyi:notification-click", data: payload });
+            })());
+          });
           SW
           # Pages has no SPA rewrites: unknown paths (deep links, reloads) get the app too.
           cp index.html 404.html

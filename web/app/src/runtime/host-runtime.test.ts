@@ -1792,12 +1792,19 @@ describe("HostRuntimeStore", () => {
       ]),
     });
     await waitForHostOnline(store, host.serverId);
-    stuckClient.ensureConnected = () => {};
+    let connectRequests = 0;
+    stuckClient.ensureConnected = () => {
+      connectRequests++;
+    };
     stuckClient.setConnectionState({ status: "disconnected", reason: "backgrounded" });
 
     useHostRuntimeClock();
     store.setAppVisible(true);
-    await vi.advanceTimersByTimeAsync(19_000);
+    expect(connectRequests).toBe(1);
+    // Retries every 2 s rather than waiting out the client's backoff.
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(connectRequests).toBe(2);
+    await vi.advanceTimersByTimeAsync(17_000);
     expect(freshClient.connectCalls).toBe(0);
     await vi.advanceTimersByTimeAsync(1_000);
     await waitForHostOnline(store, host.serverId);

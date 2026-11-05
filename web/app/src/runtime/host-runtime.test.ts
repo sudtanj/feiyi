@@ -1797,7 +1797,7 @@ describe("HostRuntimeStore", () => {
 
     useHostRuntimeClock();
     store.setAppVisible(true);
-    await vi.advanceTimersByTimeAsync(7_000);
+    await vi.advanceTimersByTimeAsync(19_000);
     expect(freshClient.connectCalls).toBe(0);
     await vi.advanceTimersByTimeAsync(1_000);
     await waitForHostOnline(store, host.serverId);

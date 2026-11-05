@@ -263,12 +263,13 @@ impl Term {
         .await;
     }
 
-    /// Once the shell is reaped the child is dropped, so `end` never signals a recycled pid.
+    /// Once the shell exits, its leftover group is killed and the child dropped,
+    /// so `end` never signals a recycled pid.
     fn gone(&self) -> bool {
         let mut child = self.child.lock().unwrap();
         let alive = child.as_mut().is_some_and(|c| matches!(c.try_wait(), Ok(None)));
-        if !alive {
-            child.take();
+        if !alive && child.take().is_some() {
+            unsafe { libc::killpg(self.pid, libc::SIGKILL) };
         }
         !alive
     }

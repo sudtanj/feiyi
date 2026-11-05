@@ -232,6 +232,26 @@ const PROBE_INACTIVE_WHILE_ONLINE_MS = 120_000;
 const ADAPTIVE_SWITCH_THRESHOLD_MS = 40;
 const ADAPTIVE_SWITCH_CONSECUTIVE_PROBES = 3;
 const CONFIGURED_OVERRIDE_BOOTSTRAP_RETRY_MS = 1_000;
+// A healthy relay reconnect takes a few seconds; the client's own connect timeout is 15 s.
+const FOREGROUND_NEW_CLIENT_AFTER_MS = 8_000;
+const FOREGROUND_RELOAD_AFTER_MS = 20_000;
+const FOREGROUND_RELOAD_KEY = "feiyi.foregroundReloadAt";
+const FOREGROUND_RELOAD_MIN_GAP_MS = 5 * 60_000;
+
+// Web only, online only (an offline reload shows the browser's error page), and at most
+// once per few minutes so a host that is really down cannot cause a reload loop.
+function reloadStuckPage(): void {
+  if (typeof window === "undefined" || typeof window.location?.reload !== "function") return;
+  if (typeof navigator !== "undefined" && navigator.onLine === false) return;
+  try {
+    const last = Number(window.sessionStorage.getItem(FOREGROUND_RELOAD_KEY) ?? 0);
+    if (Date.now() - last < FOREGROUND_RELOAD_MIN_GAP_MS) return;
+    window.sessionStorage.setItem(FOREGROUND_RELOAD_KEY, String(Date.now()));
+  } catch {
+    return;
+  }
+  window.location.reload();
+}
 
 function toActiveConnection(connection: HostConnection): ActiveConnection {
   if (connection.type === "directSocket") {
@@ -772,6 +792,12 @@ export class HostRuntimeController {
 
   ensureConnected(options?: { verify?: boolean }): void {
     this.activeClient?.ensureConnected(options);
+  }
+
+  /** Replaces the active client with a new one, as a cold start would. */
+  reconnectWithNewClient(): void {
+    const connectionId = this.snapshot.activeConnectionId;
+    if (connectionId) void this.switchToConnection({ connectionId });
   }
 
   markAgentDirectorySyncLoading(): void {
@@ -2558,7 +2584,13 @@ export class HostRuntimeStore {
     }
   }
 
+  private foregroundWatchdog: ReturnType<typeof setTimeout> | null = null;
+
   setAppVisible(visible: boolean): void {
+    if (this.foregroundWatchdog) {
+      clearTimeout(this.foregroundWatchdog);
+      this.foregroundWatchdog = null;
+    }
     // Keep normal reconnect backoff running while hidden, for as long as the OS
     // lets us execute. Foregrounding bypasses that backoff without closing healthy sockets.
     if (!visible) {
@@ -2567,6 +2599,33 @@ export class HostRuntimeStore {
     }
 
     this.ensureConnectedAll({ verify: true });
+    this.watchForegroundReconnect("new_client");
+  }
+
+  // An Android PWA can resume with a client that never reconnects; only killing the
+  // app recovered it. Do the same in steps: a new client, then a page reload.
+  private watchForegroundReconnect(step: "new_client" | "reload"): void {
+    this.foregroundWatchdog = setTimeout(
+      () => {
+        this.foregroundWatchdog = null;
+        const stuck = [...this.controllers.values()].filter((controller) => {
+          const snapshot = controller.getSnapshot();
+          return (
+            snapshot.activeConnectionId !== null &&
+            snapshot.connectionStatus !== "online" &&
+            !snapshot.authFailureReason
+          );
+        });
+        if (stuck.length === 0) return;
+        if (step === "new_client") {
+          for (const controller of stuck) controller.reconnectWithNewClient();
+          this.watchForegroundReconnect("reload");
+          return;
+        }
+        reloadStuckPage();
+      },
+      step === "new_client" ? FOREGROUND_NEW_CLIENT_AFTER_MS : FOREGROUND_RELOAD_AFTER_MS,
+    );
   }
 
   runProbeCycleNow(serverId?: string): Promise<void> {

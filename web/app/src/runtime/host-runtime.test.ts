@@ -1756,6 +1756,57 @@ describe("HostRuntimeStore", () => {
     },
   );
 
+  it("replaces a client that stays disconnected after the app returns to the foreground", async () => {
+    const connection: HostConnection = {
+      id: "relay:relay.paseo.sh:443",
+      type: "relay",
+      relayEndpoint: "relay.paseo.sh:443",
+      daemonPublicKeyB64: "pk_stuck",
+    };
+    const host = makeHost({
+      serverId: "srv_stuck",
+      connections: [connection],
+      preferredConnectionId: connection.id,
+    });
+    const stuckClient = new FakeDaemonClient();
+    stuckClient.setConnectionState({ status: "connected" });
+    const freshClient = new FakeDaemonClient();
+    const store = new HostRuntimeStore({
+      storage: createMemoryHostRuntimeStorage(),
+      deps: {
+        createClient: () => freshClient as unknown as DaemonClient,
+        connectToDaemon: async () => ({
+          client: makeConnectedProbeClient(5) as unknown as DaemonClient,
+          serverId: host.serverId,
+          hostname: "stuck",
+        }),
+        getClientId: async () => "cid_test_runtime",
+      },
+    });
+    store.syncHosts([host], {
+      initialConnectionByServerId: new Map([
+        [
+          host.serverId,
+          { connectionId: connection.id, existingClient: stuckClient as unknown as DaemonClient },
+        ],
+      ]),
+    });
+    await waitForHostOnline(store, host.serverId);
+    stuckClient.ensureConnected = () => {};
+    stuckClient.setConnectionState({ status: "disconnected", reason: "backgrounded" });
+
+    useHostRuntimeClock();
+    store.setAppVisible(true);
+    await vi.advanceTimersByTimeAsync(7_000);
+    expect(freshClient.connectCalls).toBe(0);
+    await vi.advanceTimersByTimeAsync(1_000);
+    await waitForHostOnline(store, host.serverId);
+    expect(freshClient.connectCalls).toBe(1);
+    expect(stuckClient.isDisposed()).toBe(true);
+
+    store.syncHosts([]);
+  });
+
   it("revokes push notifications before removing a host", async () => {
     const host = makeHost({ connections: [makeHost().connections[0]!] });
     const revocation = createDeferred<void>();

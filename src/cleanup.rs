@@ -137,16 +137,9 @@ fn regenerable_tree(root: &Path, rel: &str) -> bool {
     true
 }
 
-/// Why the work in `dir` can't be recovered from a remote; None when it can.
-/// Any git error counts as unrecoverable.
-async fn unrecoverable(dir: &Path) -> Option<String> {
-    let Ok(top) = git(dir, &["rev-parse", "--show-toplevel"]).await else {
-        return Some("it is not a git repository, so there is no remote copy".into());
-    };
-    let same = std::fs::canonicalize(top.trim()).ok() == std::fs::canonicalize(dir).ok();
-    if !same {
-        return Some("it is a folder inside a larger git repository".into());
-    }
+/// Why the working tree in `dir` holds files git can't restore (uncommitted
+/// changes, ignored files beyond the regenerable ones); None when it is clean.
+pub(crate) async fn unsaved_work(dir: &Path) -> Option<String> {
     let status = match git(dir, &["status", "--porcelain", "--ignored=matching"]).await {
         Ok(s) => s,
         Err(e) => return Some(format!("git status failed: {e}")),
@@ -157,6 +150,22 @@ async fn unrecoverable(dir: &Path) -> Option<String> {
             Some(rel) => return Some(format!("it has ignored files git can't restore (e.g. {})", rel.trim())),
             None => return Some("it has uncommitted changes".into()),
         }
+    }
+    None
+}
+
+/// Why the work in `dir` can't be recovered from a remote; None when it can.
+/// Any git error counts as unrecoverable.
+async fn unrecoverable(dir: &Path) -> Option<String> {
+    let Ok(top) = git(dir, &["rev-parse", "--show-toplevel"]).await else {
+        return Some("it is not a git repository, so there is no remote copy".into());
+    };
+    let same = std::fs::canonicalize(top.trim()).ok() == std::fs::canonicalize(dir).ok();
+    if !same {
+        return Some("it is a folder inside a larger git repository".into());
+    }
+    if let Some(reason) = unsaved_work(dir).await {
+        return Some(reason);
     }
     // HEAD too, so commits on a detached HEAD count.
     match git(dir, &["log", "HEAD", "--branches", "--not", "--remotes", "--oneline"]).await {

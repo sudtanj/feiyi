@@ -116,11 +116,36 @@ feiyi speaks Paseo's core WebSocket protocol subset with the upstream message na
   `GET /api/files/download?token=…` on the direct listener (single-use, 60 s; over the relay the app reads the
   file instead), `fs.file.write.request` (saves a text file of up to 1 MiB atomically, with a conflict check against
   the version the app loaded), and `fs.entry.create` / `fs.entry.rename` (`git mv` for tracked files) /
-  `fs.entry.delete`. Every path must stay inside the request's `cwd`, including through symlinks.
-  Live file updates (`fs.file.subscribe`) and `fs.entry.duplicate` are not supported; the file pane then
-  reloads the file when you open it instead of updating live.
+  `fs.entry.duplicate` ("name copy.ext", "name copy 2.ext"; files and folders) / `fs.entry.delete`.
+  Every path must stay inside the request's `cwd`, including through symlinks.
+  `fs.file.subscribe` / `fs.file.unsubscribe` push `fs.file.update` when an open file changes on disk. feiyi
+  polls the file once a second while it is subscribed (up to 32 per connection) and stops on unsubscribe or disconnect.
 
-Anything else (live file updates, duplicating files, terminals, plugins, voice, schedules, Hub, worktrees) answers with
+- git worktrees: `workspace.create` with a `worktree` source (new branch cut from `refName`/`baseBranch` or the default
+  branch, or `action: "checkout"` of an existing branch), `create_paseo_worktree`, `paseo_worktree_list`,
+  `paseo_worktree_archive`, and `create_agent` with a `worktree` target or `git.createWorktree`. Worktrees live in
+  `<PASEO_LITE_HOME>/worktrees/<repo hash>/<slug>` (upstream: `~/.paseo/worktrees/...`) and show up in the workspace
+  list as `worktree` workspaces. Archiving the last workspace of a worktree removes the directory with
+  `git worktree remove`, but archives nothing when it holds uncommitted or ignored non-regenerable files or commits on a
+  detached HEAD: the app gets the reason. The branch always stays. `PASEO_DELETE_PROJECT_FILES=never` keeps the
+  directory, `all` removes it with `--force`. Not supported: checking out a pull request into a worktree, setup
+  scripts (`paseo.json`), and the worktree fields of `checkout_status`.
+
+- terminals: `create_terminal`, `list_terminals`, `subscribe_terminals` (live list), `subscribe_terminal` /
+  `unsubscribe_terminal`, `terminal_input` (input, resize), `kill_terminal`, `terminal.rename`, with upstream's
+  binary frames (`opcode, slot, payload`: output, input, resize, restore) on the direct socket and over the E2EE relay.
+  A terminal is a shell (`$SHELL`, else `/bin/sh`) on a PTY in a known project or workspace directory, with
+  `PASEO_*` removed from its environment. At most 4 run at once; each keeps the last 256 KiB of output, and a
+  client that reattaches (or reconnects) gets that back as a `restore` frame, so the terminals survive a dropped
+  connection. Killing, exiting or stopping the daemon kills the whole process group. There is no screen emulator:
+  the restore is the raw output, so a full-screen program may redraw oddly until its next repaint. Mouse events,
+  `capture_terminal`, `close_items` and activity/attention notices are not supported.
+
+- schedules for the app's Schedules screen: `schedule/create`, `list`, `inspect`, `logs`, `pause`, `resume`, `update`,
+  `run-once` and `delete` (see below).
+
+Anything else (plugins, voice, Hub) answers with
+
 `rpc_error` / `unsupported`. The official app is expected to handle the core agent flow. Screens built
 on unsupported features will show errors.
 
@@ -131,6 +156,22 @@ other worktrees, every commit on a remote, and no ignored files beyond regenerab
 that is still empty is deleted without checks. Otherwise the folder is kept and the app is told why.
 Whatever the policy, only folders strictly inside your home directory are deleted, never one that
 holds feiyi's data or another project. See `PASEO_DELETE_PROJECT_FILES`.
+
+**Schedules** use upstream's shapes and rules, stored in `schedules.json`. A cadence is `every` (a fixed
+interval, run on creation) or a five-field `cron` expression (`*`, ranges, lists, `/step`; all five fields must match,
+so a day-of-month and a weekday together mean both). Without a `timezone` cron runs in UTC; IANA names such as
+`Asia/Jakarta` are read from the system tz database (`/usr/share/zoneinfo`, or `TZDIR`), so the host needs tzdata.
+A target is an existing agent (the prompt is sent to it) or a new agent per run (`provider`, `cwd`, `modeId`, `model`,
+`thinkingOptionId`, `systemPrompt`, `archiveOnFinish`; the new agent is archived when its run ends unless
+`archiveOnFinish` is false). Git worktree isolation is not supported. `maxRuns` and `expiresAt` complete a schedule.
+Runs are recorded with their output (`schedule/logs`, newest 100 kept) and end when the agent's turn ends.
+
+- A run starts only if the agent CLI has a free slot right now (see `PASEO_CLAUDE_MAX_LIVE`). Otherwise the run is
+  recorded as failed with "Skipped: the daemon is at capacity" and the schedule moves on; nothing is queued.
+- Runs missed while the daemon was down are not replayed. On start, runs that were in flight are marked failed and
+  overdue schedules jump to their next slot.
+- `schedule/run-once` answers as soon as the run has started, where upstream waits for it to finish.
+- A schedule that targets an archived or deleted agent completes when it next fires.
 
 **Notifications** work like upstream: the app registers its Expo push token, and when an agent
 finishes or needs permission, a client that's looking at that agent gets nothing, the most recently

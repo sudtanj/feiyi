@@ -109,6 +109,9 @@ pub struct WorkspaceRecord {
     pub created_at: String,
     #[serde(default)]
     pub archived_at: Option<String>,
+    /// Main checkout of the repository when `directory` is a worktree feiyi created.
+    #[serde(default)]
+    pub main_repo_root: Option<String>,
 }
 
 pub struct Store {

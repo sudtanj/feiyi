@@ -260,7 +260,7 @@ impl Manager {
                 let source = msg.get("source").cloned().unwrap_or(Value::Null);
                 let fail = |error: String, code: &str| json!({ "type": "workspace.create.response", "payload": { "requestId": rid, "workspace": null, "setupTerminalId": null, "error": error, "errorCode": code } });
                 if s(&source, "kind").as_deref() != Some("directory") {
-                    return reply(out, fail("feiyi does not create git worktrees yet; choose Local isolation".into(), "unsupported"));
+                    return self.create_worktree_workspace(&source, &rid, out);
                 }
                 let dir = match normalize_dir(&s(&source, "path").unwrap_or_default()) {
                     Ok(d) => d,
@@ -432,11 +432,6 @@ impl Manager {
                 }
                 reply(out, json!({ "type": "push.unregister.response", "payload": { "requestId": rid } }));
             }
-            // ponytail: no terminals (a PTY plus a screen emulator per shell does
-            // not fit a 1 GB VM): answer empty so the app stops erroring.
-            "list_terminals_request" => reply(out, json!({ "type": "list_terminals_response", "payload": { "cwd": s(&msg, "cwd").unwrap_or_default(), "terminals": [], "requestId": rid } })),
-            "subscribe_terminals_request" => reply(out, json!({ "type": "terminals_changed", "payload": { "requestId": rid, "cwd": s(&msg, "cwd").unwrap_or_default(), "terminals": [] } })),
-            "unsubscribe_terminals_request" => {}
             "project_icon_request" => reply(out, json!({ "type": "project_icon_response", "payload": { "cwd": s(&msg, "cwd").unwrap_or_default(), "icon": s(&msg, "cwd").and_then(|c| crate::project_meta::icon(&c)), "error": null, "requestId": rid } })),
             "workspace.script.list.request" => {
                 let id = s(&msg, "workspaceId").unwrap_or_default();
@@ -452,6 +447,7 @@ impl Manager {
                 reply(out, json!({ "type": "read_project_config_response", "payload": payload }));
             }
             "abort_request" => {}
+            k if k.starts_with("schedule/") => self.schedule_rpc(k, &msg, &rid, out),
             "ping" => {
                 let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
                 let mut payload = json!({ "requestId": rid, "serverReceivedAt": now, "serverSentAt": now });
@@ -463,7 +459,7 @@ impl Manager {
             _ => {
                 let git = crate::git_actions::GitCtx { watcher: self.checkout.clone(), bcast: self.bcast.clone() };
                 // File explorer, downloads, saves and entry edits (files.rs).
-                if !crate::files::handle(&kind, &msg, &rid, out) && !crate::git_actions::handle(&git, &kind, &msg, &rid, out) && !self.handle_ext_rpc(&kind, &msg, &rid, out) && request_id.is_some() {
+                if !crate::files::handle(&kind, &msg, &rid, out) && !crate::git_actions::handle(&git, &kind, &msg, &rid, out) && !self.handle_ext_rpc(&kind, &msg, &rid, out) && !self.handle_worktree_rpc(&kind, &msg, &rid, out) && request_id.is_some() {
                     rpc_error(out, &rid, &kind, "not supported by feiyi");
                 }
             }
@@ -499,7 +495,7 @@ impl Manager {
         });
     }
 
-    fn create_agent(&mut self, msg: &Value, rid: &str, out: &Out) {
+    pub(crate) fn create_agent(&mut self, msg: &Value, rid: &str, out: &Out) {
         let config = msg.get("config").cloned().unwrap_or(Value::Null);
         let provider = s(&config, "provider").unwrap_or_default();
         let fail = |error: String| reply(out, json!({ "type": "status", "payload": { "status": "agent_create_failed", "requestId": rid, "error": error } }));
@@ -510,6 +506,9 @@ impl Manager {
             Ok(c) => c,
             Err(e) => return fail(e),
         };
+        if let Some(spec) = crate::worktrees::agent_spec(msg, &cwd) {
+            return self.create_agent_in_worktree(spec, msg, rid, out);
+        }
         let now = now_iso();
         let labels: BTreeMap<String, String> = msg
             .get("labels")

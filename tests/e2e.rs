@@ -301,9 +301,42 @@ async fn unsupported_requests_get_an_rpc_error() {
     let d = start("rpcerr", None);
     let mut ws = connect(d.port).await;
     hello(&mut ws, None).await;
-    send(&mut ws, session(json!({ "type": "create_terminal_request", "requestId": "r1" }))).await;
+    send(&mut ws, session(json!({ "type": "voice_not_in_feiyi_request", "requestId": "r1" }))).await;
     let err = recv_until(&mut ws, |v| (v["message"]["type"] == "rpc_error").then(|| v["message"]["payload"].clone())).await;
     assert_eq!(err["requestId"], "r1");
+}
+
+#[tokio::test]
+async fn file_subscription_pushes_updates_and_entries_duplicate() {
+    let d = start("filesub", None);
+    let cwd = d.dir.join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::write(cwd.join("a.txt"), "one").unwrap();
+    let cwd = cwd.to_string_lossy().into_owned();
+    let mut ws = connect(d.port).await;
+    let info = hello(&mut ws, None).await;
+    assert_eq!(info["message"]["payload"]["features"]["fsEntryDuplicate"], true);
+
+    let sub = rpc(&mut ws, json!({ "type": "fs.file.subscribe.request", "requestId": "s1", "cwd": cwd, "path": "a.txt", "subscriptionId": "sub1" }), "fs.file.subscribe.response").await;
+    assert_eq!(sub["subscriptionId"], "sub1");
+    assert_eq!(sub["initial"]["status"], "ready");
+    assert_eq!(sub["initial"]["size"], 3);
+
+    std::fs::write(cwd.clone() + "/a.txt", "changed").unwrap();
+    let update = recv_until(&mut ws, |v| (v["message"]["type"] == "fs.file.update").then(|| v["message"]["payload"].clone())).await;
+    assert_eq!(update["subscriptionId"], "sub1");
+    assert_eq!(update["version"]["size"], 7);
+
+    let un = rpc(&mut ws, json!({ "type": "fs.file.unsubscribe.request", "requestId": "s2", "subscriptionId": "sub1" }), "fs.file.unsubscribe.response").await;
+    assert_eq!(un["subscriptionId"], "sub1");
+
+    let dup = rpc(&mut ws, json!({ "type": "fs.entry.duplicate.request", "requestId": "d1", "cwd": cwd, "path": "a.txt" }), "fs.entry.duplicate.response").await;
+    assert_eq!(dup["success"], true, "{dup}");
+    assert_eq!(dup["duplicatedPath"], "a copy.txt");
+    assert_eq!(std::fs::read_to_string(cwd.clone() + "/a copy.txt").unwrap(), "changed");
+    let outside = rpc(&mut ws, json!({ "type": "fs.entry.duplicate.request", "requestId": "d2", "cwd": cwd, "path": "../x" }), "fs.entry.duplicate.response").await;
+    assert_eq!(outside["success"], false);
+    assert!(outside["duplicatedPath"].is_null());
 }
 
 #[tokio::test]
@@ -937,4 +970,390 @@ async fn codex_gets_the_shell_environment_exclude() {
     }
     let args = std::fs::read_to_string(&file).expect("codex was started");
     assert!(args.lines().any(|l| l.starts_with("shell_environment_policy.exclude=") && l.contains("PASEO_*") && l.contains("*API_KEY*")), "{args}");
+}
+
+#[tokio::test]
+async fn worktree_workspace_create_list_and_guarded_archive() {
+    let d = start("worktree", None);
+    let repo = d.dir.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    git(&repo, &["config", "user.name", "Test"]);
+    std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-q", "-m", "initial"]);
+    let cwd = repo.to_string_lossy().to_string();
+    let mut ws = connect(d.port).await;
+    hello(&mut ws, None).await;
+
+    let r = rpc(&mut ws, json!({ "type": "workspace.create.request", "requestId": "w1", "source": { "kind": "worktree", "cwd": cwd, "worktreeSlug": "brave-fox" } }), "workspace.create.response").await;
+    assert!(r["error"].is_null(), "{r}");
+    let workspace = &r["workspace"];
+    assert_eq!(workspace["workspaceKind"], "worktree");
+    assert_eq!(workspace["worktreeSlug"], "brave-fox");
+    assert_eq!(workspace["name"], "brave-fox");
+    assert_eq!(workspace["gitRuntime"]["isPaseoOwnedWorktree"], true);
+    let dir = std::path::PathBuf::from(workspace["workspaceDirectory"].as_str().unwrap());
+    assert!(dir.starts_with(d.dir.join("home").join("worktrees")), "{dir:?}");
+    assert_eq!(git(&dir, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(), "brave-fox");
+    let id = workspace["id"].as_str().unwrap().to_string();
+
+    let r = rpc(&mut ws, json!({ "type": "fetch_workspaces_request", "requestId": "w2" }), "fetch_workspaces_response").await;
+    assert!(r["entries"].as_array().unwrap().iter().any(|e| e["id"] == id.as_str()), "{r}");
+    let r = rpc(&mut ws, json!({ "type": "paseo_worktree_list_request", "requestId": "w3", "cwd": cwd }), "paseo_worktree_list_response").await;
+    assert!(r["error"].is_null(), "{r}");
+    assert_eq!(r["worktrees"].as_array().unwrap().len(), 1, "{r}");
+    assert_eq!(r["worktrees"][0]["branchName"], "brave-fox");
+
+    let r = rpc(&mut ws, json!({ "type": "workspace.create.request", "requestId": "w4", "source": { "kind": "worktree", "cwd": cwd, "branchName": "bad..name" } }), "workspace.create.response").await;
+    assert!(r["workspace"].is_null() && r["error"].as_str().unwrap().contains("Invalid branch name"), "{r}");
+    let r = rpc(&mut ws, json!({ "type": "workspace.create.request", "requestId": "w5", "source": { "kind": "worktree", "cwd": cwd, "action": "checkout", "refName": "nope" } }), "workspace.create.response").await;
+    assert_eq!(r["errorCode"], "unknown_branch", "{r}");
+
+    // Uncommitted work blocks the archive and nothing changes; once clean the directory goes, the branch stays.
+    std::fs::write(dir.join("draft.txt"), "wip\n").unwrap();
+    let r = rpc(&mut ws, json!({ "type": "archive_workspace_request", "requestId": "w6", "workspaceId": id }), "archive_workspace_response").await;
+    assert!(r["error"].as_str().unwrap().contains("uncommitted"), "{r}");
+    assert!(dir.join("draft.txt").exists());
+    let r = rpc(&mut ws, json!({ "type": "paseo_worktree_archive_request", "requestId": "w7", "worktreePath": dir.to_string_lossy(), "scope": "worktree" }), "paseo_worktree_archive_response").await;
+    assert_eq!(r["success"], false, "{r}");
+    assert_eq!(r["error"]["code"], "NOT_ALLOWED");
+
+    std::fs::remove_file(dir.join("draft.txt")).unwrap();
+    let r = rpc(&mut ws, json!({ "type": "paseo_worktree_archive_request", "requestId": "w8", "worktreePath": dir.to_string_lossy(), "scope": "worktree" }), "paseo_worktree_archive_response").await;
+    assert_eq!(r["success"], true, "{r}");
+    assert!(!dir.exists());
+    assert!(git(&repo, &["branch", "--list", "brave-fox"]).contains("brave-fox"));
+    let r = rpc(&mut ws, json!({ "type": "paseo_worktree_list_request", "requestId": "w9", "cwd": cwd }), "paseo_worktree_list_response").await;
+    assert!(r["worktrees"].as_array().unwrap().is_empty(), "{r}");
+}
+
+/// Next frame of either kind: JSON text or a binary terminal frame.
+async fn recv_frame(ws: &mut Ws) -> Message {
+    loop {
+        match tokio::time::timeout(Duration::from_secs(20), ws.next()).await.expect("timed out waiting for a frame") {
+            Some(Ok(m @ (Message::Text(_) | Message::Binary(_)))) => return m,
+            Some(Ok(_)) => continue,
+            other => panic!("socket closed: {other:?}"),
+        }
+    }
+}
+
+/// Collect terminal output/restore frames for `slot` until they contain `needle`.
+async fn terminal_output_until(ws: &mut Ws, slot: u8, needle: &str) {
+    let mut seen = Vec::new();
+    loop {
+        if let Message::Binary(b) = recv_frame(ws).await {
+            if b.len() >= 2 && (b[0] == 0x01 || b[0] == 0x05) && b[1] == slot {
+                seen.extend_from_slice(&b[2..]);
+            }
+        }
+        if String::from_utf8_lossy(&seen).contains(needle) {
+            return;
+        }
+    }
+}
+
+async fn terminal_payload(ws: &mut Ws, kind: &str) -> Value {
+    loop {
+        if let Message::Text(t) = recv_frame(ws).await {
+            let v: Value = serde_json::from_str(&t).unwrap();
+            if v["message"]["type"] == kind {
+                return v["message"]["payload"].clone();
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn terminal_runs_a_shell_streams_output_and_reattaches() {
+    let d = start_with(unique_dir("term"), None, "ok", &[("SHELL", "/bin/sh")]);
+    let proj = d.dir.join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let cwd = proj.to_string_lossy().into_owned();
+    let mut ws = connect(d.port).await;
+    hello(&mut ws, None).await;
+    send(&mut ws, session(json!({ "type": "project.add.request", "requestId": "p1", "cwd": cwd }))).await;
+    recv_until(&mut ws, |v| (v["message"]["type"] == "project.add.response").then_some(())).await;
+
+    // Outside every project: refused.
+    send(&mut ws, session(json!({ "type": "create_terminal_request", "requestId": "t0", "cwd": "/" }))).await;
+    let refused = terminal_payload(&mut ws, "create_terminal_response").await;
+    assert!(refused["terminal"].is_null() && refused["error"].is_string(), "{refused}");
+
+    send(&mut ws, session(json!({ "type": "create_terminal_request", "requestId": "t1", "cwd": cwd }))).await;
+    let created = terminal_payload(&mut ws, "create_terminal_response").await;
+    assert!(created["error"].is_null(), "{created}");
+    let id = created["terminal"]["id"].as_str().unwrap().to_string();
+
+    send(&mut ws, session(json!({ "type": "list_terminals_request", "requestId": "l1", "cwd": cwd }))).await;
+    let listed = terminal_payload(&mut ws, "list_terminals_response").await;
+    assert_eq!(listed["terminals"][0]["id"], id.as_str());
+
+    send(&mut ws, session(json!({ "type": "subscribe_terminal_request", "requestId": "s1", "terminalId": id, "restore": { "mode": "visible-snapshot" } }))).await;
+    let sub = terminal_payload(&mut ws, "subscribe_terminal_response").await;
+    assert!(sub["error"].is_null(), "{sub}");
+    let slot = sub["slot"].as_u64().unwrap() as u8;
+
+    // The command's own echo says `20+1`; only the shell's answer says `21`.
+    send(&mut ws, session(json!({ "type": "terminal_input", "terminalId": id, "message": { "type": "input", "data": "echo hi-$((20+1))\n" } }))).await;
+    terminal_output_until(&mut ws, slot, "hi-21").await;
+
+    // The terminal outlives the connection: a new one gets the scrollback back.
+    drop(ws);
+    let mut ws2 = connect(d.port).await;
+    hello(&mut ws2, None).await;
+    send(&mut ws2, session(json!({ "type": "subscribe_terminal_request", "requestId": "s2", "terminalId": id, "restore": { "mode": "visible-snapshot" } }))).await;
+    let sub = terminal_payload(&mut ws2, "subscribe_terminal_response").await;
+    let slot = sub["slot"].as_u64().unwrap() as u8;
+    terminal_output_until(&mut ws2, slot, "hi-21").await;
+
+    // Binary input frame: opcode 0x02, slot, bytes.
+    let mut frame = vec![0x02, slot];
+    frame.extend_from_slice(b"exit\n");
+    ws2.send(Message::Binary(frame)).await.unwrap();
+    let exit = terminal_payload(&mut ws2, "terminal_stream_exit").await;
+    assert_eq!(exit["terminalId"], id.as_str());
+    assert_eq!(exit["subscriptionId"], sub["subscriptionId"]);
+
+    send(&mut ws2, session(json!({ "type": "list_terminals_request", "requestId": "l2", "cwd": cwd }))).await;
+    let listed = terminal_payload(&mut ws2, "list_terminals_response").await;
+    assert!(listed["terminals"].as_array().unwrap().is_empty(), "{listed}");
+}
+
+/// Poll `schedule/inspect` until the schedule has `runs` runs and none is running.
+async fn schedule_settled(ws: &mut Ws, id: &str, runs: usize) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let r = rpc(ws, json!({ "type": "schedule/inspect", "requestId": "poll", "scheduleId": id }), "schedule/inspect/response").await;
+        let list = r["schedule"]["runs"].as_array().expect("runs").clone();
+        if list.len() >= runs && list.iter().all(|run| run["status"] != "running") {
+            return r["schedule"].clone();
+        }
+        assert!(Instant::now() < deadline, "schedule runs did not finish: {r}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+fn new_agent_schedule(request_id: &str, cwd: &std::path::Path) -> Value {
+    json!({
+        "type": "schedule/create",
+        "requestId": request_id,
+        "name": "build check",
+        "prompt": "say hi",
+        "cadence": { "type": "every", "everyMs": 3_600_000 },
+        "target": { "type": "new-agent", "config": { "provider": "claude", "cwd": cwd.to_string_lossy(), "modeId": "bypassPermissions" } },
+    })
+}
+
+#[tokio::test]
+async fn schedules_create_list_run_now_pause_update_delete() {
+    let d = start("schedules", None);
+    let cwd = d.dir.join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let mut ws = connect(d.port).await;
+    hello(&mut ws, None).await;
+
+    let created = rpc(&mut ws, new_agent_schedule("s1", &cwd), "schedule/create/response").await;
+    assert!(created["error"].is_null(), "{created}");
+    let schedule = &created["schedule"];
+    assert_eq!((schedule["status"].as_str(), schedule["name"].as_str(), schedule["maxRuns"].is_null()), (Some("active"), Some("build check"), true), "{created}");
+    assert!(schedule.get("runs").is_none(), "{created}");
+    let id = schedule["id"].as_str().unwrap().to_string();
+
+    // An interval schedule runs on creation: a new agent answers, and its output is recorded.
+    let first = schedule_settled(&mut ws, &id, 1).await;
+    let run = &first["runs"][0];
+    assert_eq!(run["status"], "succeeded", "{first}");
+    assert!(run["output"].as_str().unwrap().contains("hello from fake claude"), "{first}");
+    assert!(run["agentId"].is_string() && run["error"].is_null() && run["endedAt"].is_string(), "{first}");
+    assert!(first["lastRunAt"].is_string() && first["nextRunAt"].is_string(), "{first}");
+
+    let listed = rpc(&mut ws, json!({ "type": "schedule/list", "requestId": "s2" }), "schedule/list/response").await;
+    assert_eq!(listed["schedules"].as_array().unwrap().len(), 1, "{listed}");
+    assert_eq!(listed["schedules"][0]["id"], id.as_str());
+    assert!(listed["schedules"][0].get("runs").is_none());
+
+    // Run now adds a run without moving the cadence.
+    let ran = rpc(&mut ws, json!({ "type": "schedule/run-once", "requestId": "s3", "scheduleId": id }), "schedule/run-once/response").await;
+    assert!(ran["error"].is_null(), "{ran}");
+    assert_eq!(ran["schedule"]["runs"].as_array().unwrap().len(), 2, "{ran}");
+    let both = schedule_settled(&mut ws, &id, 2).await;
+    assert!(both["runs"].as_array().unwrap().iter().all(|r| r["status"] == "succeeded"), "{both}");
+    assert_eq!(both["nextRunAt"], first["nextRunAt"]);
+
+    // Each run's agent is archived once it finishes.
+    let live = rpc(&mut ws, json!({ "type": "fetch_agents_request", "requestId": "s4" }), "fetch_agents_response").await;
+    assert!(live["entries"].as_array().unwrap().is_empty(), "{live}");
+    let history = rpc(&mut ws, json!({ "type": "fetch_agent_history_request", "requestId": "s5" }), "fetch_agent_history_response").await;
+    assert_eq!(history["entries"].as_array().unwrap().len(), 2, "{history}");
+    assert!(history["entries"].as_array().unwrap().iter().all(|e| e["agent"]["archivedAt"].is_string()), "{history}");
+
+    let logs = rpc(&mut ws, json!({ "type": "schedule/logs", "requestId": "s6", "scheduleId": id }), "schedule/logs/response").await;
+    assert_eq!(logs["runs"].as_array().unwrap().len(), 2, "{logs}");
+
+    let paused = rpc(&mut ws, json!({ "type": "schedule/pause", "requestId": "s7", "scheduleId": id }), "schedule/pause/response").await;
+    assert_eq!((paused["schedule"]["status"].as_str(), paused["schedule"]["nextRunAt"].is_null(), paused["schedule"]["pausedAt"].is_string()), (Some("paused"), true, true), "{paused}");
+    let resumed = rpc(&mut ws, json!({ "type": "schedule/resume", "requestId": "s8", "scheduleId": id }), "schedule/resume/response").await;
+    assert_eq!((resumed["schedule"]["status"].as_str(), resumed["schedule"]["nextRunAt"].is_string(), resumed["schedule"]["pausedAt"].is_null()), (Some("active"), true, true), "{resumed}");
+
+    let updated = rpc(&mut ws, json!({ "type": "schedule/update", "requestId": "s9", "scheduleId": id, "name": "renamed", "cadence": { "type": "cron", "expression": "0 9 * * 1-5" }, "maxRuns": 5 }), "schedule/update/response").await;
+    assert!(updated["error"].is_null(), "{updated}");
+    assert_eq!((updated["schedule"]["name"].as_str(), updated["schedule"]["maxRuns"].as_u64()), (Some("renamed"), Some(5)), "{updated}");
+    assert_eq!(updated["schedule"]["cadence"], json!({ "type": "cron", "expression": "0 9 * * 1-5" }));
+    assert_eq!(updated["schedule"]["runs"].as_array().unwrap().len(), 2);
+
+    let deleted = rpc(&mut ws, json!({ "type": "schedule/delete", "requestId": "s10", "scheduleId": id }), "schedule/delete/response").await;
+    assert_eq!((deleted["scheduleId"].as_str(), deleted["error"].is_null()), (Some(id.as_str()), true), "{deleted}");
+    let listed = rpc(&mut ws, json!({ "type": "schedule/list", "requestId": "s11" }), "schedule/list/response").await;
+    assert!(listed["schedules"].as_array().unwrap().is_empty(), "{listed}");
+
+    send(&mut ws, session(json!({ "type": "schedule/inspect", "requestId": "s12", "scheduleId": id }))).await;
+    let err = recv_until(&mut ws, |v| (v["message"]["type"] == "rpc_error").then(|| v["message"]["payload"].clone())).await;
+    assert_eq!((err["requestId"].as_str(), err["code"].as_str()), (Some("s12"), Some("schedule_request_failed")), "{err}");
+    assert!(err["error"].as_str().unwrap().contains("not found"), "{err}");
+
+    send(&mut ws, session(json!({ "type": "schedule/create", "requestId": "s13", "prompt": "x", "cadence": { "type": "cron", "expression": "nope" }, "target": { "type": "agent", "agentId": "a" } }))).await;
+    let err = recv_until(&mut ws, |v| (v["message"]["type"] == "rpc_error").then(|| v["message"]["payload"].clone())).await;
+    assert!(err["error"].as_str().unwrap().contains("5 fields"), "{err}");
+}
+
+#[tokio::test]
+async fn schedules_persist_and_a_full_daemon_records_a_skipped_run() {
+    let dir = unique_dir("schedcap");
+    let cwd = dir.join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let d = start_with(dir, None, "hang", &[("PASEO_CLAUDE_MAX_LIVE", "1")]);
+    let mut ws = connect(d.port).await;
+    hello(&mut ws, None).await;
+    // One agent occupies the only slot and never answers.
+    send(&mut ws, session(json!({ "type": "create_agent_request", "requestId": "a1", "config": { "provider": "claude", "cwd": cwd.to_string_lossy() }, "initialPrompt": "wait" }))).await;
+    recv_until(&mut ws, |v| (v["message"]["payload"]["status"] == "agent_created").then_some(())).await;
+
+    let created = rpc(&mut ws, new_agent_schedule("s1", &cwd), "schedule/create/response").await;
+    let id = created["schedule"]["id"].as_str().unwrap().to_string();
+    let settled = schedule_settled(&mut ws, &id, 1).await;
+    let run = &settled["runs"][0];
+    assert_eq!(run["status"], "failed", "{settled}");
+    assert!(run["error"].as_str().unwrap().contains("at capacity"), "{settled}");
+    assert!(run["agentId"].is_null(), "{settled}");
+    assert_eq!(settled["status"], "active");
+    assert!(settled["nextRunAt"].is_string(), "{settled}");
+
+    // A second connection reads the same schedules, and they are on disk for a restart.
+    let mut ws2 = connect(d.port).await;
+    hello(&mut ws2, None).await;
+    let listed = rpc(&mut ws2, json!({ "type": "schedule/list", "requestId": "s2" }), "schedule/list/response").await;
+    assert_eq!(listed["schedules"][0]["id"], id.as_str());
+    let saved: Value = serde_json::from_slice(&std::fs::read(d.dir.join("home").join("schedules.json")).unwrap()).unwrap();
+    assert_eq!(saved[0]["id"], id.as_str());
+    assert_eq!(saved[0]["runs"][0]["status"], "failed");
+}
+
+#[tokio::test]
+async fn entries_duplicate_copies_a_directory_tree() {
+    let d = start("dupdir", None);
+    let cwd = d.dir.join("work");
+    std::fs::create_dir_all(cwd.join("src/sub")).unwrap();
+    std::fs::write(cwd.join("src/sub/b.txt"), "two").unwrap();
+    let cwd_s = cwd.to_string_lossy().into_owned();
+    let mut ws = connect(d.port).await;
+    hello(&mut ws, None).await;
+
+    let dup = rpc(&mut ws, json!({ "type": "fs.entry.duplicate.request", "requestId": "d1", "cwd": cwd_s, "path": "src" }), "fs.entry.duplicate.response").await;
+    assert_eq!((dup["success"].as_bool(), dup["duplicatedPath"].as_str()), (Some(true), Some("src copy")), "{dup}");
+    assert_eq!(std::fs::read_to_string(cwd.join("src copy/sub/b.txt")).unwrap(), "two");
+    let again = rpc(&mut ws, json!({ "type": "fs.entry.duplicate.request", "requestId": "d2", "cwd": cwd_s, "path": "src" }), "fs.entry.duplicate.response").await;
+    assert_eq!(again["duplicatedPath"], "src copy 2", "{again}");
+    let root = rpc(&mut ws, json!({ "type": "fs.entry.duplicate.request", "requestId": "d3", "cwd": cwd_s, "path": "." }), "fs.entry.duplicate.response").await;
+    assert_eq!(root["success"], false, "{root}");
+}
+
+#[tokio::test]
+async fn worktree_archive_succeeds_when_its_directory_was_deleted_by_hand() {
+    let d = start("wtgone", None);
+    let repo = d.dir.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    git(&repo, &["config", "user.name", "Test"]);
+    std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-q", "-m", "initial"]);
+    let cwd = repo.to_string_lossy().to_string();
+    let mut ws = connect(d.port).await;
+    hello(&mut ws, None).await;
+
+    let r = rpc(&mut ws, json!({ "type": "workspace.create.request", "requestId": "w1", "source": { "kind": "worktree", "cwd": cwd, "worktreeSlug": "gone-fox" } }), "workspace.create.response").await;
+    assert!(r["error"].is_null(), "{r}");
+    let dir = std::path::PathBuf::from(r["workspace"]["workspaceDirectory"].as_str().unwrap());
+    let id = r["workspace"]["id"].as_str().unwrap().to_string();
+    std::fs::remove_dir_all(&dir).unwrap();
+
+    let r = rpc(&mut ws, json!({ "type": "paseo_worktree_archive_request", "requestId": "w2", "worktreePath": dir.to_string_lossy(), "scope": "worktree" }), "paseo_worktree_archive_response").await;
+    assert_eq!(r["success"], true, "{r}");
+    assert!(!git(&repo, &["worktree", "list", "--porcelain"]).contains("gone-fox"), "stale worktree entry was not pruned");
+    assert!(git(&repo, &["branch", "--list", "gone-fox"]).contains("gone-fox"));
+    let r = rpc(&mut ws, json!({ "type": "paseo_worktree_list_request", "requestId": "w3", "cwd": cwd }), "paseo_worktree_list_response").await;
+    assert!(r["worktrees"].as_array().unwrap().is_empty(), "{r}");
+    let r = rpc(&mut ws, json!({ "type": "fetch_workspaces_request", "requestId": "w4" }), "fetch_workspaces_response").await;
+    assert!(!r["entries"].as_array().unwrap().iter().any(|e| e["id"] == id.as_str()), "{r}");
+}
+
+#[tokio::test]
+async fn archiving_a_workspace_ends_its_terminals() {
+    let d = start_with(unique_dir("termarch"), None, "ok", &[("SHELL", "/bin/sh")]);
+    let proj = d.dir.join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let cwd = proj.to_string_lossy().into_owned();
+    let mut ws = connect(d.port).await;
+    hello(&mut ws, None).await;
+
+    let r = rpc(&mut ws, json!({ "type": "workspace.create.request", "requestId": "w1", "source": { "kind": "directory", "path": cwd } }), "workspace.create.response").await;
+    assert!(r["error"].is_null(), "{r}");
+    let workspace_id = r["workspace"]["id"].as_str().unwrap().to_string();
+
+    send(&mut ws, session(json!({ "type": "create_terminal_request", "requestId": "t1", "cwd": cwd, "workspaceId": workspace_id }))).await;
+    let created = terminal_payload(&mut ws, "create_terminal_response").await;
+    assert!(created["error"].is_null(), "{created}");
+    let id = created["terminal"]["id"].as_str().unwrap().to_string();
+    send(&mut ws, session(json!({ "type": "subscribe_terminal_request", "requestId": "s1", "terminalId": id, "restore": { "mode": "visible-snapshot" } }))).await;
+    let sub = terminal_payload(&mut ws, "subscribe_terminal_response").await;
+    assert!(sub["error"].is_null(), "{sub}");
+
+    send(&mut ws, session(json!({ "type": "archive_workspace_request", "requestId": "a1", "workspaceId": workspace_id }))).await;
+    let exit = terminal_payload(&mut ws, "terminal_stream_exit").await;
+    assert_eq!(exit["terminalId"], id.as_str());
+
+    send(&mut ws, session(json!({ "type": "list_terminals_request", "requestId": "l1", "workspaceId": workspace_id }))).await;
+    let listed = terminal_payload(&mut ws, "list_terminals_response").await;
+    assert!(listed["terminals"].as_array().unwrap().is_empty(), "{listed}");
+
+    send(&mut ws, session(json!({ "type": "create_terminal_request", "requestId": "t2", "cwd": cwd, "workspaceId": workspace_id }))).await;
+    let refused = terminal_payload(&mut ws, "create_terminal_response").await;
+    assert!(refused["terminal"].is_null() && refused["error"].is_string(), "{refused}");
+}
+
+#[tokio::test]
+async fn schedule_create_rejects_an_interval_under_one_minute() {
+    let d = start("schedmin", None);
+    let cwd = d.dir.join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let mut ws = connect(d.port).await;
+    hello(&mut ws, None).await;
+
+    for (request_id, every_ms) in [("s1", 59_999u64), ("s2", 0)] {
+        let mut msg = new_agent_schedule(request_id, &cwd);
+        msg["cadence"]["everyMs"] = json!(every_ms);
+        send(&mut ws, session(msg)).await;
+        let err = recv_until(&mut ws, |v| (v["message"]["type"] == "rpc_error").then(|| v["message"]["payload"].clone())).await;
+        assert_eq!(err["requestId"], request_id, "{err}");
+        assert!(err["error"].as_str().unwrap().contains("everyMs must be between 1 minute"), "{err}");
+    }
+    let listed = rpc(&mut ws, json!({ "type": "schedule/list", "requestId": "s3" }), "schedule/list/response").await;
+    assert!(listed["schedules"].as_array().unwrap().is_empty(), "{listed}");
+
+    let ok = rpc(&mut ws, { let mut m = new_agent_schedule("s4", &cwd); m["cadence"]["everyMs"] = json!(60_000); m }, "schedule/create/response").await;
+    assert!(ok["error"].is_null(), "{ok}");
 }

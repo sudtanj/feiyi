@@ -73,7 +73,7 @@ async fn current_branch(dir: &Path) -> Option<String> {
 }
 
 /// Upstream's `assertSafeGitRef`.
-fn safe_ref(name: &str) -> bool {
+pub(crate) fn safe_ref(name: &str) -> bool {
     !name.is_empty()
         && name.chars().all(|c| c.is_ascii_alphanumeric() || "._/-".contains(c))
         && !name.contains("..")
@@ -89,7 +89,7 @@ fn normalize_branch(name: &str) -> &str {
 }
 
 /// Where a branch name lives: local, remote-only (origin), or nowhere.
-async fn resolve_branch(dir: &Path, name: &str) -> Option<(String, bool)> {
+pub(crate) async fn resolve_branch(dir: &Path, name: &str) -> Option<(String, bool)> {
     let n = normalize_branch(name);
     if git(dir, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{n}")]).await.is_ok() {
         return Some((n.to_string(), false));
@@ -326,7 +326,7 @@ async fn switch_branch(dir: &Path, cwd: &str, branch: &str) -> Result<&'static s
 }
 
 /// Upstream's `validateBranchSlug` for renames.
-fn branch_slug_error(name: &str) -> Option<&'static str> {
+pub(crate) fn branch_slug_error(name: &str) -> Option<&'static str> {
     if name.is_empty() {
         Some("Branch name is required")
     } else if name.len() > 100 {

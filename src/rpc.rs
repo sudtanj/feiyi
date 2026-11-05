@@ -432,11 +432,6 @@ impl Manager {
                 }
                 reply(out, json!({ "type": "push.unregister.response", "payload": { "requestId": rid } }));
             }
-            // ponytail: no terminals (a PTY plus a screen emulator per shell does
-            // not fit a 1 GB VM): answer empty so the app stops erroring.
-            "list_terminals_request" => reply(out, json!({ "type": "list_terminals_response", "payload": { "cwd": s(&msg, "cwd").unwrap_or_default(), "terminals": [], "requestId": rid } })),
-            "subscribe_terminals_request" => reply(out, json!({ "type": "terminals_changed", "payload": { "requestId": rid, "cwd": s(&msg, "cwd").unwrap_or_default(), "terminals": [] } })),
-            "unsubscribe_terminals_request" => {}
             "project_icon_request" => reply(out, json!({ "type": "project_icon_response", "payload": { "cwd": s(&msg, "cwd").unwrap_or_default(), "icon": s(&msg, "cwd").and_then(|c| crate::project_meta::icon(&c)), "error": null, "requestId": rid } })),
             "workspace.script.list.request" => {
                 let id = s(&msg, "workspaceId").unwrap_or_default();

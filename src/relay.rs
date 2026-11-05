@@ -227,7 +227,7 @@ async fn data_socket(ctx: Arc<Ctx>, cfg: &Config, identity: Arc<DaemonIdentity>,
     sink.send(ready_frame(binary_ciphertext)).await.map_err(|e| e.to_string())?;
 
     let (in_tx, in_rx) = tokio::sync::mpsc::channel::<Inbound>(64);
-    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Arc<str>>(256);
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<session::Outbound>(256);
     let session = tokio::spawn(session::run(ctx, in_rx, out_tx, true));
     let mut last_seen = Instant::now();
     let mut keepalive = tokio::time::interval(PING_INTERVAL);
@@ -239,11 +239,11 @@ async fn data_socket(ctx: Arc<Ctx>, cfg: &Config, identity: Arc<DaemonIdentity>,
                 // JSON is text plaintext => base64 ciphertext in a text frame.
                 // Queue whatever else is already waiting and flush once, so a
                 // burst of stream updates costs one write instead of one each.
-                let mut res = sink.feed(Message::Text(channel.encrypt_text(&out))).await;
+                let mut res = sink.feed(wire(&channel, &out, binary_ciphertext)).await;
                 let mut n = 1;
                 while res.is_ok() && n < WRITE_BATCH {
                     let Ok(more) = out_rx.try_recv() else { break };
-                    res = sink.feed(Message::Text(channel.encrypt_text(&more))).await;
+                    res = sink.feed(wire(&channel, &more, binary_ciphertext)).await;
                     n += 1;
                 }
                 // A dead TCP connection never errors on write: bound the flush so it is noticed.
@@ -310,12 +310,21 @@ async fn data_socket(ctx: Arc<Ctx>, cfg: &Config, identity: Arc<DaemonIdentity>,
     result
 }
 
-/// Decrypted plaintext -> session frame: file-transfer frames stay binary,
-/// everything else must be UTF-8 JSON.
+/// Decrypted plaintext -> session frame: file-transfer and terminal frames stay
+/// binary, everything else must be UTF-8 JSON.
 fn inbound_frame(plain: Vec<u8>) -> Result<Inbound, String> {
-    if crate::uploads::is_file_frame(&plain) {
+    if session::is_binary_frame(&plain) {
         Ok(Inbound::Binary(plain))
     } else {
         String::from_utf8(plain).map(Inbound::Text).map_err(|e| e.to_string())
+    }
+}
+
+/// Binary plaintext goes out as binary ciphertext when the client negotiated it, else base64 in a text frame.
+fn wire(channel: &Channel, out: &session::Outbound, binary_ciphertext: bool) -> Message {
+    match out {
+        session::Outbound::Text(text) => Message::Text(channel.encrypt_text(text)),
+        session::Outbound::Binary(bytes) if binary_ciphertext => Message::Binary(channel.encrypt(bytes)),
+        session::Outbound::Binary(bytes) => Message::Text(channel.encrypt_base64(bytes)),
     }
 }

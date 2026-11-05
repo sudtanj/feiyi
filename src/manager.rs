@@ -79,6 +79,8 @@ pub enum Cmd {
     Debug { tool: String, args: Value, reply: oneshot::Sender<Result<Value, String>> },
     /// Finish background work (a worktree created or removed) on the manager.
     Run(Box<dyn FnOnce(&mut Manager) + Send>),
+    /// Where a new terminal may start: its canonical directory and workspace (terminal.rs).
+    TerminalTarget { cwd: String, workspace_id: Option<String>, reply: oneshot::Sender<Result<(String, Option<String>), String>> },
 }
 
 /// What a connected client last reported via `client_heartbeat`.
@@ -270,6 +272,9 @@ impl Manager {
                         let _ = reply.send(self.debug_tool(&tool, &args));
                     }
                     Cmd::Run(work) => work(&mut self),
+                    Cmd::TerminalTarget { cwd, workspace_id, reply } => {
+                        let _ = reply.send(self.terminal_target(&cwd, workspace_id.as_deref()));
+                    }
                     Cmd::RevokePushTokens(tokens) => {
                         for t in tokens {
                             self.push_tokens.revoke(&t);

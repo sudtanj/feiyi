@@ -131,7 +131,17 @@ feiyi speaks Paseo's core WebSocket protocol subset with the upstream message na
   directory, `all` removes it with `--force`. Not supported: checking out a pull request into a worktree, setup
   scripts (`paseo.json`), and the worktree fields of `checkout_status`.
 
-Anything else (terminals, plugins, voice, schedules, Hub) answers with
+- terminals: `create_terminal`, `list_terminals`, `subscribe_terminals` (live list), `subscribe_terminal` /
+  `unsubscribe_terminal`, `terminal_input` (input, resize), `kill_terminal`, `terminal.rename`, with upstream's
+  binary frames (`opcode, slot, payload`: output, input, resize, restore) on the direct socket and over the E2EE relay.
+  A terminal is a shell (`$SHELL`, else `/bin/sh`) on a PTY in a known project or workspace directory, with
+  `PASEO_*` removed from its environment. At most 4 run at once; each keeps the last 256 KiB of output, and a
+  client that reattaches (or reconnects) gets that back as a `restore` frame, so the terminals survive a dropped
+  connection. Killing, exiting or stopping the daemon kills the whole process group. There is no screen emulator:
+  the restore is the raw output, so a full-screen program may redraw oddly until its next repaint. Mouse events,
+  `capture_terminal`, `close_items` and activity/attention notices are not supported.
+
+Anything else (plugins, voice, schedules, Hub) answers with
 `rpc_error` / `unsupported`. The official app is expected to handle the core agent flow. Screens built
 on unsupported features will show errors.
 

@@ -1094,7 +1094,7 @@ mod tests {
 
     #[test]
     fn only_a_silent_error_free_first_result_is_held() {
-        let ends = |events: &[ProviderEvent]| events.iter().filter(|e| matches!(e, ProviderEvent::TurnCompleted { .. })).count();
+        let ends = |events: &[ProviderEvent]| events.iter().filter(|e| matches!(e, ProviderEvent::TurnCompleted { .. } | ProviderEvent::TurnFailed { .. })).count();
         let result = |extra: Value| {
             let mut r = json!({ "type": "result", "subtype": "success", "result": "", "usage": { "output_tokens": 0 } });
             for (k, v) in extra.as_object().unwrap() {

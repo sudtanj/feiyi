@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <title>feiyi</title>
+  <!-- Full-bleed ground and a mark inside the central 80% circle, so it also works as a maskable icon. -->
+  <rect width="512" height="512" fill="#181B1A"/>
+  <g fill="#E5553B">
+    <path d="M144 176H192V344L144 392Z"/>
+    <path d="M144 176H328L368 128L344 224H144Z"/>
+    <path d="M192 272H280L312 240L296 312H192Z"/>
+  </g>
+</svg>

@@ -52,6 +52,13 @@ jobs:
           path: upstream
           persist-credentials: false
 
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: web/logo.svg
+          sparse-checkout-cone-mode: false
+          path: self
+          persist-credentials: false
+
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -114,6 +121,23 @@ jobs:
           EXPO_PUBLIC_PAGES_BASE_PATH: ${{ steps.pages.outputs.base_path }}
           NODE_OPTIONS: --max-old-space-size=6144
         run: npm run build:web --workspace=@getpaseo/app
+
+      - name: Brand as feiyi
+        working-directory: upstream/packages/app/dist
+        run: |
+          sudo apt-get install -y -qq librsvg2-bin >/dev/null
+          logo="$GITHUB_WORKSPACE/self/web/logo.svg"
+          cp "$logo" logo.svg
+          for s in 192 512; do rsvg-convert -w $s -h $s "$logo" -o pwa-icon-$s.png; done
+          rsvg-convert -w 180 -h 180 "$logo" -o apple-touch-icon.png
+          grep -q 'rel="icon" href="[^"]*favicon.ico"' index.html || { echo "::error::favicon link changed upstream"; exit 1; }
+          sed -i 's|<link rel="icon" href="[^"]*favicon.ico" />|<link rel="icon" type="image/svg+xml" href="/logo.svg" />|' index.html
+          sed -i 's/Paseo/feiyi/g' index.html
+          sed -i -E 's/"(name|short_name)": "Paseo"/"\1": "feiyi"/' manifest.json
+          # The app's own copy (titles, welcome, notifications). Only the word on its own, so
+          # identifiers like PaseoClient stay; a leading / keeps the desktop download URLs.
+          find _expo/static/js -name '*.js' -exec sed -i -E 's#(^|[^A-Za-z0-9_$/])Paseo([^A-Za-z0-9_$]|$)#\1feiyi\2#g' {} +
+          echo "[*] Paseo left in the app: $(cat _expo/static/js/web/*.js | grep -oE '(^|[^A-Za-z0-9_$/])Paseo([^A-Za-z0-9_$]|$)' | wc -l) standalone"
 
       - name: Adapt the output for Pages
         working-directory: upstream/packages/app/dist
@@ -221,7 +245,7 @@ jobs:
           cp index.html 404.html
           touch .nojekyll
           {
-            echo "### Paseo web app ${UPSTREAM_REF}"
+            echo "### feiyi web app ${UPSTREAM_REF}"
             echo
             echo "| | size |"
             echo "|---|---|"
@@ -242,7 +266,7 @@ jobs:
           if [ -n "$BASE" ]; then mkdir -p "$root$(dirname "$BASE")"; ln -s "$dist" "$root$BASE"; else root="$dist"; fi
           python3 -m http.server 8080 --bind 127.0.0.1 --directory "$root" >/dev/null 2>&1 &
           sleep 1
-          paths="$BASE/ $BASE/sw.js $BASE/sw-register.js"; [ -f "$dist/mermaid-runtime.html" ] && paths="$paths $BASE/mermaid-runtime.html"
+          paths="$BASE/ $BASE/sw.js $BASE/sw-register.js $BASE/logo.svg $BASE/pwa-icon-512.png"; [ -f "$dist/mermaid-runtime.html" ] && paths="$paths $BASE/mermaid-runtime.html"
           for path in $paths; do
             code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:8080$path")
             [ "$code" = 200 ] || { echo "::error::$path answered $code"; exit 1; }

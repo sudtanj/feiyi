@@ -30,6 +30,7 @@ import { PluginCommandCenterActions } from "@/plugins/command-center/registratio
 import { AddProjectFlowHost } from "@/components/add-project-flow-host";
 import { WorktreeSetupCalloutSource } from "@/components/worktree-setup-callout-source";
 import { DownloadToast } from "@/components/download-toast";
+import { UpdateToast } from "@/components/update-toast";
 import { QuittingOverlay } from "@/components/quitting-overlay";
 import { KeyboardShortcutsDialog } from "@/components/keyboard-shortcuts-dialog";
 import { ChangelogHost } from "@/changelog";
@@ -595,6 +596,7 @@ function AppContainer({ children, chromeEnabled: chromeEnabledOverride }: AppCon
       {isCompactLayout ? themedSidebarChrome : null}
       <AppearanceStyleBoundary>
         <DownloadToast />
+        <UpdateToast />
         <RosettaCalloutSource />
         <UpdateCalloutSource />
         <LegacyAgentSkillsMigration />

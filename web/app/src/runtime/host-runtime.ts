@@ -30,6 +30,7 @@ import {
 } from "@/utils/daemon-endpoints";
 import { resolveAppVersion } from "@/utils/app-version";
 import { ConnectionOfferSchema, type ConnectionOffer } from "@getpaseo/protocol/connection-offer";
+import { connectionLogger, flushConnectionLog, logConnection } from "./connection-log";
 import { HostConfirmations, type HostConfirmationRequest } from "./host-confirmation";
 import { shouldUseDesktopDaemon } from "@/desktop/daemon/desktop-daemon";
 import { isWeb } from "@/constants/platform";
@@ -232,6 +233,26 @@ const PROBE_INACTIVE_WHILE_ONLINE_MS = 120_000;
 const ADAPTIVE_SWITCH_THRESHOLD_MS = 40;
 const ADAPTIVE_SWITCH_CONSECUTIVE_PROBES = 3;
 const CONFIGURED_OVERRIDE_BOOTSTRAP_RETRY_MS = 1_000;
+// A healthy relay reconnect takes a few seconds; the client's own connect timeout is 15 s.
+const FOREGROUND_NEW_CLIENT_AFTER_MS = 8_000;
+const FOREGROUND_RELOAD_AFTER_MS = 20_000;
+const FOREGROUND_RELOAD_KEY = "feiyi.foregroundReloadAt";
+const FOREGROUND_RELOAD_MIN_GAP_MS = 5 * 60_000;
+
+// Web only, online only (an offline reload shows the browser's error page), and at most
+// once per few minutes so a host that is really down cannot cause a reload loop.
+function reloadStuckPage(): void {
+  if (typeof window === "undefined" || typeof window.location?.reload !== "function") return;
+  if (typeof navigator !== "undefined" && navigator.onLine === false) return;
+  try {
+    const last = Number(window.sessionStorage.getItem(FOREGROUND_RELOAD_KEY) ?? 0);
+    if (Date.now() - last < FOREGROUND_RELOAD_MIN_GAP_MS) return;
+    window.sessionStorage.setItem(FOREGROUND_RELOAD_KEY, String(Date.now()));
+  } catch {
+    return;
+  }
+  window.location.reload();
+}
 
 function toActiveConnection(connection: HostConnection): ActiveConnection {
   if (connection.type === "directSocket") {
@@ -539,6 +560,7 @@ function createDefaultDeps(): HostRuntimeControllerDeps {
       const webSocketConfig = { webSocketFactory: createAppWebSocketFactory() };
       const base = {
         suppressSendErrors: true,
+        logger: connectionLogger,
         clientId,
         clientType: "mobile",
         appVersion: resolveAppVersion() ?? undefined,
@@ -772,6 +794,12 @@ export class HostRuntimeController {
 
   ensureConnected(options?: { verify?: boolean }): void {
     this.activeClient?.ensureConnected(options);
+  }
+
+  /** Replaces the active client with a new one, as a cold start would. */
+  reconnectWithNewClient(): void {
+    const connectionId = this.snapshot.activeConnectionId;
+    if (connectionId) void this.switchToConnection({ connectionId });
   }
 
   markAgentDirectorySyncLoading(): void {
@@ -1326,6 +1354,7 @@ export class HostRuntimeController {
 
     const failConnection = async (error: unknown) => {
       if (!this.isCurrentSwitchRequest(requestVersion) || this.activeClient !== client) return;
+      logConnection("connect failed", { error: toErrorMessage(error) });
       const authFailure = getConnectionAuthFailureReason(error);
       if (authFailure) this.authRejectedConnectionIds.add(connection.id);
       this.unsubscribeClientStatus?.();
@@ -1372,6 +1401,7 @@ export class HostRuntimeController {
           void failConnection(new DaemonAuthenticationError(client.authFailureReason));
           return;
         }
+        logConnection(`client state ${state.status}`, { lastError: client.lastError });
         this.applyConnectionEvent({ type: "client_state", state, lastError: client.lastError });
         this.updateSnapshot({
           ...toSnapshotConnectionPatch(this.connectionMachineState, this.connectionEpoch),
@@ -1379,6 +1409,7 @@ export class HostRuntimeController {
           client,
           authFailureReason: null,
         });
+        if (state.status === "connected") flushConnectionLog(client);
       });
     } catch (error) {
       await failConnection(error);
@@ -2558,7 +2589,14 @@ export class HostRuntimeStore {
     }
   }
 
+  private foregroundWatchdog: ReturnType<typeof setTimeout> | null = null;
+
   setAppVisible(visible: boolean): void {
+    logConnection(visible ? "foreground" : "background", { statuses: this.connectionStatuses() });
+    if (this.foregroundWatchdog) {
+      clearTimeout(this.foregroundWatchdog);
+      this.foregroundWatchdog = null;
+    }
     // Keep normal reconnect backoff running while hidden, for as long as the OS
     // lets us execute. Foregrounding bypasses that backoff without closing healthy sockets.
     if (!visible) {
@@ -2567,6 +2605,38 @@ export class HostRuntimeStore {
     }
 
     this.ensureConnectedAll({ verify: true });
+    this.watchForegroundReconnect("new_client");
+  }
+
+  // An Android PWA can resume with a client that never reconnects; only killing the
+  // app recovered it. Do the same in steps: a new client, then a page reload.
+  private connectionStatuses(): string[] {
+    return [...this.controllers.values()].map((controller) => controller.getSnapshot().connectionStatus);
+  }
+
+  private watchForegroundReconnect(step: "new_client" | "reload"): void {
+    this.foregroundWatchdog = setTimeout(
+      () => {
+        this.foregroundWatchdog = null;
+        const stuck = [...this.controllers.values()].filter((controller) => {
+          const snapshot = controller.getSnapshot();
+          return (
+            snapshot.activeConnectionId !== null &&
+            snapshot.connectionStatus !== "online" &&
+            !snapshot.authFailureReason
+          );
+        });
+        if (stuck.length === 0) return;
+        logConnection(`watchdog ${step}`, { statuses: this.connectionStatuses() });
+        if (step === "new_client") {
+          for (const controller of stuck) controller.reconnectWithNewClient();
+          this.watchForegroundReconnect("reload");
+          return;
+        }
+        reloadStuckPage();
+      },
+      step === "new_client" ? FOREGROUND_NEW_CLIENT_AFTER_MS : FOREGROUND_RELOAD_AFTER_MS,
+    );
   }
 
   runProbeCycleNow(serverId?: string): Promise<void> {

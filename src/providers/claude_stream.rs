@@ -444,7 +444,15 @@ impl StreamState {
                 self.timeline(card);
                 if self.background.len() < MAX_BACKGROUND {
                     if let Some(agent) = background_agent_id(&name, &input, &output) {
-                        self.background_agents.insert(agent, id.clone());
+                        // A resumed agent had stopped: its earlier call stops
+                        // counting even if its report was never matched.
+                        if let Some(old) = self.background_agents.insert(agent, id.clone()) {
+                            self.admitted.remove(&old);
+                            self.sub_logs.remove(&old);
+                            if let Some((old_name, old_input)) = self.background.remove(&old) {
+                                self.timeline(tools::tool_call(&old, &old_name, tools::claude_detail(&old_name, &old_input, None), "completed", None));
+                            }
+                        }
                     }
                     self.background.insert(id, (name, input));
                     self.note_background();
@@ -1198,5 +1206,29 @@ mod tests {
         // Under pressure no new sub-agent starts, whatever is running.
         st.sub_cap.store(0, Ordering::Relaxed);
         assert!(denied(&gate(&mut st, "t4")));
+    }
+
+    #[test]
+    fn resuming_an_agent_frees_its_unreported_launch() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let (stdin, mut out) = mpsc::unbounded_channel();
+        let mut st = StreamState::new("a1".into(), tx, stdin, Arc::new(AtomicBool::new(false)), Some("s1".into()));
+        st.sub_cap.store(1, Ordering::Relaxed);
+        let mut denied = |st: &mut StreamState, id: &str| {
+            let hook = json!({ "type": "control_request", "request_id": id, "request": { "subtype": "hook_callback", "callback_id": SUBAGENT_HOOK, "input": { "hook_event_name": "PreToolUse", "tool_name": "Agent" }, "tool_use_id": id } });
+            st.handle_line(&hook.to_string());
+            let resp: Value = serde_json::from_str(&out.try_recv().unwrap()).unwrap();
+            resp.pointer("/response/response/hookSpecificOutput/permissionDecision").is_some()
+        };
+        let call = |st: &mut StreamState, id: &str, name: &str, input: Value, output: &str| {
+            st.handle_line(&json!({ "type": "assistant", "message": { "content": [{ "type": "tool_use", "id": id, "name": name, "input": input }] } }).to_string());
+            st.handle_line(&json!({ "type": "user", "message": { "content": [{ "type": "tool_result", "tool_use_id": id, "content": output }] } }).to_string());
+        };
+        assert!(!denied(&mut st, "t1"));
+        call(&mut st, "t1", "Agent", json!({ "run_in_background": true }), "Async agent launched successfully.\nagentId: ag1");
+        assert!(denied(&mut st, "t2"));
+        // Its stop report was missed; resuming it shows it had stopped.
+        call(&mut st, "s1", "SendMessage", json!({ "to": "ag1" }), "{\"resumedAgentId\":\"ag1\"}");
+        assert!(!denied(&mut st, "t2"));
     }
 }

@@ -84,7 +84,25 @@ done
         ),
         marker = dir.join("limit-hit").display()
     );
+    // A cold resume: the process's first prompt is preceded by the empty,
+    // zero-token result of a stopped-notice turn (not echoed), then answered.
+    let resume = r#"#!/bin/sh
+first=1
+while IFS= read -r line; do
+  case "$line" in
+    *'"type":"user"'*)
+      if [ "$first" = 1 ]; then
+        first=0
+        printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"","usage":{"output_tokens":0}}'
+      fi
+      printf '%s\n' '{"type":"assistant","message":{"id":"m1","role":"assistant","content":[{"type":"text","text":"answered after the notice"}]}}'
+      printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"answered after the notice","usage":{"output_tokens":4}}'
+      ;;
+  esac
+done
+"#;
     let body = match mode {
+        "resume" => resume.to_string(),
         "hang" => hanging.to_string(),
         "tool" => tool.to_string(),
         "stream" => stream,
@@ -704,6 +722,44 @@ async fn usage_limit_waits_and_continues() {
     .await;
     assert!(noted, "the wait was not announced");
     assert!(d.dir.join("limit-hit").exists());
+}
+
+#[tokio::test]
+async fn a_cold_resume_notice_result_does_not_end_the_prompts_turn() {
+    let d = start_at(unique_dir("resume"), None, "resume");
+    let cwd = d.dir.join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let mut ws = connect(d.port).await;
+    hello(&mut ws, None).await;
+    send(
+        &mut ws,
+        session(json!({ "type": "create_agent_request", "requestId": "r1", "config": { "provider": "claude", "cwd": cwd.to_string_lossy(), "modeId": "bypassPermissions" }, "initialPrompt": "continue" })),
+    )
+    .await;
+    let agent_id = recv_until(&mut ws, |v| {
+        let p = &v["message"]["payload"];
+        (v["message"]["type"] == "status" && p["status"] == "agent_created").then(|| p["agentId"].as_str().unwrap().to_string())
+    })
+    .await;
+    // The empty result must not end the turn: the answer arrives before turn_completed.
+    let mut seen = Vec::new();
+    recv_until(&mut ws, |v| {
+        let ev = &v["message"]["payload"]["event"];
+        if v["message"]["type"] != "agent_stream" {
+            return None;
+        }
+        assert_ne!(ev["type"], "turn_failed", "{ev}");
+        if ev["type"] == "timeline" {
+            seen.push(ev["item"].clone());
+        }
+        (ev["type"] == "turn_completed").then_some(())
+    })
+    .await;
+    assert!(seen.iter().any(|i| i["type"] == "assistant_message" && i["text"].as_str().unwrap_or("").contains("answered after the notice")), "turn ended before the answer: {seen:?}");
+    let tl = rpc(&mut ws, json!({ "type": "fetch_agent_timeline_request", "requestId": "r2", "agentId": agent_id, "direction": "tail", "limit": 50 }), "fetch_agent_timeline_response").await;
+    let all = tl["entries"].as_array().unwrap().iter().map(|e| e["item"].to_string()).collect::<Vec<_>>().join("\n");
+    assert!(all.contains("answered after the notice"), "{all}");
+    assert!(!all.contains("Something went wrong") && !all.contains("no response"), "{all}");
 }
 
 /// Start a claude chat and wait for its first turn to finish.

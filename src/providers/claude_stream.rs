@@ -52,6 +52,9 @@ pub struct StreamState {
     /// "stopped before the previous session ended" notices this way), and
     /// that turn's result is not our prompt's.
     notification_ahead: bool,
+    /// This process has ended a turn or run one of its own. Before that, a
+    /// resume may run its notices ahead of our prompt without echoing them.
+    result_seen: bool,
     /// agent id -> tool_use_id of the background sub-agent, so a report that
     /// names only the agent (or one resumed with SendMessage) is matched.
     background_agents: HashMap<String, String>,
@@ -163,7 +166,7 @@ fn s(v: &Value, key: &str) -> Option<String> {
 
 impl StreamState {
     pub fn new(agent_id: String, events: EventTx, stdin: mpsc::UnboundedSender<String>, interrupted: Arc<AtomicBool>, session_id: Option<String>) -> Self {
-        StreamState { agent_id, events, stdin, interrupted, session_id, tools: HashMap::new(), streamed: HashSet::new(), current_message: None, context_tokens: None, limit_info: None, limit_refused: None, sub_limited: false, sub_logs: HashMap::new(), background: HashMap::new(), sub_active: Arc::default(), sub_cap: Arc::new(AtomicUsize::new(usize::MAX)), admitted: HashMap::new(), turn_open: Arc::default(), assistant_seen: false, notification_ahead: false, background_agents: HashMap::new() }
+        StreamState { agent_id, events, stdin, interrupted, session_id, tools: HashMap::new(), streamed: HashSet::new(), current_message: None, context_tokens: None, limit_info: None, limit_refused: None, sub_limited: false, sub_logs: HashMap::new(), background: HashMap::new(), sub_active: Arc::default(), sub_cap: Arc::new(AtomicUsize::new(usize::MAX)), admitted: HashMap::new(), turn_open: Arc::default(), assistant_seen: false, notification_ahead: false, result_seen: false, background_agents: HashMap::new() }
     }
 
     fn emit(&self, ev: ProviderEvent) {
@@ -173,8 +176,10 @@ impl StreamState {
     /// The CLI produces output while no turn is open on the daemon's side:
     /// it runs a turn of its own (background work reported back). Tell the
     /// manager once, before the output, so it opens the turn and records it.
-    fn ensure_turn(&self) {
+    fn ensure_turn(&mut self) {
         if !self.turn_open.swap(true, Ordering::SeqCst) {
+            // This turn's result is the CLI's own, not one ahead of our prompt.
+            self.result_seen = true;
             self.emit(ProviderEvent::BackgroundTurn { agent_id: self.agent_id.clone() });
         }
     }
@@ -200,6 +205,8 @@ impl StreamState {
                     item["preTokens"] = json!(pre);
                 }
                 self.timeline(item);
+                // A /compact is a real end of turn, even with no text.
+                self.assistant_seen = true;
             }
             "system" => {
                 if s(&msg, "subtype").as_deref() == Some("init") {
@@ -214,6 +221,7 @@ impl StreamState {
             "stream_event" if !is_sidechain => {
                 if !replay {
                     self.ensure_turn();
+                    self.assistant_seen = true;
                 }
                 self.handle_stream_event(msg.get("event").unwrap_or(&Value::Null));
             }
@@ -468,7 +476,11 @@ impl StreamState {
         let output_tokens = msg.pointer("/usage/output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
         let silent = msg.get("result").and_then(|v| v.as_str()).map_or(true, |r| r.trim().is_empty());
         let is_error = msg.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
-        if std::mem::take(&mut self.notification_ahead) && !answered && silent && !is_error && output_tokens == 0 && !self.interrupted.load(Ordering::SeqCst) {
+        // On a fresh (resumed) process the notice is not always echoed before
+        // its result, so the first empty result counts as one too: with zero
+        // output tokens and no error, the model never ran for our prompt.
+        let ahead = std::mem::take(&mut self.notification_ahead) || !std::mem::replace(&mut self.result_seen, true);
+        if ahead && !answered && silent && !is_error && output_tokens == 0 && !self.interrupted.load(Ordering::SeqCst) {
             crate::log!("claude {agent_id}: a background notice ran as a turn ahead of the prompt; waiting for the prompt's turn");
             return;
         }
@@ -1053,8 +1065,52 @@ mod tests {
         assert_eq!(ends(&run(&[notice.clone(), empty.clone()])), 0);
         assert_eq!(ends(&run(&[notice.clone(), empty.clone(), answer.clone(), done.clone()])), 1);
         // A turn the model answered ends as usual, notice or not.
-        assert_eq!(ends(&run(&[notice, answer, done])), 1);
-        assert_eq!(ends(&run(&[empty])), 1);
+        assert_eq!(ends(&run(&[notice, answer.clone(), done.clone()])), 1);
+        // A resumed process may run the notice without echoing it: its empty
+        // result, the first of the process, is skipped all the same.
+        assert_eq!(ends(&run(&[empty.clone(), answer.clone(), done.clone()])), 1);
+        // Once the process has ended a turn, an empty result ends the turn.
+        assert_eq!(ends(&run(&[answer, done, empty])), 2);
+    }
+
+    #[test]
+    fn a_turn_the_cli_opens_itself_ends_with_its_empty_result() {
+        let note = "<task-notification>\n<task-id>ag1</task-id>\n<status>stopped</status>\n<summary>Background agent didn't finish before the previous session ended</summary>\n</task-notification>";
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (stdin, _keep) = mpsc::unbounded_channel();
+        let mut st = StreamState::new("a1".into(), tx, stdin, Arc::new(AtomicBool::new(false)), Some("s1".into()));
+        assert!(!st.turn_open.load(Ordering::SeqCst));
+        st.handle_line(&json!({ "type": "user", "message": { "content": note } }).to_string());
+        assert!(st.turn_open.load(Ordering::SeqCst), "the echoed notice opens the CLI's own turn");
+        st.handle_line(&json!({ "type": "result", "subtype": "success", "result": "", "usage": { "output_tokens": 0 } }).to_string());
+        assert!(!st.turn_open.load(Ordering::SeqCst), "its empty result ends the turn, it is not held");
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+        assert!(events.iter().any(|e| matches!(e, ProviderEvent::BackgroundTurn { .. })));
+        assert_eq!(events.iter().filter(|e| matches!(e, ProviderEvent::TurnCompleted { .. })).count(), 1);
+    }
+
+    #[test]
+    fn only_a_silent_error_free_first_result_is_held() {
+        let ends = |events: &[ProviderEvent]| events.iter().filter(|e| matches!(e, ProviderEvent::TurnCompleted { .. })).count();
+        let result = |extra: Value| {
+            let mut r = json!({ "type": "result", "subtype": "success", "result": "", "usage": { "output_tokens": 0 } });
+            for (k, v) in extra.as_object().unwrap() {
+                r[k] = v.clone();
+            }
+            r
+        };
+        // An error, text or spent tokens are real ends of turn, even first.
+        assert_eq!(ends(&run(&[result(json!({ "is_error": true }))])), 1);
+        assert_eq!(ends(&run(&[result(json!({ "result": "Unknown command" }))])), 1);
+        assert_eq!(ends(&run(&[result(json!({ "usage": { "output_tokens": 5 } }))])), 1);
+        // Streamed output counts as an answer: stream events, then a silent result.
+        let delta = json!({ "type": "stream_event", "event": { "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": "x" } } });
+        assert_eq!(ends(&run(&[delta, result(json!({}))])), 1);
+        // Only the first empty result of a process is held.
+        assert_eq!(ends(&run(&[result(json!({})), result(json!({}))])), 1);
     }
 
     #[test]

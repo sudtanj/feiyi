@@ -1,0 +1,25 @@
+# One-off: draws 費禕 from OFL brush fonts as SVG paths for the logo. Deleted after use.
+name: logo-gen
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  gen:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          sudo apt-get install -y -qq librsvg2-bin >/dev/null
+          pip install -q fonttools
+          mkdir -p fonts out
+          for f in yujisyuku/YujiSyuku-Regular yujiboku/YujiBoku-Regular yujimai/YujiMai-Regular \
+                   mashanzheng/MaShanZheng-Regular zhimangxing/ZhiMangXing-Regular liujianmaocao/LiuJianMaoCao-Regular \
+                   longcang/LongCang-Regular lxgwwenkaitc/LXGWWenKaiTC-Bold kleeone/KleeOne-SemiBold; do
+            curl -fsSL -o "fonts/$(basename $f).ttf" "https://github.com/google/fonts/raw/main/ofl/$f.ttf" || echo "missing $f"
+          done
+          python3 .github/logo-gen/gen.py fonts out
+          cd out && for s in *.svg; do rsvg-convert -w 256 -h 256 "$s" -o "${s%.svg}-256.png"; rsvg-convert -w 32 -h 32 "$s" -o "${s%.svg}-32.png"; done; ls
+      - uses: actions/upload-artifact@v4
+        with:
+          name: logo
+          path: out

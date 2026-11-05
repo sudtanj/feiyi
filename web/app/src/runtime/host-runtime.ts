@@ -233,8 +233,8 @@ const PROBE_INACTIVE_WHILE_ONLINE_MS = 120_000;
 const ADAPTIVE_SWITCH_THRESHOLD_MS = 40;
 const ADAPTIVE_SWITCH_CONSECUTIVE_PROBES = 3;
 const CONFIGURED_OVERRIDE_BOOTSTRAP_RETRY_MS = 1_000;
-// A healthy relay reconnect takes a few seconds; the client's own connect timeout is 15 s.
-const FOREGROUND_NEW_CLIENT_AFTER_MS = 8_000;
+// After the client's own 15 s connect timeout, so a slow but live reconnect is never cut short.
+const FOREGROUND_NEW_CLIENT_AFTER_MS = 20_000;
 const FOREGROUND_RELOAD_AFTER_MS = 20_000;
 const FOREGROUND_RELOAD_KEY = "feiyi.foregroundReloadAt";
 const FOREGROUND_RELOAD_MIN_GAP_MS = 5 * 60_000;

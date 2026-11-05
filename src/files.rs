@@ -8,7 +8,7 @@
 //! - `file_download_token_request`, redeemed once within 60 s at
 //!   `GET /api/files/download?token=…` on the direct HTTP listener (see server.rs);
 //! - `fs.file.write.request`: revision-checked atomic save of a text file;
-//! - `fs.entry.create` / `fs.entry.rename` (`git mv` for tracked files) / `fs.entry.delete`.
+//! - `fs.entry.create` / `fs.entry.rename` (`git mv` for tracked files) / `fs.entry.duplicate` / `fs.entry.delete`.
 //!
 //! Every path is resolved against the request's `cwd` and has to stay inside
 //! it, both lexically (`..`, absolute paths) and after resolving symlinks.
@@ -46,6 +46,7 @@ pub fn handle(kind: &str, msg: &Value, rid: &str, out: &Out) -> bool {
         "fs.file.write.request" => "fs.file.write.response",
         "fs.entry.create.request" => "fs.entry.create.response",
         "fs.entry.rename.request" => "fs.entry.rename.response",
+        "fs.entry.duplicate.request" => "fs.entry.duplicate.response",
         "fs.entry.delete.request" => "fs.entry.delete.response",
         _ => return false,
     };
@@ -79,6 +80,10 @@ fn payload(kind: &str, msg: &Value, rid: &str) -> Value {
         "fs.entry.rename.request" => {
             let (renamed, success, error) = outcome(rename_entry(&cwd, &path, &s("name")));
             json!({ "cwd": cwd, "path": path, "renamedPath": renamed, "success": success, "error": error, "requestId": rid })
+        }
+        "fs.entry.duplicate.request" => {
+            let (duplicated, success, error) = outcome(duplicate_entry(&cwd, &path));
+            json!({ "cwd": cwd, "path": path, "duplicatedPath": duplicated, "success": success, "error": error, "requestId": rid })
         }
         _ => {
             let (_, success, error) = outcome(delete_entry(&cwd, &path));
@@ -477,6 +482,26 @@ fn matches_expected(meta: &std::fs::Metadata, expected_modified_at: &str, expect
     }
 }
 
+/// Upstream's `getExplorerFileVersion`, for `fs.file.subscribe`.
+pub fn file_version(cwd: &str, rel: &str) -> Value {
+    let failed = |cwd: &str, error: String| json!({ "status": "error", "cwd": cwd, "path": rel, "error": error });
+    let root = match root(cwd) {
+        Ok(r) => r,
+        Err(e) => return failed(cwd, e),
+    };
+    let expanded_cwd = root.lexical.to_string_lossy().into_owned();
+    let scoped = match scope(&root, rel) {
+        Ok(s) => s,
+        Err(e) => return failed(&expanded_cwd, e),
+    };
+    match std::fs::metadata(&scoped.real) {
+        Ok(meta) if meta.is_file() => version_ready(&expanded_cwd, &scoped.rel, &meta),
+        Ok(_) => failed(&expanded_cwd, "Requested path is not a file".into()),
+        Err(e) if e.kind() == ErrorKind::NotFound => json!({ "status": "missing", "cwd": expanded_cwd, "path": scoped.rel }),
+        Err(e) => failed(&expanded_cwd, e.to_string()),
+    }
+}
+
 /// Upstream's `writeExplorerFile`: `written`, `conflict` (with the file's
 /// current version) or `error`. Only existing UTF-8 text files up to 1 MiB.
 fn write_file(cwd: &str, rel: &str, content: &str, expected_modified_at: &str, expected_revision: Option<&str>) -> Value {
@@ -617,6 +642,67 @@ fn rename_entry(cwd: &str, rel: &str, name: &str) -> Result<String, String> {
         std::fs::rename(&source.requested, &target).map_err(gone)?;
     }
     Ok(renamed)
+}
+
+/// Node's `path.extname`: the last dot onwards, none for a leading dot.
+fn dot_extension(name: &str) -> &str {
+    match name.rfind('.') {
+        Some(i) if i > 0 => &name[i..],
+        _ => "",
+    }
+}
+
+/// "a.txt" -> "a copy.txt", "a copy 2.txt", ...; folders keep their whole name as the base.
+fn copy_name(name: &str, is_dir: bool, copy_number: u32) -> String {
+    let ext = if is_dir { "" } else { dot_extension(name) };
+    let base = &name[..name.len() - ext.len()];
+    if copy_number == 1 {
+        format!("{base} copy{ext}")
+    } else {
+        format!("{base} copy {copy_number}{ext}")
+    }
+}
+
+/// Copies a file, folder tree or symlink (kept as a link, not followed).
+fn copy_tree(from: &Path, to: &Path, meta: &std::fs::Metadata) -> std::io::Result<()> {
+    if meta.file_type().is_symlink() {
+        std::os::unix::fs::symlink(std::fs::read_link(from)?, to)
+    } else if meta.is_dir() {
+        std::fs::create_dir(to)?;
+        for entry in std::fs::read_dir(from)? {
+            let entry = entry?;
+            copy_tree(&entry.path(), &to.join(entry.file_name()), &entry.metadata()?)?;
+        }
+        std::fs::set_permissions(to, meta.permissions())
+    } else if meta.is_file() {
+        std::fs::copy(from, to).map(drop)
+    } else {
+        Err(std::io::Error::new(ErrorKind::InvalidInput, "Unsupported file type"))
+    }
+}
+
+fn duplicate_entry(cwd: &str, rel: &str) -> Result<String, String> {
+    let root = root(cwd)?;
+    let source = scope(&root, rel)?;
+    if source.real == root.canon {
+        return Err("Cannot duplicate the workspace root".into());
+    }
+    let meta = std::fs::symlink_metadata(&source.requested).map_err(gone)?;
+    let name = source.requested.file_name().and_then(|n| n.to_str()).ok_or("Invalid name")?;
+    let parent = source.requested.parent().unwrap_or(Path::new("/"));
+    let mut copy_number = 1;
+    let (copy, target) = loop {
+        let copy = copy_name(name, meta.is_dir(), copy_number);
+        let target = parent.join(&copy);
+        match std::fs::symlink_metadata(&target) {
+            Ok(_) => copy_number += 1,
+            Err(e) if e.kind() == ErrorKind::NotFound => break (copy, target),
+            Err(e) => return Err(e.to_string()),
+        }
+    };
+    copy_tree(&source.requested, &target, &meta).map_err(gone)?;
+    let parent_rel = Path::new(&source.rel).parent().map(|p| p.to_string_lossy().into_owned()).filter(|p| !p.is_empty()).unwrap_or_else(|| ".".into());
+    Ok(join_rel(&parent_rel, &copy))
 }
 
 fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
@@ -825,6 +911,49 @@ mod tests {
         assert!(!w.join("docs").exists());
         assert!(tmp.0.join("outside/secret.txt").is_file());
         assert_eq!(delete_entry(&ws, "docs").unwrap_err(), "File or folder no longer exists");
+    }
+
+    #[test]
+    fn copy_names_follow_upstream() {
+        assert_eq!(copy_name("a.txt", false, 1), "a copy.txt");
+        assert_eq!(copy_name("a.tar.gz", false, 2), "a.tar copy 2.gz");
+        assert_eq!(copy_name(".env", false, 1), ".env copy");
+        assert_eq!(copy_name("Makefile", false, 3), "Makefile copy 3");
+        assert_eq!(copy_name("v1.2", true, 1), "v1.2 copy");
+    }
+
+    #[test]
+    fn duplicate_copies_files_and_folders_inside_the_workspace() {
+        let (tmp, ws) = setup();
+        let w = tmp.0.join("ws");
+        std::fs::write(w.join("src/a.txt"), "one").unwrap();
+        assert_eq!(duplicate_entry(&ws, "src/a.txt").unwrap(), "src/a copy.txt");
+        assert_eq!(duplicate_entry(&ws, "src/a.txt").unwrap(), "src/a copy 2.txt");
+        assert_eq!(std::fs::read_to_string(w.join("src/a copy 2.txt")).unwrap(), "one");
+
+        std::fs::create_dir_all(w.join("src/sub")).unwrap();
+        std::fs::write(w.join("src/sub/b.txt"), "two").unwrap();
+        symlink("b.txt", w.join("src/sub/link")).unwrap();
+        assert_eq!(duplicate_entry(&ws, "src").unwrap(), "src copy");
+        assert_eq!(std::fs::read_to_string(w.join("src copy/sub/b.txt")).unwrap(), "two");
+        assert_eq!(std::fs::read_link(w.join("src copy/sub/link")).unwrap(), Path::new("b.txt"));
+
+        assert_eq!(duplicate_entry(&ws, ".").unwrap_err(), "Cannot duplicate the workspace root");
+        assert_eq!(duplicate_entry(&ws, "../outside/secret.txt").unwrap_err(), OUTSIDE);
+        symlink(tmp.0.join("outside"), w.join("out")).unwrap();
+        assert_eq!(duplicate_entry(&ws, "out/secret.txt").unwrap_err(), OUTSIDE);
+        assert_eq!(duplicate_entry(&ws, "nope").unwrap_err(), "File or folder no longer exists");
+    }
+
+    #[test]
+    fn file_version_reports_ready_missing_and_errors() {
+        let (tmp, ws) = setup();
+        std::fs::write(tmp.0.join("ws/a.txt"), "one").unwrap();
+        let v = file_version(&ws, "a.txt");
+        assert_eq!((v["status"].as_str(), v["size"].as_u64(), v["path"].as_str()), (Some("ready"), Some(3), Some("a.txt")));
+        assert_eq!(file_version(&ws, "gone.txt")["status"], "missing");
+        assert_eq!(file_version(&ws, "src")["error"], "Requested path is not a file");
+        assert_eq!(file_version(&ws, "../outside/secret.txt")["error"], OUTSIDE);
     }
 
     #[test]

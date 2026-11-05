@@ -307,6 +307,39 @@ async fn unsupported_requests_get_an_rpc_error() {
 }
 
 #[tokio::test]
+async fn file_subscription_pushes_updates_and_entries_duplicate() {
+    let d = start("filesub", None);
+    let cwd = d.dir.join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::write(cwd.join("a.txt"), "one").unwrap();
+    let cwd = cwd.to_string_lossy().into_owned();
+    let mut ws = connect(d.port).await;
+    let info = hello(&mut ws, None).await;
+    assert_eq!(info["message"]["payload"]["features"]["fsEntryDuplicate"], true);
+
+    let sub = rpc(&mut ws, json!({ "type": "fs.file.subscribe.request", "requestId": "s1", "cwd": cwd, "path": "a.txt", "subscriptionId": "sub1" }), "fs.file.subscribe.response").await;
+    assert_eq!(sub["subscriptionId"], "sub1");
+    assert_eq!(sub["initial"]["status"], "ready");
+    assert_eq!(sub["initial"]["size"], 3);
+
+    std::fs::write(cwd.clone() + "/a.txt", "changed").unwrap();
+    let update = recv_until(&mut ws, |v| (v["message"]["type"] == "fs.file.update").then(|| v["message"]["payload"].clone())).await;
+    assert_eq!(update["subscriptionId"], "sub1");
+    assert_eq!(update["version"]["size"], 7);
+
+    let un = rpc(&mut ws, json!({ "type": "fs.file.unsubscribe.request", "requestId": "s2", "subscriptionId": "sub1" }), "fs.file.unsubscribe.response").await;
+    assert_eq!(un["subscriptionId"], "sub1");
+
+    let dup = rpc(&mut ws, json!({ "type": "fs.entry.duplicate.request", "requestId": "d1", "cwd": cwd, "path": "a.txt" }), "fs.entry.duplicate.response").await;
+    assert_eq!(dup["success"], true, "{dup}");
+    assert_eq!(dup["duplicatedPath"], "a copy.txt");
+    assert_eq!(std::fs::read_to_string(cwd.clone() + "/a copy.txt").unwrap(), "changed");
+    let outside = rpc(&mut ws, json!({ "type": "fs.entry.duplicate.request", "requestId": "d2", "cwd": cwd, "path": "../x" }), "fs.entry.duplicate.response").await;
+    assert_eq!(outside["success"], false);
+    assert!(outside["duplicatedPath"].is_null());
+}
+
+#[tokio::test]
 async fn daemon_config_custom_models_round_trip() {
     let d = start("config", None);
     let mut ws = connect(d.port).await;

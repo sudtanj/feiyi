@@ -60,6 +60,7 @@ fn server_info(ctx: &Ctx) -> Arc<str> {
                 "providerRemoval": true,
                 "checkoutRefresh": true,
                 "checkoutDiscardChanges": true,
+                "fsEntryDuplicate": true,
                 "commitsList": true,
                 "commitBaseClassification": true,
                 "usageSources": true,
@@ -115,6 +116,7 @@ pub async fn run(ctx: Arc<Ctx>, mut inbound: mpsc::Receiver<Inbound>, outbound: 
     let mut events = ctx.bcast.subscribe();
     let (reply_tx, mut reply_rx) = mpsc::unbounded_channel::<Arc<str>>();
     let mut uploads = crate::uploads::Uploads::default();
+    let mut watches = crate::filewatch::Watches::default();
     loop {
         tokio::select! {
             frame = inbound.recv() => {
@@ -144,6 +146,9 @@ pub async fn run(ctx: Arc<Ctx>, mut inbound: mpsc::Receiver<Inbound>, outbound: 
                             if let Some(resp) = uploads.begin(&ctx.home, &inner) {
                                 if outbound.send(crate::manager::wrap(resp)).await.is_err() { return; }
                             }
+                            continue;
+                        }
+                        if watches.handle(inner.get("type").and_then(|t| t.as_str()).unwrap_or(""), &inner, &reply_tx) {
                             continue;
                         }
                         if ctx.cmds.send(Cmd::Rpc { msg: inner, out: reply_tx.clone() }).is_err() { return; }

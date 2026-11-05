@@ -116,11 +116,12 @@ feiyi speaks Paseo's core WebSocket protocol subset with the upstream message na
   `GET /api/files/download?token=…` on the direct listener (single-use, 60 s; over the relay the app reads the
   file instead), `fs.file.write.request` (saves a text file of up to 1 MiB atomically, with a conflict check against
   the version the app loaded), and `fs.entry.create` / `fs.entry.rename` (`git mv` for tracked files) /
-  `fs.entry.delete`. Every path must stay inside the request's `cwd`, including through symlinks.
-  Live file updates (`fs.file.subscribe`) and `fs.entry.duplicate` are not supported; the file pane then
-  reloads the file when you open it instead of updating live.
+  `fs.entry.duplicate` ("name copy.ext", "name copy 2.ext"; files and folders) / `fs.entry.delete`.
+  Every path must stay inside the request's `cwd`, including through symlinks.
+  `fs.file.subscribe` / `fs.file.unsubscribe` push `fs.file.update` when an open file changes on disk. feiyi
+  polls the file once a second while it is subscribed (up to 32 per connection) and stops on unsubscribe or disconnect.
 
-Anything else (live file updates, duplicating files, terminals, plugins, voice, schedules, Hub, worktrees) answers with
+Anything else (terminals, plugins, voice, schedules, Hub, worktrees) answers with
 `rpc_error` / `unsupported`. The official app is expected to handle the core agent flow. Screens built
 on unsupported features will show errors.
 

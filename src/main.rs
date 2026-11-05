@@ -7,6 +7,7 @@ mod daemon_config;
 mod e2ee;
 mod egress;
 mod files;
+mod filewatch;
 mod git_actions;
 mod guard;
 mod limits;

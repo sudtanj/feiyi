@@ -77,6 +77,8 @@ pub enum Cmd {
     RevokePushTokens(Vec<String>),
     /// A tool of the built-in debug MCP server that reads manager state (mcp_server.rs).
     Debug { tool: String, args: Value, reply: oneshot::Sender<Result<Value, String>> },
+    /// Where a new terminal may start: its canonical directory and workspace (terminal.rs).
+    TerminalTarget { cwd: String, workspace_id: Option<String>, reply: oneshot::Sender<Result<(String, Option<String>), String>> },
 }
 
 /// What a connected client last reported via `client_heartbeat`.
@@ -266,6 +268,9 @@ impl Manager {
                     }
                     Cmd::Debug { tool, args, reply } => {
                         let _ = reply.send(self.debug_tool(&tool, &args));
+                    }
+                    Cmd::TerminalTarget { cwd, workspace_id, reply } => {
+                        let _ = reply.send(self.terminal_target(&cwd, workspace_id.as_deref()));
                     }
                     Cmd::RevokePushTokens(tokens) => {
                         for t in tokens {

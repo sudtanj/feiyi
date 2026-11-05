@@ -25,6 +25,7 @@ mod server;
 mod session;
 mod snapshot;
 mod store;
+mod terminal;
 mod token_saver;
 mod uploads;
 mod usage;
@@ -157,6 +158,7 @@ async fn run(cfg: Config, identity: Arc<e2ee::DaemonIdentity>) {
     shutdown_signal().await;
     crate::log!("shutting down");
     server.abort();
+    terminal::kill_all();
     let _ = stop_tx.send(());
     let _ = manager_task.await;
 }

@@ -124,6 +124,10 @@ impl Channel {
             .map_err(|_| "Decryption failed".to_string())
     }
 
+    pub fn encrypt_base64(&self, plaintext: &[u8]) -> String {
+        STANDARD.encode(self.encrypt(plaintext))
+    }
+
     /// Text plaintext travels as base64 ciphertext in a text frame.
     pub fn encrypt_text(&self, text: &str) -> String {
         STANDARD.encode(self.encrypt(text.as_bytes()))

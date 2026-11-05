@@ -301,7 +301,7 @@ async fn unsupported_requests_get_an_rpc_error() {
     let d = start("rpcerr", None);
     let mut ws = connect(d.port).await;
     hello(&mut ws, None).await;
-    send(&mut ws, session(json!({ "type": "create_terminal_request", "requestId": "r1" }))).await;
+    send(&mut ws, session(json!({ "type": "voice_not_in_feiyi_request", "requestId": "r1" }))).await;
     let err = recv_until(&mut ws, |v| (v["message"]["type"] == "rpc_error").then(|| v["message"]["payload"].clone())).await;
     assert_eq!(err["requestId"], "r1");
 }
@@ -937,4 +937,97 @@ async fn codex_gets_the_shell_environment_exclude() {
     }
     let args = std::fs::read_to_string(&file).expect("codex was started");
     assert!(args.lines().any(|l| l.starts_with("shell_environment_policy.exclude=") && l.contains("PASEO_*") && l.contains("*API_KEY*")), "{args}");
+}
+
+/// Next frame of either kind: JSON text or a binary terminal frame.
+async fn recv_frame(ws: &mut Ws) -> Message {
+    loop {
+        match tokio::time::timeout(Duration::from_secs(20), ws.next()).await.expect("timed out waiting for a frame") {
+            Some(Ok(m @ (Message::Text(_) | Message::Binary(_)))) => return m,
+            Some(Ok(_)) => continue,
+            other => panic!("socket closed: {other:?}"),
+        }
+    }
+}
+
+/// Collect terminal output/restore frames for `slot` until they contain `needle`.
+async fn terminal_output_until(ws: &mut Ws, slot: u8, needle: &str) {
+    let mut seen = Vec::new();
+    loop {
+        if let Message::Binary(b) = recv_frame(ws).await {
+            if b.len() >= 2 && (b[0] == 0x01 || b[0] == 0x05) && b[1] == slot {
+                seen.extend_from_slice(&b[2..]);
+            }
+        }
+        if String::from_utf8_lossy(&seen).contains(needle) {
+            return;
+        }
+    }
+}
+
+async fn terminal_payload(ws: &mut Ws, kind: &str) -> Value {
+    loop {
+        if let Message::Text(t) = recv_frame(ws).await {
+            let v: Value = serde_json::from_str(&t).unwrap();
+            if v["message"]["type"] == kind {
+                return v["message"]["payload"].clone();
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn terminal_runs_a_shell_streams_output_and_reattaches() {
+    let d = start_with(unique_dir("term"), None, "ok", &[("SHELL", "/bin/sh")]);
+    let proj = d.dir.join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let cwd = proj.to_string_lossy().into_owned();
+    let mut ws = connect(d.port).await;
+    hello(&mut ws, None).await;
+    send(&mut ws, session(json!({ "type": "project.add.request", "requestId": "p1", "cwd": cwd }))).await;
+    recv_until(&mut ws, |v| (v["message"]["type"] == "project.add.response").then_some(())).await;
+
+    // Outside every project: refused.
+    send(&mut ws, session(json!({ "type": "create_terminal_request", "requestId": "t0", "cwd": "/" }))).await;
+    let refused = terminal_payload(&mut ws, "create_terminal_response").await;
+    assert!(refused["terminal"].is_null() && refused["error"].is_string(), "{refused}");
+
+    send(&mut ws, session(json!({ "type": "create_terminal_request", "requestId": "t1", "cwd": cwd }))).await;
+    let created = terminal_payload(&mut ws, "create_terminal_response").await;
+    assert!(created["error"].is_null(), "{created}");
+    let id = created["terminal"]["id"].as_str().unwrap().to_string();
+
+    send(&mut ws, session(json!({ "type": "list_terminals_request", "requestId": "l1", "cwd": cwd }))).await;
+    let listed = terminal_payload(&mut ws, "list_terminals_response").await;
+    assert_eq!(listed["terminals"][0]["id"], id.as_str());
+
+    send(&mut ws, session(json!({ "type": "subscribe_terminal_request", "requestId": "s1", "terminalId": id, "restore": { "mode": "visible-snapshot" } }))).await;
+    let sub = terminal_payload(&mut ws, "subscribe_terminal_response").await;
+    assert!(sub["error"].is_null(), "{sub}");
+    let slot = sub["slot"].as_u64().unwrap() as u8;
+
+    // The command's own echo says `20+1`; only the shell's answer says `21`.
+    send(&mut ws, session(json!({ "type": "terminal_input", "terminalId": id, "message": { "type": "input", "data": "echo hi-$((20+1))\n" } }))).await;
+    terminal_output_until(&mut ws, slot, "hi-21").await;
+
+    // The terminal outlives the connection: a new one gets the scrollback back.
+    drop(ws);
+    let mut ws2 = connect(d.port).await;
+    hello(&mut ws2, None).await;
+    send(&mut ws2, session(json!({ "type": "subscribe_terminal_request", "requestId": "s2", "terminalId": id, "restore": { "mode": "visible-snapshot" } }))).await;
+    let sub = terminal_payload(&mut ws2, "subscribe_terminal_response").await;
+    let slot = sub["slot"].as_u64().unwrap() as u8;
+    terminal_output_until(&mut ws2, slot, "hi-21").await;
+
+    // Binary input frame: opcode 0x02, slot, bytes.
+    let mut frame = vec![0x02, slot];
+    frame.extend_from_slice(b"exit\n");
+    ws2.send(Message::Binary(frame)).await.unwrap();
+    let exit = terminal_payload(&mut ws2, "terminal_stream_exit").await;
+    assert_eq!(exit["terminalId"], id.as_str());
+    assert_eq!(exit["subscriptionId"], sub["subscriptionId"]);
+
+    send(&mut ws2, session(json!({ "type": "list_terminals_request", "requestId": "l2", "cwd": cwd }))).await;
+    let listed = terminal_payload(&mut ws2, "list_terminals_response").await;
+    assert!(listed["terminals"].as_array().unwrap().is_empty(), "{listed}");
 }

@@ -120,7 +120,17 @@ feiyi speaks Paseo's core WebSocket protocol subset with the upstream message na
   Live file updates (`fs.file.subscribe`) and `fs.entry.duplicate` are not supported; the file pane then
   reloads the file when you open it instead of updating live.
 
-Anything else (live file updates, duplicating files, terminals, plugins, voice, schedules, Hub, worktrees) answers with
+- terminals: `create_terminal`, `list_terminals`, `subscribe_terminals` (live list), `subscribe_terminal` /
+  `unsubscribe_terminal`, `terminal_input` (input, resize), `kill_terminal`, `terminal.rename`, with upstream's
+  binary frames (`opcode, slot, payload`: output, input, resize, restore) on the direct socket and over the E2EE relay.
+  A terminal is a shell (`$SHELL`, else `/bin/sh`) on a PTY in a known project or workspace directory, with
+  `PASEO_*` removed from its environment. At most 4 run at once; each keeps the last 256 KiB of output, and a
+  client that reattaches (or reconnects) gets that back as a `restore` frame, so the terminals survive a dropped
+  connection. Killing, exiting or stopping the daemon kills the whole process group. There is no screen emulator:
+  the restore is the raw output, so a full-screen program may redraw oddly until its next repaint. Mouse events,
+  `capture_terminal`, `close_items` and activity/attention notices are not supported.
+
+Anything else (live file updates, duplicating files, plugins, voice, schedules, Hub, worktrees) answers with
 `rpc_error` / `unsupported`. The official app is expected to handle the core agent flow. Screens built
 on unsupported features will show errors.
 

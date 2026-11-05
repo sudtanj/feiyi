@@ -157,7 +157,7 @@ async fn handle_socket(ctx: Arc<Ctx>, socket: WebSocket) {
     use std::time::{Duration, Instant};
     let (mut sink, mut stream) = socket.split();
     let (in_tx, in_rx) = tokio::sync::mpsc::channel::<session::Inbound>(64);
-    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Arc<str>>(256);
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<session::Outbound>(256);
     let session = tokio::spawn(session::run(ctx, in_rx, out_tx, false));
     // Phones drop off the network without closing the socket: ping, and give up
     // on a connection that neither answers nor writes, so a stale one never
@@ -169,7 +169,11 @@ async fn handle_socket(ctx: Arc<Ctx>, socket: WebSocket) {
         tokio::select! {
             out = out_rx.recv() => {
                 let Some(out) = out else { break };
-                match tokio::time::timeout(Duration::from_secs(20), sink.send(Message::Text(out.to_string()))).await {
+                let message = match out {
+                    session::Outbound::Text(text) => Message::Text(text.to_string()),
+                    session::Outbound::Binary(bytes) => Message::Binary(bytes),
+                };
+                match tokio::time::timeout(Duration::from_secs(20), sink.send(message)).await {
                     Ok(Ok(())) => {}
                     _ => break,
                 }
@@ -186,8 +190,8 @@ async fn handle_socket(ctx: Arc<Ctx>, socket: WebSocket) {
                 last_seen = Instant::now();
                 let inbound = match frame {
                     Some(Ok(Message::Text(t))) => session::Inbound::Text(t),
-                    // File-transfer frames (uploads) stay binary; other binary must be UTF-8 JSON.
-                    Some(Ok(Message::Binary(b))) if crate::uploads::is_file_frame(&b) => session::Inbound::Binary(b),
+                    // File-transfer and terminal frames stay binary; other binary must be UTF-8 JSON.
+                    Some(Ok(Message::Binary(b))) if session::is_binary_frame(&b) => session::Inbound::Binary(b),
                     Some(Ok(Message::Binary(b))) => match String::from_utf8(b) {
                         Ok(t) => session::Inbound::Text(t),
                         Err(_) => continue,

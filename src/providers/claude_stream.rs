@@ -208,6 +208,20 @@ impl StreamState {
                 // A /compact is a real end of turn, even with no text.
                 self.assistant_seen = true;
             }
+            // stream-json reports finished background work here; the matching
+            // `<task-notification>` user message is not echoed. The CLI's own
+            // turn on it opens the turn when its output starts.
+            "system" if s(&msg, "subtype").as_deref() == Some("task_notification") => {
+                let field = |key: &str| s(&msg, key).unwrap_or_default();
+                let note = format!(
+                    "<task-notification><task-id>{}</task-id><tool-use-id>{}</tool-use-id><status>{}</status><summary>{}</summary></task-notification>",
+                    field("task_id"),
+                    field("tool_use_id"),
+                    field("status"),
+                    field("summary")
+                );
+                self.finish_background(&Value::String(note), false);
+            }
             "system" => {
                 if s(&msg, "subtype").as_deref() == Some("init") {
                     if let Some(sid) = s(&msg, "session_id") {
@@ -376,12 +390,14 @@ impl StreamState {
     /// Background work that reported back (`<task-notification>`): its cards
     /// get the final result. The CLI then runs a turn of its own on
     /// them, which the manager is told to open (once, if not already).
-    fn finish_background(&mut self, content: &Value) {
+    fn finish_background(&mut self, content: &Value, open_turn: bool) {
         let text = content_text(content);
         if !text.contains("<task-notification>") {
             return;
         }
-        self.ensure_turn();
+        if open_turn {
+            self.ensure_turn();
+        }
         for note in text.split("<task-notification>").skip(1) {
             // Reports name the launching call, or (a sub-agent resumed with
             // SendMessage) only the agent: match either.
@@ -426,7 +442,7 @@ impl StreamState {
         if let Some(summary) = failed_task_summary(content) {
             self.sub_limited |= super::is_usage_limit(&summary);
         }
-        self.finish_background(content);
+        self.finish_background(content, true);
         let Some(blocks) = msg.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_array()) else { return };
         for block in blocks {
             if !block.get("type").and_then(|t| t.as_str()).map(|t| t.ends_with("tool_result")).unwrap_or(false) {
@@ -1203,6 +1219,11 @@ mod tests {
         let note = "<task-notification>\n<tool-use-id>t1</tool-use-id>\n<status>completed</status>\n<result>Done.</result>\n</task-notification>";
         st.handle_line(&json!({ "type": "user", "message": { "content": note } }).to_string());
         assert!(!denied(&gate(&mut st, "t3")));
+        launch(&mut st, "t3");
+        assert!(denied(&gate(&mut st, "t4")));
+        // stream-json reports it as a system message instead.
+        st.handle_line(&json!({ "type": "system", "subtype": "task_notification", "task_id": "ag2", "tool_use_id": "t2", "status": "completed", "summary": "Agent \"Part\" finished" }).to_string());
+        assert!(!denied(&gate(&mut st, "t4")));
         // Under pressure no new sub-agent starts, whatever is running.
         st.sub_cap.store(0, Ordering::Relaxed);
         assert!(denied(&gate(&mut st, "t4")));

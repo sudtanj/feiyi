@@ -831,9 +831,9 @@ describe("appearance settings", () => {
     expect(defaultUiBaseFontSize(false)).toBe(14);
   });
 
-  it("uses a 16px content default on mobile and a 15px default on web", () => {
+  it("uses a 16px content default on mobile and on web", () => {
     expect(defaultContentFontSize(true)).toBe(16);
-    expect(defaultContentFontSize(false)).toBe(15);
+    expect(defaultContentFontSize(false)).toBe(16);
     expect(DEFAULT_CONTENT_FONT_SIZE).toBe(defaultContentFontSize(false));
   });
 

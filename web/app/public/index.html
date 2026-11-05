@@ -6,7 +6,7 @@
     <meta name="robots" content="noindex,nofollow" />
     <meta name="theme-color" content="#181B1A" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
-    <meta name="apple-mobile-web-app-title" content="Paseo" />
+    <meta name="apple-mobile-web-app-title" content="feiyi" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <meta
       name="viewport"
@@ -14,6 +14,7 @@
     />
     <link rel="manifest" href="/manifest.json" />
     <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <link rel="preload" href="/fonts/Geist-Variable-latin.woff2" as="font" type="font/woff2" crossorigin />
     <title>%WEB_TITLE%</title>
     <!-- The `react-native-web` recommended style reset: https://necolas.github.io/react-native-web/docs/setup/#root-element -->
     <style id="expo-reset">
@@ -27,6 +28,15 @@
         overflow: hidden;
         overscroll-behavior: none;
       }
+      /* Keep the url as /fonts/...: the Pages build prefixes the base path onto exactly that form. */
+      @font-face {
+        font-family: "Geist";
+        font-style: normal;
+        font-weight: 100 900;
+        font-display: swap;
+        src: url(/fonts/Geist-Variable-latin.woff2) format("woff2");
+        unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+      }
       /* These styles smooth text rendering in the app shell. */
       body {
         -webkit-font-smoothing: antialiased;
@@ -37,6 +47,12 @@
         html,
         body {
           background-color: #181b1a;
+        }
+      }
+      @media (prefers-color-scheme: light) {
+        html,
+        body {
+          background-color: #fbfbfa;
         }
       }
       /* These styles make the root element full-height */
@@ -85,8 +101,26 @@
       *:focus {
         outline: none;
       }
+      /* Phones zoom into any focused field under 16px; with zoom allowed, keep fields at 16. */
+      @media (max-width: 899px) {
+        input,
+        textarea,
+        select {
+          font-size: max(16px, 1em) !important;
+        }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        *,
+        *::before,
+        *::after {
+          animation-duration: 0.01ms !important;
+          animation-iteration-count: 1 !important;
+          transition-duration: 0.01ms !important;
+          scroll-behavior: auto !important;
+        }
+      }
       *:focus-visible {
-        outline: 2px solid #20744a;
+        outline: 2px solid var(--focus-ring, #F0735B);
         outline-offset: 2px;
       }
     </style>

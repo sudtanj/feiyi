@@ -130,7 +130,7 @@ describe("applyAppearance", () => {
     expect(fontSize.base).toBe(15);
     expect(fontSize.sm).toBe(13);
     expect(fontSize.lg).toBe(17);
-    expect(fontSize.xl).toBe(19);
+    expect(fontSize.xl).toBe(21);
     expect(fontSize["4xl"]).toBe(28);
   });
 

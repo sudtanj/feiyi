@@ -23,9 +23,11 @@ export const density = {
   /** A list row such as a sidebar entry. */
   rowHeight: byLayout(44, 36),
   /** A row in a tight group, such as the sidebar's navigation rows. */
-  tightRowHeight: byLayout(36, 28),
+  tightRowHeight: byLayout(44, 28),
   /** A square icon-only button that sits in a row or toolbar. */
   iconButton: byLayout(44, 28),
+  /** A composer action button; the compact 36 gets hitSlop 4 for a 44 touch target. */
+  composerButton: byLayout(36, 28),
   /** The space between two blocks of rich text, such as Markdown paragraphs, code and images. */
   blockGap: byLayout(12, 16),
 };

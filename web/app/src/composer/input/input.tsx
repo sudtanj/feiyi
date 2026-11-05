@@ -750,6 +750,7 @@ function VoiceButtonTooltip({
         accessibilityRole="button"
         accessibilityLabel={voiceButtonAccessibilityLabel}
         style={voiceButtonStyle}
+        hitSlop={4}
       >
         {renderVoiceButtonIcon}
       </TooltipTrigger>
@@ -801,6 +802,7 @@ function SendButtonTooltip({
         accessibilityRole="button"
         testID={submitButtonTestID}
         style={sendButtonCombinedStyle}
+        hitSlop={4}
       >
         <SendButtonContent
           isSubmitLoading={isSubmitLoading}
@@ -1907,6 +1909,7 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
       () => [
         styles.sendButton,
         submitLabel ? styles.sendButtonLabeled : undefined,
+        isPresentedSendDisabled && styles.sendButtonDisabled,
         isPresentedSendDisabled && styles.buttonDisabled,
       ],
       [isPresentedSendDisabled, submitLabel],
@@ -2209,12 +2212,12 @@ const styles = StyleSheet.create((theme: Theme) => ({
     borderColor: theme.colors.borderAccent,
     borderRadius: theme.borderRadius["2xl"],
     paddingTop: {
-      xs: theme.spacing[2],
+      xs: theme.spacing[3],
       md: theme.spacing[4],
     },
     // The button row bleeds 6px horizontally, so match its corner inset at the bottom.
     paddingBottom: {
-      xs: theme.spacing[2],
+      xs: theme.spacing[3],
       md: theme.spacing[3],
     },
     paddingHorizontal: {
@@ -2280,7 +2283,8 @@ const styles = StyleSheet.create((theme: Theme) => ({
     // line box is the same for every line. Web keeps the CSS value.
     ...(isWeb
       ? ({
-          lineHeight: theme.fontSize.content * 1.4,
+          lineHeight: theme.fontSize.content * 1.5,
+          caretColor: theme.colors.accentBright,
           outlineStyle: "none",
           outlineWidth: 0,
           outlineColor: "transparent",
@@ -2316,21 +2320,21 @@ const styles = StyleSheet.create((theme: Theme) => ({
     gap: theme.spacing[1],
   },
   attachButton: {
-    width: 28,
-    height: 28,
+    width: { xs: 36, md: 28 },
+    height: { xs: 36, md: 28 },
     borderRadius: theme.borderRadius.full,
     alignItems: "center",
     justifyContent: "center",
   },
   attachButtonAnchor: {
-    width: 28,
-    height: 28,
+    width: { xs: 36, md: 28 },
+    height: { xs: 36, md: 28 },
     alignItems: "center",
     justifyContent: "center",
   },
   voiceButton: {
-    width: 28,
-    height: 28,
+    width: { xs: 36, md: 28 },
+    height: { xs: 36, md: 28 },
     borderRadius: theme.borderRadius.full,
     alignItems: "center",
     justifyContent: "center",
@@ -2339,8 +2343,8 @@ const styles = StyleSheet.create((theme: Theme) => ({
     backgroundColor: theme.colors.destructive,
   },
   sendButton: {
-    width: 28,
-    height: 28,
+    width: { xs: 36, md: 28 },
+    height: { xs: 36, md: 28 },
     borderRadius: theme.borderRadius.full,
     backgroundColor: theme.colors.accent,
     alignItems: "center",
@@ -2357,6 +2361,9 @@ const styles = StyleSheet.create((theme: Theme) => ({
     fontSize: theme.fontSize.base,
     fontWeight: theme.fontWeight.medium,
     color: theme.colors.accentForeground,
+  },
+  sendButtonDisabled: {
+    backgroundColor: theme.colors.surface3,
   },
   iconButtonHovered: {
     backgroundColor: theme.colors.surface2,

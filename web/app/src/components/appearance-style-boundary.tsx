@@ -1,9 +1,11 @@
-import { Fragment, type ReactNode } from "react";
+import { Fragment, useEffect, type ReactNode } from "react";
+import { Platform } from "react-native";
 import { withUnistyles } from "react-native-unistyles";
 import type { Theme } from "@/styles/theme";
 
 interface AppearanceStyleBoundaryProps {
   appearanceKey?: string;
+  focusRing?: string;
   children: ReactNode;
 }
 
@@ -16,7 +18,16 @@ interface AppearanceStyleBoundaryProps {
 // detaches its screen container inside a FragmentManager transaction and crashes Android.
 // `ThemedStack` places one per screen; the app shell places them around the chrome outside the
 // navigators.
-function AppearanceStyleBoundaryBase({ appearanceKey, children }: AppearanceStyleBoundaryProps) {
+function AppearanceStyleBoundaryBase({
+  appearanceKey,
+  focusRing,
+  children,
+}: AppearanceStyleBoundaryProps) {
+  // Read by the global :focus-visible rule in public/index.html, which sits outside React.
+  useEffect(() => {
+    if (Platform.OS === "web" && focusRing) document.documentElement.style.setProperty("--focus-ring", focusRing);
+  }, [focusRing]);
+
   return <Fragment key={appearanceKey}>{children}</Fragment>;
 }
 
@@ -65,7 +76,7 @@ export function appearanceStyleBoundaryKey(theme: Theme): string {
 }
 
 function appearanceStyleBoundaryMapping(theme: Theme): Partial<AppearanceStyleBoundaryProps> {
-  return { appearanceKey: appearanceStyleBoundaryKey(theme) };
+  return { appearanceKey: appearanceStyleBoundaryKey(theme), focusRing: theme.colors.ring };
 }
 
 const ThemedAppearanceStyleBoundary = withUnistyles(AppearanceStyleBoundaryBase);

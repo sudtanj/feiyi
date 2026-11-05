@@ -128,13 +128,13 @@ const styles = StyleSheet.create((theme) => ({
     borderColor: theme.colors.border,
   },
   muteButtonMuted: {
-    backgroundColor: theme.colors.palette.red[600],
-    borderColor: theme.colors.palette.red[800],
+    backgroundColor: theme.colors.destructive,
+    borderColor: theme.colors.destructive,
   },
   stopButton: {
-    backgroundColor: theme.colors.palette.red[600],
+    backgroundColor: theme.colors.destructive,
     borderWidth: theme.borderWidth[1],
-    borderColor: theme.colors.palette.red[800],
+    borderColor: theme.colors.destructive,
   },
   buttonDisabled: {
     opacity: 0.5,

@@ -15,7 +15,7 @@ export function createMarkdownStyles(
   const paragraph = {
     fontSize,
     fontFamily: theme.fontFamily.ui,
-    lineHeight: Math.round(fontSize * 1.4),
+    lineHeight: Math.round(fontSize * 1.5),
     color: theme.colors.foreground,
     ...block,
   };

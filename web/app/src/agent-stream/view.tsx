@@ -1626,7 +1626,7 @@ const stylesheet = StyleSheet.create((theme) => ({
     paddingVertical: 0,
     flexGrow: 1,
     paddingHorizontal: {
-      xs: theme.spacing[3],
+      xs: theme.spacing[2],
       md: theme.spacing[4],
     },
   },
@@ -1699,7 +1699,7 @@ const permissionStyles = StyleSheet.create((theme) => ({
   container: {
     marginVertical: theme.spacing[3],
     padding: theme.spacing[3],
-    borderRadius: theme.spacing[2],
+    borderRadius: theme.borderRadius.lg,
     borderWidth: 1,
     gap: theme.spacing[2],
     backgroundColor: theme.colors.surface1,

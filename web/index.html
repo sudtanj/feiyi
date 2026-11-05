@@ -2,34 +2,46 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="referrer" content="no-referrer">
 <meta name="robots" content="noindex, nofollow">
-<title>Feiyi</title>
+<title>feiyi</title>
 <style>
-  :root { --bg:#0f1115; --panel:#171a21; --line:#262a33; --fg:#e6e8ec; --mute:#8b93a1; --acc:#6aa6ff; --bad:#f85149; }
+  :root { color-scheme:dark light; --bg:#181B1A; --panel:#1E2120; --field:#141716; --btn:#262A28; --line:#2F3534; --fg:#F2F4F3; --mute:#A1A5A4; --acc:#E5553B; --on-acc:#181B1A; --ring:#F0735B; --bad:#E5536B; }
+  @media (prefers-color-scheme: light) {
+    :root { --bg:#FBFBFA; --panel:#FFFFFF; --field:#FBFBFA; --btn:#EDEFEE; --line:#DDE0DF; --fg:#181B1A; --mute:#4F5453; --ring:#B93A22; --bad:#B3263F; }
+  }
   * { box-sizing:border-box; }
-  body { margin:0; font:14px/1.45 system-ui,-apple-system,Segoe UI,sans-serif; background:var(--bg); color:var(--fg); min-height:100vh; display:flex; align-items:center; justify-content:center; padding:16px; }
-  .card { width:min(400px,100%); background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:22px; }
-  h1 { font-size:17px; margin:0 0 4px; }
-  .mute { color:var(--mute); } .small { font-size:12px; } .err { color:var(--bad); min-height:1.45em; margin:8px 0 0; }
-  button, input { font:inherit; color:var(--fg); background:#0c0e12; border:1px solid var(--line); border-radius:6px; padding:8px 10px; }
+  body { margin:0; font:16px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif; background:var(--bg); color:var(--fg); min-height:100vh; min-height:100dvh; display:flex; align-items:center; justify-content:center;
+    padding:max(16px,env(safe-area-inset-top)) max(16px,env(safe-area-inset-right)) max(16px,env(safe-area-inset-bottom)) max(16px,env(safe-area-inset-left)); }
+  .card { width:min(420px,100%); background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:24px; }
+  h1 { display:flex; align-items:center; gap:10px; font-size:20px; line-height:1.3; margin:0 0 12px; }
+  h1 svg { width:32px; height:32px; border-radius:8px; flex:none; }
+  p { margin:0 0 12px; }
+  .mute { color:var(--mute); } .small { font-size:14px; } .err { color:var(--bad); min-height:1.5em; margin:8px 0 0; font-size:14px; }
+  button, input { font:inherit; color:var(--fg); background:var(--field); border:1px solid var(--line); border-radius:10px; padding:10px 14px; min-height:44px; }
   input { width:100%; }
-  button { cursor:pointer; background:#1f2430; } button.primary { background:var(--acc); color:#0b1020; border-color:var(--acc); }
+  button { cursor:pointer; background:var(--btn); font-weight:500; }
+  button:hover:not(:disabled) { border-color:var(--mute); }
+  button.primary { background:var(--acc); color:var(--on-acc); border-color:var(--acc); }
+  button.primary:hover:not(:disabled) { border-color:var(--acc); filter:brightness(1.08); }
   button:disabled { opacity:.6; cursor:default; }
-  .row { display:flex; gap:8px; margin-top:12px; } .row > * { flex:1; }
-  #qr { background:#fff; border-radius:8px; padding:6px; width:max-content; max-width:100%; margin:14px auto; }
+  :focus-visible { outline:2px solid var(--ring); outline-offset:2px; }
+  code { font-size:14px; }
+  .row { display:flex; flex-wrap:wrap; gap:8px; margin-top:12px; } .row > * { flex:1 1 auto; }
+  #qr { background:#fff; border-radius:10px; padding:8px; width:max-content; max-width:100%; margin:16px auto; }
   #qr svg { display:block; max-width:100%; height:auto; }
   [hidden] { display:none !important; }
+  @media (prefers-reduced-motion: reduce) { * { transition:none !important; animation:none !important; } }
 </style>
 </head>
 <body>
 <!-- Nothing about the daemon is in this page: the pairing offer is fetched over
      /ws only after the daemon accepts the password, and dropped on lock. -->
 <main class="card">
-  <h1>Feiyi</h1>
+  <h1><svg viewBox="0 0 512 512" aria-hidden="true" focusable="false"><rect width="512" height="512" fill="#181B1A"/><g fill="#E5553B"><path d="M144 176H192V344L144 392Z"/><path d="M144 176H328L368 128L344 224H144Z"/><path d="M192 272H280L312 240L296 312H192Z"/></g></svg>feiyi</h1>
 
-  <section id="checking"><p class="mute">Connecting…</p></section>
+  <section id="checking"><p class="mute" role="status">Connecting…</p></section>
 
   <section id="unreachable" hidden>
     <p class="err">Can't reach the daemon.</p>
@@ -42,15 +54,15 @@
 
   <form id="login" hidden autocomplete="on">
     <p class="mute small">Enter the daemon password to show the pairing QR code.</p>
-    <input id="pw" type="password" name="password" autocomplete="current-password" placeholder="Password" required autofocus>
+    <input id="pw" type="password" name="password" autocomplete="current-password" placeholder="Password" aria-label="Password" aria-describedby="loginErr" required autofocus>
     <p id="loginErr" class="err" role="alert"></p>
     <div class="row"><button id="unlockBtn" class="primary">Unlock</button></div>
   </form>
 
   <section id="pairing" hidden>
-    <p class="mute small">Scan with the Paseo app, or open the link on the device you want to pair. <b>Anyone with this link can control your agents</b> - keep it private.</p>
+    <p class="mute small">Scan with the feiyi app, or open the link on the device you want to pair. <b>Anyone with this link can control your agents</b> - keep it private.</p>
     <div id="qr"></div>
-    <input id="url" readonly aria-label="Pairing link">
+    <input id="url" readonly aria-label="Pairing link" aria-describedby="pairErr">
     <p id="pairErr" class="err"></p>
     <div class="row"><button id="copyBtn">Copy link</button><button id="openBtn">Open</button><button id="lockBtn" class="primary">Lock</button></div>
     <p class="mute small">Locks automatically in <span id="left"></span>.</p>

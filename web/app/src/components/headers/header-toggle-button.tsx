@@ -55,6 +55,8 @@ export function HeaderToggleButton({
   return (
     <Tooltip delayDuration={tooltipDelayDuration} enabledOnDesktop enabledOnMobile={false}>
       <TooltipTrigger
+        // 32px visual on phones; the slop takes the touch target to 44.
+        hitSlop={6}
         {...props}
         {...ariaExpandedProps}
         disabled={disabled}

@@ -514,6 +514,10 @@ const styles = StyleSheet.create((theme) => ({
   },
   sidebarRowSelected: {
     backgroundColor: theme.colors.surfaceSidebarSelected,
+    // Selection is marked by the bar too, not only by the fill colour.
+    borderLeftWidth: 3,
+    borderLeftColor: theme.colors.accent,
+    paddingLeft: theme.spacing[2] - 3,
   },
   workspaceCreatingText: {
     color: theme.colors.foregroundMuted,

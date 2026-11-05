@@ -73,6 +73,7 @@ import Animated, {
   Easing,
   cancelAnimation,
   useAnimatedStyle,
+  useReducedMotion,
   useSharedValue,
   withRepeat,
   withTiming,
@@ -159,8 +160,12 @@ let webToolCallShimmerRegistered = false;
 const SCROLL_EDGE_EPSILON = 0.5;
 
 // Font size for stream metadata (timestamps, durations, live elapsed timer).
-// Lives between theme.fontSize.sm (12) and theme.fontSize.base (14); no token.
-export const STREAM_METADATA_FONT_SIZE = 13;
+export const STREAM_METADATA_FONT_SIZE = 12;
+const TABULAR_NUMS: TextStyle = { fontVariant: ["tabular-nums"] };
+// A 22px button plus slop reaches 44 on compact layouts and 32 on desktop.
+const COMPACT_HIT_SLOP = 11;
+const DESKTOP_HIT_SLOP = 5;
+const PHONE_MAX_DETAIL_HEIGHT = 320;
 type ScrollAxis = "x" | "y";
 
 function ensureWebToolCallShimmerKeyframes() {
@@ -296,7 +301,7 @@ const userMessageStylesheet = StyleSheet.create((theme) => ({
   },
   content: {
     alignItems: "flex-end",
-    maxWidth: "100%",
+    maxWidth: { xs: "92%", md: "85%" },
     cursor: "auto",
   },
   containerSpacing: {
@@ -309,11 +314,11 @@ const userMessageStylesheet = StyleSheet.create((theme) => ({
     marginBottom: theme.spacing[4],
   },
   bubble: {
-    backgroundColor: theme.colors.surface3,
+    backgroundColor: theme.colors.surface2,
     borderRadius: theme.borderRadius["2xl"],
     borderTopRightRadius: theme.borderRadius.sm,
     paddingHorizontal: theme.spacing[4],
-    paddingVertical: theme.spacing[4],
+    paddingVertical: theme.spacing[3],
     minWidth: 0,
     flexShrink: 1,
   },
@@ -322,7 +327,7 @@ const userMessageStylesheet = StyleSheet.create((theme) => ({
     fontSize: theme.fontSize.content,
     ...(isWeb
       ? {
-          lineHeight: Math.round(theme.fontSize.content * 1.4),
+          lineHeight: Math.round(theme.fontSize.content * 1.5),
           overflowWrap: "anywhere" as const,
         }
       : {}),
@@ -362,8 +367,9 @@ const userMessageStylesheet = StyleSheet.create((theme) => ({
     opacity: 1,
   },
   timestampText: {
-    color: theme.colors.foregroundMuted,
+    color: theme.colors.foregroundExtraMuted,
     fontSize: STREAM_METADATA_FONT_SIZE,
+    fontVariant: ["tabular-nums"],
   },
 }));
 
@@ -564,16 +570,18 @@ const assistantTurnFooterStylesheet = StyleSheet.create((theme) => ({
     position: "relative",
   },
   labelSizer: {
-    color: theme.colors.foregroundMuted,
+    color: theme.colors.foregroundExtraMuted,
     fontSize: STREAM_METADATA_FONT_SIZE,
+    fontVariant: ["tabular-nums"],
     opacity: 0,
   },
   labelOverlay: {
     position: "absolute",
     top: 0,
     left: 0,
-    color: theme.colors.foregroundMuted,
+    color: theme.colors.foregroundExtraMuted,
     fontSize: STREAM_METADATA_FONT_SIZE,
+    fontVariant: ["tabular-nums"],
   },
 }));
 
@@ -703,7 +711,7 @@ export const LiveElapsed = memo(function LiveElapsed({
   }, [active, startedAtMs]);
 
   return (
-    <Text style={style} testID={testID}>
+    <Text style={[TABULAR_NUMS, style]} testID={testID}>
       {formatDuration(visibleElapsedMs)}
     </Text>
   );
@@ -805,6 +813,7 @@ export const TurnCopyButton = memo(function TurnCopyButton({
   copiedAccessibilityLabel,
 }: TurnCopyButtonProps) {
   const { t } = useTranslation();
+  const isCompact = useIsCompactFormFactor();
   const [copied, setCopied] = useState(false);
   const copyTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -844,6 +853,7 @@ export const TurnCopyButton = memo(function TurnCopyButton({
     <Pressable
       onPress={handleCopy}
       style={pressableStyle}
+      hitSlop={isCompact ? COMPACT_HIT_SLOP : DESKTOP_HIT_SLOP}
       accessibilityRole="button"
       accessibilityLabel={
         copied
@@ -876,6 +886,8 @@ const expandableBadgeStylesheet = StyleSheet.create((theme) => ({
     marginBottom: theme.spacing[4],
   },
   pressable: {
+    minHeight: { xs: 44, md: 32 },
+    justifyContent: "center",
     borderRadius: theme.borderRadius.lg,
     borderWidth: theme.borderWidth[1],
     borderColor: "transparent",
@@ -921,9 +933,17 @@ const expandableBadgeStylesheet = StyleSheet.create((theme) => ({
   secondaryLabel: {
     flexShrink: 1,
     minWidth: 0,
-    color: theme.colors.foregroundMuted,
-    fontSize: theme.fontSize.base,
+    color: theme.colors.foregroundExtraMuted,
+    fontFamily: theme.fontFamily.mono,
+    fontSize: theme.fontSize.code,
     fontWeight: theme.fontWeight.normal,
+    marginLeft: theme.spacing[2],
+  },
+  errorLabel: {
+    flexShrink: 0,
+    color: theme.colors.destructive,
+    fontSize: theme.fontSize.sm,
+    fontWeight: theme.fontWeight.medium,
     marginLeft: theme.spacing[2],
   },
   secondaryLabelActive: {
@@ -931,7 +951,6 @@ const expandableBadgeStylesheet = StyleSheet.create((theme) => ({
   },
   shimmerText: {
     color: "transparent",
-    fontSize: theme.fontSize.base,
     fontWeight: theme.fontWeight.normal,
   },
   spacer: {
@@ -956,6 +975,7 @@ const expandableBadgeStylesheet = StyleSheet.create((theme) => ({
     borderWidth: theme.borderWidth[1],
     borderTopWidth: 0,
     borderColor: theme.colors.border,
+    backgroundColor: theme.colors.surface1,
     padding: 0,
     gap: 0,
     flexShrink: 1,
@@ -1231,7 +1251,7 @@ const speakMessageStylesheet = StyleSheet.create((theme) => ({
   text: {
     fontFamily: theme.fontFamily.ui,
     fontSize: theme.fontSize.content,
-    lineHeight: Math.round(theme.fontSize.content * 1.4),
+    lineHeight: Math.round(theme.fontSize.content * 1.5),
     color: theme.colors.foreground,
   },
 }));
@@ -1589,6 +1609,7 @@ interface ExpandableBadgeLabelRowProps {
   secondaryLabelStyle: StyleProp<TextStyle>;
   shouldMeasureWebShimmer: boolean;
   shouldMeasureNativeShimmer: boolean;
+  isError: boolean;
   isWebShimmer: boolean;
   isNativeShimmer: boolean;
   shimmerLabelTextStyle: StyleProp<TextStyle>;
@@ -1615,6 +1636,7 @@ function ExpandableBadgeLabelRow({
   secondaryLabelStyle,
   shouldMeasureWebShimmer,
   shouldMeasureNativeShimmer,
+  isError,
   isWebShimmer,
   isNativeShimmer,
   shimmerLabelTextStyle,
@@ -1634,6 +1656,7 @@ function ExpandableBadgeLabelRow({
   onOpenFileHoverOut,
 }: ExpandableBadgeLabelRowProps) {
   const { t } = useTranslation();
+  const isCompact = useIsCompactFormFactor();
   return (
     <View
       style={expandableBadgeStylesheet.labelRow}
@@ -1652,6 +1675,11 @@ function ExpandableBadgeLabelRow({
         shouldMeasureWebShimmer={shouldMeasureWebShimmer}
         onSecondaryLayout={onSecondaryLayout}
       />
+      {isError ? (
+        <Text style={expandableBadgeStylesheet.errorLabel} numberOfLines={1}>
+          {t("toolCallDetails.error")}
+        </Text>
+      ) : null}
       {showOpenFileButton ? (
         <Pressable
           onPress={onOpenFilePress}
@@ -1661,7 +1689,7 @@ function ExpandableBadgeLabelRow({
           accessibilityLabel={t("message.actions.openFile")}
           testID="tool-call-open-file"
           style={expandableBadgeStylesheet.openFileButton}
-          hitSlop={6}
+          hitSlop={isCompact ? COMPACT_HIT_SLOP : 8}
         >
           <ThemedFileSymlinkIcon
             size={14}
@@ -1881,6 +1909,7 @@ export const ExpandableBadge = memo(function ExpandableBadge({
   testID,
 }: ExpandableBadgeProps) {
   const resolvedDisableOuterSpacing = useDisableOuterSpacing(disableOuterSpacing);
+  const reduceMotion = useReducedMotion();
   const [isHovered, setIsHovered] = useState(false);
   const [isOpenFileHovered, setIsOpenFileHovered] = useState(false);
   const [isPressed, setIsPressed] = useState(false);
@@ -1934,7 +1963,7 @@ export const ExpandableBadge = memo(function ExpandableBadge({
   } = computeShimmerMetrics({
     label,
     secondaryLabel,
-    isLoading,
+    isLoading: isLoading && !reduceMotion,
     labelRowWidth,
     labelRowHeight,
     labelOffsetX,
@@ -2154,6 +2183,7 @@ export const ExpandableBadge = memo(function ExpandableBadge({
             secondaryLabelStyle={secondaryLabelStyle}
             shouldMeasureWebShimmer={shouldMeasureWebShimmer}
             shouldMeasureNativeShimmer={shouldMeasureNativeShimmer}
+            isError={isError}
             isWebShimmer={isWebShimmer}
             isNativeShimmer={isNativeShimmer}
             shimmerLabelTextStyle={shimmerLabelTextStyle}
@@ -2353,12 +2383,13 @@ export const ToolCall = memo(function ToolCall({
         toolName={toolName}
         detail={presentation.detail}
         errorText={presentation.errorText}
-        maxHeight={maxDetailHeight}
+        maxHeight={isMobile ? Math.min(maxDetailHeight, PHONE_MAX_DETAIL_HEIGHT) : maxDetailHeight}
         showLoadingSkeleton={presentation.isLoadingDetails}
       />
     );
   }, [
     shouldRenderInline,
+    isMobile,
     toolName,
     presentation.detail,
     presentation.errorText,

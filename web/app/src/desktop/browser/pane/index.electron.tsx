@@ -659,8 +659,8 @@ export function BrowserPane({
     [theme.colors.foreground],
   );
   const errorTextStyle = useMemo(
-    () => [styles.metaError, { color: theme.colors.palette.red[500] }],
-    [theme.colors.palette.red],
+    () => [styles.metaError, { color: theme.colors.destructive }],
+    [theme.colors.destructive],
   );
   const browserErrorLabels = useMemo(
     () => ({

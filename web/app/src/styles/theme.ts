@@ -233,6 +233,7 @@ export interface LightThemeConfig {
   accent: string;
   accentBright: string;
   accentForeground?: string;
+  success?: string;
   primary: string;
   primaryForeground: string;
   destructive: string;
@@ -285,7 +286,7 @@ export function buildLightSemanticColors(tint: LightThemeConfig) {
 
     destructive: tint.destructive,
     destructiveForeground: tint.surface0,
-    success: tint.accent,
+    success: tint.success ?? tint.accent,
     successForeground: tint.surface0,
 
     background: tint.surface0,
@@ -321,27 +322,28 @@ export function buildLightSemanticColors(tint: LightThemeConfig) {
 }
 
 const lightSemanticColors = buildLightSemanticColors({
-  surface0: "#ffffff",
-  surface1: "#fafafa",
-  surface2: "#f4f4f5",
-  surface3: "#e4e4e7",
-  surface4: "#d4d4d8",
-  surfaceDiffEmpty: "#f6f6f6",
-  surfaceSidebar: "#f4f4f5",
-  foreground: "#1a1a1e",
-  foregroundMuted: "#71717a",
-  foregroundExtraMuted: "#a1a1aa",
-  border: "#e4e4e7",
-  borderAccent: "#ececf1",
-  accent: "#20744A",
-  accentBright: "#239956",
-  accentForeground: "#ffffff",
-  primary: "#18181b",
+  surface0: "#FBFBFA",
+  surface1: "#F5F6F5",
+  surface2: "#EDEFEE",
+  surface3: "#E0E3E2",
+  surface4: "#CDD1D0",
+  surfaceDiffEmpty: "#F2F4F3",
+  surfaceSidebar: "#F1F3F2",
+  foreground: "#181B1A",
+  foregroundMuted: "#4F5453",
+  foregroundExtraMuted: "#646968",
+  border: "#DDE0DF",
+  borderAccent: "#E8EAE9",
+  accent: "#E5553B",
+  accentBright: "#B93A22",
+  accentForeground: "#181B1A",
+  success: "#1F7A3E",
+  primary: "#181B1A",
   primaryForeground: "#fafafa",
-  destructive: "#b04138",
+  destructive: "#B3263F",
   terminalBlack: "#1a1a1e",
   terminalBrightBlack: "#3f3f46",
-  ring: "#18181b",
+  ring: "#B93A22",
 });
 
 // ---------------------------------------------------------------------------
@@ -364,6 +366,8 @@ export interface DarkThemeConfig {
   accentBright: string;
   accentForeground?: string;
   destructive: string;
+  destructiveForeground?: string;
+  success?: string;
   terminalBlack: string;
   terminalBrightBlack: string;
   foreground?: string;
@@ -415,9 +419,10 @@ export function buildDarkSemanticColors(tint: DarkThemeConfig) {
     accentForeground: tint.accentForeground ?? "#ffffff",
 
     destructive: tint.destructive,
-    destructiveForeground: "#ffffff",
-    success: tint.accent,
-    successForeground: "#ffffff",
+    destructiveForeground: tint.destructiveForeground ?? "#ffffff",
+    success: tint.success ?? tint.accent,
+    // Variants whose success is their accent keep white; the decoupled green needs charcoal.
+    successForeground: tint.success ? "#181B1A" : "#ffffff",
 
     // Legacy aliases (for gradual migration)
     background: tint.surface0,
@@ -456,22 +461,27 @@ export function buildDarkSemanticColors(tint: DarkThemeConfig) {
 // Dark tint definitions
 // ---------------------------------------------------------------------------
 
-// Paseo — subtle teal-green tint (default)
+// Paseo — subtle teal-green tint with the brand orange-red accent (default)
 const paseoDarkColors = buildDarkSemanticColors({
   surface0: "#181B1A",
   surface1: "#1E2120",
-  surface2: "#272A29",
-  surface3: "#434645",
-  surface4: "#595B5B",
+  surface2: "#262A28",
+  surface3: "#343837",
+  surface4: "#444846",
   surfaceDiffEmpty: "#252827",
   surfaceSidebar: "#141716",
+  foreground: "#F2F4F3",
   foregroundMuted: "#A1A5A4",
-  foregroundExtraMuted: "#717574",
+  foregroundExtraMuted: "#909493",
   border: "#252B2A",
   borderAccent: "#2F3534",
-  accent: "#20744A",
-  accentBright: "#7ccba0",
-  destructive: "#c64f43", // warm red, hue ~7 — reads as red (not pink) against the green tint
+  accent: "#E5553B",
+  accentBright: "#F0735B",
+  accentForeground: "#181B1A",
+  success: "#35C264",
+  ring: "#F0735B",
+  destructive: "#E5536B", // crimson, kept apart from the orange-red accent
+  destructiveForeground: "#181B1A",
   terminalBlack: "#141716",
   terminalBrightBlack: "#434645",
 });
@@ -576,13 +586,13 @@ export const SPACING = {
 
 export const FONT_SIZE = {
   code: 12,
-  content: 15,
+  content: 16,
   sm: 12,
   base: 14,
   lg: 16,
-  xl: 18,
+  xl: 20,
   "2xl": 20,
-  "3xl": 22,
+  "3xl": 26,
   "4xl": 26,
 } as const;
 
@@ -608,12 +618,12 @@ export const FONT_WEIGHT = {
 
 export const BORDER_RADIUS = {
   none: 0,
-  sm: 2,
-  base: 4,
-  md: 6,
-  lg: 8,
-  xl: 12,
-  "2xl": 16,
+  sm: 4,
+  base: 6,
+  md: 8,
+  lg: 10,
+  xl: 14,
+  "2xl": 20,
   full: 9999,
 } as const;
 
@@ -641,11 +651,11 @@ export const DEFAULT_UI_FONT_STACK: string = Platform.select({
 export const DEFAULT_MONO_FONT_STACK: string = Platform.select({
   ios: "ui-monospace",
   default: "monospace",
-  web: "SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace",
+  web: "ui-monospace, 'SF Mono', 'Cascadia Mono', Menlo, Consolas, 'Liberation Mono', monospace",
 });
 
 // Chat and markdown content column; the appearance updater patches the user's width in.
-export const DEFAULT_CONTENT_MAX_WIDTH = 820;
+export const DEFAULT_CONTENT_MAX_WIDTH = 680;
 
 // `fontSize`, `fontFamily`, `lineHeight`, and `contentMaxWidth` are deliberately widened to plain
 // `number`/`string` (not narrowed by `as const`) so the appearance updater can patch
@@ -791,7 +801,7 @@ export const THEME_OPTIONS = [
     group: "primary",
     unistylesName: "dark",
     theme: darkTheme,
-    swatch: "#2D8B62",
+    swatch: "#E5553B",
   },
   { name: "auto", group: "primary" },
   {

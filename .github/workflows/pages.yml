@@ -156,7 +156,7 @@ jobs:
             # Root-absolute links in the hand-written HTML shell (manifest, icons), and the
             # PWA manifest's scope and icons. The second expression undoes a double prefix on
             # paths Expo already wrote under the base path.
-            sed -i -E -e 's#(href|src)="/([^/"])#\1="'"$BASE"'/\2#g' -e 's#"'"$BASE$BASE"'/#"'"$BASE"'/#g' index.html
+            sed -i -E -e 's#(href|src)="/([^/"])#\1="'"$BASE"'/\2#g' -e 's#url\(/fonts/#url('"$BASE"'/fonts/#g' -e 's#"'"$BASE$BASE"'/#"'"$BASE"'/#g' index.html
             sed -i -E -e 's#"(id|start_url|scope|src)": "/#"\1": "'"$BASE"'/#' -e 's#"'"$BASE$BASE"'/#"'"$BASE"'/#g' manifest.json
           fi
           # Keep what you paste (pairing links) and what the app stores in this browser: a

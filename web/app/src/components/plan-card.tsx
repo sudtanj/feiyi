@@ -90,7 +90,7 @@ const styles = StyleSheet.create((theme) => ({
   container: {
     marginVertical: theme.spacing[3],
     padding: theme.spacing[3],
-    borderRadius: theme.spacing[2],
+    borderRadius: theme.borderRadius.lg,
     borderWidth: 1,
     backgroundColor: theme.colors.surface1,
     borderColor: theme.colors.border,
@@ -103,7 +103,7 @@ const styles = StyleSheet.create((theme) => ({
     flexDirection: "row",
     alignItems: "center",
     gap: theme.spacing[2],
-    minHeight: 24,
+    minHeight: { xs: 44, md: 32 },
   },
   chevron: {},
   chevronExpanded: { transform: [{ rotate: "90deg" }] },

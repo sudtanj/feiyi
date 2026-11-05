@@ -559,10 +559,10 @@ const foregroundMutedColorMapping = (theme: Theme) => ({
   color: theme.colors.foregroundMuted,
 });
 const greenColorMapping = (theme: Theme) => ({
-  color: theme.colors.palette.green[500],
+  color: theme.colors.statusSuccess,
 });
 const redColorMapping = (theme: Theme) => ({
-  color: theme.colors.palette.red[500],
+  color: theme.colors.destructive,
 });
 
 const styles = StyleSheet.create((theme) => ({
@@ -670,10 +670,10 @@ const styles = StyleSheet.create((theme) => ({
   },
   errorCard: {
     padding: theme.spacing[3],
-    backgroundColor: theme.colors.palette.red[100],
+    backgroundColor: theme.colors.surface2,
   },
   errorText: {
     fontSize: theme.fontSize.base,
-    color: theme.colors.palette.red[800],
+    color: theme.colors.destructive,
   },
 }));

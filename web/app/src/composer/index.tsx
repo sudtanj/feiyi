@@ -2538,7 +2538,9 @@ const styles = StyleSheet.create((theme: Theme) => ({
     width: "100%",
     overflow: "visible",
     paddingHorizontal: theme.spacing[4],
-    paddingBottom: theme.spacing[4],
+    paddingBottom: isWeb
+      ? (`max(${theme.spacing[4]}px, env(safe-area-inset-bottom))` as unknown as number)
+      : theme.spacing[4],
   },
   inputAreaLocked: {
     opacity: 0.6,
@@ -2568,10 +2570,10 @@ const styles = StyleSheet.create((theme: Theme) => ({
     gap: theme.spacing[3],
   },
   cancelButton: {
-    width: 28,
-    height: 28,
+    width: { xs: 36, md: 28 },
+    height: { xs: 36, md: 28 },
     borderRadius: theme.borderRadius.full,
-    backgroundColor: theme.colors.palette.red[600],
+    backgroundColor: theme.colors.destructive,
     alignItems: "center",
     justifyContent: "center",
     marginLeft: theme.spacing[1],
@@ -2589,8 +2591,8 @@ const styles = StyleSheet.create((theme: Theme) => ({
     justifyContent: "center",
   },
   realtimeVoiceButton: {
-    width: 28,
-    height: 28,
+    width: { xs: 36, md: 28 },
+    height: { xs: 36, md: 28 },
     borderRadius: theme.borderRadius.full,
     alignItems: "center",
     justifyContent: "center",
@@ -2599,8 +2601,8 @@ const styles = StyleSheet.create((theme: Theme) => ({
     marginLeft: theme.spacing[1],
   },
   realtimeVoiceButtonActive: {
-    backgroundColor: theme.colors.palette.green[600],
-    borderColor: theme.colors.palette.green[800],
+    backgroundColor: theme.colors.statusSuccess,
+    borderColor: theme.colors.statusSuccess,
   },
   iconButtonHovered: {
     backgroundColor: theme.colors.surface2,
@@ -2660,7 +2662,7 @@ const styles = StyleSheet.create((theme: Theme) => ({
     backgroundColor: theme.colors.accent,
   },
   sendErrorText: {
-    color: theme.colors.palette.red[500],
+    color: theme.colors.destructive,
     fontSize: theme.fontSize.base,
   },
 })) as unknown as Record<string, object>;

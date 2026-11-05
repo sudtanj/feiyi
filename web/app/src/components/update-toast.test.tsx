@@ -9,9 +9,10 @@ vi.hoisted(() => {
   (globalThis as unknown as { __DEV__: boolean }).__DEV__ = false;
 });
 
-const { hasNewBuild, platform } = vi.hoisted(() => ({
+const { hasNewBuild, platform, build } = vi.hoisted(() => ({
   hasNewBuild: vi.fn<(builtId: string) => Promise<boolean>>(),
   platform: { isWeb: true },
+  build: { id: "1" },
 }));
 
 vi.mock("react-native-unistyles", () => {
@@ -79,7 +80,9 @@ vi.mock("@/constants/platform", () => ({
 }));
 
 vi.mock("@/utils/web-build-version", () => ({
-  BUILT_ID: "1",
+  get BUILT_ID() {
+    return build.id;
+  },
   hasNewBuild,
 }));
 
@@ -114,6 +117,7 @@ describe("UpdateToast", () => {
       true;
     vi.useFakeTimers();
     platform.isWeb = true;
+    build.id = "1";
     hasNewBuild.mockReset();
     hasNewBuild.mockResolvedValue(false);
     Object.defineProperty(document, "visibilityState", { value: "visible", configurable: true });
@@ -174,15 +178,13 @@ describe("UpdateToast", () => {
   });
 
   it("does not check when the bundle has no build id", async () => {
-    vi.resetModules();
-    vi.doMock("@/utils/web-build-version", () => ({ BUILT_ID: "", hasNewBuild }));
+    build.id = "";
     hasNewBuild.mockResolvedValue(true);
     await mountToast();
     await setVisibility("visible");
     await advance(CHECK_INTERVAL_MS);
     expect(hasNewBuild).not.toHaveBeenCalled();
     expect(container.textContent).toBe("");
-    vi.doUnmock("@/utils/web-build-version");
   });
 
   it("reloads the page on Update", async () => {
@@ -230,6 +232,7 @@ describe("UpdateToast", () => {
     await setVisibility("visible");
     await advance(CHECK_INTERVAL_MS);
     expect(hasNewBuild).not.toHaveBeenCalled();
+    remove.mockRestore();
     root = createRoot(container);
   });
 });

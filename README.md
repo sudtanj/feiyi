@@ -1,3 +1,5 @@
+<img src="web/logo.svg" width="96" height="96" alt="feiyi logo">
+
 # feiyi
 
 A lightweight Rust daemon for the [Paseo](https://github.com/getpaseo/paseo) app: a rewrite of the

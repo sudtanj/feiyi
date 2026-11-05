@@ -142,6 +142,10 @@ jobs:
             );
           }
           EOF
+          # The web loading screen masks a shimmer with its own inline copy of the logo path.
+          splash=../../screens/startup-splash-screen.tsx
+          sed -i "s#viewBox='0 0 700 700'><path fill='black' d='[^']*'#viewBox='120 124 272 272'><path fill='black' d='M144 176H192V344L144 392Z M144 176H328L368 128L344 224H144Z M192 272H280L312 240L296 312H192Z'#" $splash
+          grep -q "viewBox='120 124 272 272'" $splash || { echo "::error::splash logo mask changed upstream"; exit 1; }
           # Image assets: the tab icon the app swaps by agent state (plain, running = blue dot,
           # needs attention = green dot), the notification icon and the app icon. Each is redrawn at
           # its upstream size, so layouts do not shift.

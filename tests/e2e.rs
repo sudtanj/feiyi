@@ -307,6 +307,17 @@ async fn unsupported_requests_get_an_rpc_error() {
 }
 
 #[tokio::test]
+async fn session_ping_gets_a_pong() {
+    let d = start("ping", None);
+    let mut ws = connect(d.port).await;
+    hello(&mut ws, None).await;
+    let pong = rpc(&mut ws, json!({ "type": "ping", "requestId": "p1", "clientSentAt": 42 }), "pong").await;
+    assert_eq!(pong["requestId"], "p1", "{pong}");
+    assert_eq!(pong["clientSentAt"], 42, "{pong}");
+    assert!(pong["serverSentAt"].as_u64().unwrap() > 0, "{pong}");
+}
+
+#[tokio::test]
 async fn file_subscription_pushes_updates_and_entries_duplicate() {
     let d = start("filesub", None);
     let cwd = d.dir.join("work");

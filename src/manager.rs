@@ -48,6 +48,16 @@ async fn sleep_until_opt(deadline: Option<Instant>) {
     }
 }
 
+/// Every app request waits behind the manager loop: name what held it up.
+fn timed(what: &str, f: impl FnOnce()) {
+    let started = Instant::now();
+    f();
+    let busy = started.elapsed();
+    if busy >= Duration::from_millis(500) {
+        crate::warn!("manager busy {}ms in {what}; app requests waited behind it", busy.as_millis());
+    }
+}
+
 /// The agent of an event that must not overtake that agent's buffered text
 /// (everything but timeline items, which buffer or flush themselves).
 fn other_event_agent(ev: &ProviderEvent) -> Option<&str> {
@@ -265,7 +275,10 @@ impl Manager {
         loop {
             tokio::select! {
                 Some(cmd) = cmds.recv() => match cmd {
-                    Cmd::Rpc { msg, out } => self.handle_rpc(msg, &out),
+                    Cmd::Rpc { msg, out } => {
+                        let kind = msg.get("type").and_then(|t| t.as_str()).unwrap_or("rpc").to_string();
+                        timed(&kind, || self.handle_rpc(msg, &out))
+                    }
                     Cmd::RegisterProject { path, out, mut response } => {
                         response["payload"]["project"] = self.register_project(&path, true);
                         reply(&out, response);
@@ -283,8 +296,8 @@ impl Manager {
                         }
                     }
                 },
-                Some(ev) = events.recv() => self.handle_event(ev),
-                _ = tick.tick() => self.housekeeping(),
+                Some(ev) = events.recv() => timed("provider event", || self.handle_event(ev)),
+                _ = tick.tick() => timed("housekeeping", || self.housekeeping()),
                 _ = sleep_until_opt(self.chunk_deadline) => self.flush_chunks(),
                 _ = sleep_until_opt(self.schedule_deadline()) => self.run_due_schedules(),
                 _ = &mut shutdown => break,

@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useRef } from "react";
 import type { DiagramColorScheme, MermaidRenderRequest } from "./render-model";
-import { mermaidRuntimeHtml } from "./runtime/html.gen";
 import { parseMermaidRuntimeMessage, type MermaidRuntimeRenderMessage } from "./runtime/messages";
 import { MermaidRuntimeRequestDriver } from "./runtime/request-driver";
 
@@ -75,7 +74,7 @@ export function MermaidIframeRuntime({
       aria-hidden
       inert
       sandbox="allow-scripts"
-      srcDoc={mermaidRuntimeHtml}
+      src={(process.env.EXPO_PUBLIC_PAGES_BASE_PATH || "") + "/mermaid-runtime.html"}
       tabIndex={-1}
       style={iframeStyle}
     />

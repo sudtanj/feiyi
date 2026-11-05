@@ -1,8 +1,9 @@
 name: pages
 
-# Builds the upstream Paseo web app (getpaseo/paseo, packages/app) at a pinned release and
-# publishes it on GitHub Pages, so a browser can pair with feiyi through the relay
-# without depending on app.paseo.sh. Point the daemon's pairing link at it with
+# Builds the feiyi web app (web/app, a fork of getpaseo/paseo packages/app) on GitHub Pages,
+# so a browser can pair with feiyi through the relay without depending on app.paseo.sh.
+# The other workspace packages and the lockfile come from upstream at a pinned release.
+# Point the daemon's pairing link at it with
 # PASEO_APP_BASE_URL=https://<user>.github.io/<repo> (or your custom domain).
 #
 # One-time setup: Settings > Pages > Build and deployment > Source: GitHub Actions.
@@ -19,7 +20,7 @@ on:
         default: "v0.12.0"
   push:
     branches: [main]
-    paths: [.github/workflows/pages.yml]
+    paths: [.github/workflows/pages.yml, "web/**"]
 
 permissions:
   contents: read
@@ -54,10 +55,19 @@ jobs:
 
       - uses: actions/checkout@v4
         with:
-          sparse-checkout: web/logo.svg
-          sparse-checkout-cone-mode: false
+          sparse-checkout: web
+          sparse-checkout-cone-mode: true
           path: self
           persist-credentials: false
+
+      # npm ci uses upstream's lockfile, so the fork must keep the same dependencies. Bumping
+      # them means vendoring a newer tag (web/app/UPSTREAM.md) and pinning UPSTREAM_REF to it.
+      - name: Swap in web/app
+        run: |
+          cmp upstream/packages/app/package.json self/web/app/package.json \
+            || { echo "::error::web/app/package.json differs from upstream $UPSTREAM_REF; the lockfile would not match"; exit 1; }
+          rm -rf upstream/packages/app
+          cp -a self/web/app upstream/packages/app
 
       - uses: actions/setup-node@v4
         with:
@@ -69,88 +79,23 @@ jobs:
         working-directory: upstream
         run: node scripts/npm-retry.mjs ci --no-audit --no-fund
 
-      # A project site lives under /<repo>/, but the app assumes the domain root. Expo's
-      # baseUrl prefixes routes and bundles; the same value is inlined for the one place
-      # that navigates with a hard-coded root path (the notification-click fallback).
-      - name: Serve from the Pages base path
-        working-directory: upstream/packages/app
-        env:
-          BASE: ${{ steps.pages.outputs.base_path }}
-        run: |
-          echo "[*] base path: '${BASE:-/}'"
-          [ -n "$BASE" ] || exit 0
-          grep -q 'typedRoutes: true,' app.config.js \
-            || { echo "::error::app.config.js changed upstream; update the baseUrl patch"; exit 1; }
-          sed -i 's|typedRoutes: true,|typedRoutes: true,\n      ...(process.env.EXPO_PUBLIC_PAGES_BASE_PATH ? { baseUrl: process.env.EXPO_PUBLIC_PAGES_BASE_PATH } : {}),|' app.config.js
-          f=src/utils/os-notifications.ts
-          if grep -q 'location.assign(route);' "$f"; then
-            sed -i -e 's|location.assign(route);|location.assign((process.env.EXPO_PUBLIC_PAGES_BASE_PATH \|\| "") + route);|' \
-                   -e 's|location.href = route;|location.href = (process.env.EXPO_PUBLIC_PAGES_BASE_PATH \|\| "") + route;|' "$f"
-          else
-            echo "::warning::notification fallback not patched ($f changed upstream); clicking a notification may open the wrong path"
-          fi
-
-      # Lighter startup for weak devices: the Mermaid diagram runtime (~3.6 MB) is inlined in
-      # the main bundle as a string, so every visitor downloads and parses it. Ship it as a
-      # static file instead; the sandboxed iframe loads it only when a diagram is shown, and
-      # it talks to the app through postMessage either way.
-      - name: Load the Mermaid runtime on demand
+      # Not committed: the Mermaid runtime is a 3.6 MB JSON string in html.gen.ts, served as a
+      # static file so it stays out of the main bundle, and the PNG icons are redrawn from the
+      # feiyi mark. Neither can be generated without node/rsvg on a dev machine.
+      - name: Generate Mermaid runtime and icons
         working-directory: upstream/packages/app
         run: |
-          d=src/components/markdown/fence/mermaid
-          f=$d/iframe-runtime.web.tsx
-          if grep -q '^import { mermaidRuntimeHtml } from "./runtime/html.gen";$' "$f" \
-             && grep -q 'srcDoc={mermaidRuntimeHtml}' "$f" \
-             && [ "$(grep -rl 'html.gen' src --include=*.web.tsx --include=*.web.ts --include=*.tsx --include=*.ts | grep -v '\.native\.\|\.test\.' | wc -l)" = 1 ]; then
-            node -e '
-              const fs = require("fs");
-              const m = fs.readFileSync(process.argv[1], "utf8").match(/export const mermaidRuntimeHtml = (".*");/s);
-              if (!m) { console.error("::error::html.gen.ts format changed upstream"); process.exit(1); }
-              fs.writeFileSync(process.argv[2], JSON.parse(m[1]));
-            ' "$d/runtime/html.gen.ts" public/mermaid-runtime.html
-            sed -i -e '/^import { mermaidRuntimeHtml } from ".\/runtime\/html.gen";$/d' \
-                   -e 's|srcDoc={mermaidRuntimeHtml}|src={(process.env.EXPO_PUBLIC_PAGES_BASE_PATH \|\| "") + "/mermaid-runtime.html"}|' "$f"
-            echo "[*] Mermaid runtime: $(wc -c < public/mermaid-runtime.html) bytes moved out of the main bundle"
-          else
-            echo "::warning::Mermaid runtime left inline ($f changed upstream)"
-          fi
-
-      # The welcome, splash and onboarding screens draw the logo from this component; the tab
-      # icons and notifications use the images.
-      - name: Use the feiyi logo in the app (component and images)
-        working-directory: upstream/packages/app/src/components/icons
-        run: |
-          grep -q 'export function PaseoLogo' paseo-logo.tsx || { echo "::error::PaseoLogo moved upstream"; exit 1; }
-          cat > paseo-logo.tsx <<'EOF'
-          import Svg, { Path } from "react-native-svg";
-          import { useUnistyles } from "react-native-unistyles";
-
-          interface PaseoLogoProps {
-            size?: number;
-            color?: string;
-          }
-
-          // feiyi's mark (web/logo.svg in feiyi) without its background.
-          export function PaseoLogo({ size = 64, color }: PaseoLogoProps) {
-            const { theme } = useUnistyles();
-            const fill = color ?? theme.colors.foreground;
-
-            return (
-              <Svg width={size} height={size} viewBox="120 124 272 272" fill="none">
-                <Path d="M144 176H192V344L144 392Z M144 176H328L368 128L344 224H144Z M192 272H280L312 240L296 312H192Z" fill={fill} />
-              </Svg>
-            );
-          }
-          EOF
-          # The web loading screen masks a shimmer with its own inline copy of the logo path.
-          splash=../../screens/startup-splash-screen.tsx
-          sed -i "s#viewBox='0 0 700 700'><path fill='black' d='[^']*'#viewBox='120 124 272 272'><path fill='black' d='M144 176H192V344L144 392Z M144 176H328L368 128L344 224H144Z M192 272H280L312 240L296 312H192Z'#" $splash
-          grep -q "viewBox='120 124 272 272'" $splash || { echo "::error::splash logo mask changed upstream"; exit 1; }
+          node -e '
+            const fs = require("fs");
+            const m = fs.readFileSync(process.argv[1], "utf8").match(/export const mermaidRuntimeHtml = (".*");/s);
+            if (!m) { console.error("::error::html.gen.ts format changed"); process.exit(1); }
+            fs.writeFileSync(process.argv[2], JSON.parse(m[1]));
+          ' src/components/markdown/fence/mermaid/runtime/html.gen.ts public/mermaid-runtime.html
           # Image assets: the tab icon the app swaps by agent state (plain, running = blue dot,
           # needs attention = green dot), the notification icon and the app icon. Each is redrawn at
           # its upstream size, so layouts do not shift.
           sudo apt-get install -y -qq librsvg2-bin >/dev/null
-          cd ../../../assets/images
+          cd assets/images
           mark='<path fill="#E5553B" d="M144 176H192V344L144 392Z M144 176H328L368 128L344 224H144Z M192 272H280L312 240L296 312H192Z"/>'
           draw() { # file, svg body: render at the PNG's current width
             w=$(od -An -tu1 -j16 -N4 "$1" | awk '{print $1*16777216+$2*65536+$3*256+$4}')
@@ -167,12 +112,21 @@ jobs:
           draw favicon.png "$tile$mark"
           draw icon.png "$tile$mark"
 
+
       - name: Build
         working-directory: upstream
         env:
           EXPO_PUBLIC_PAGES_BASE_PATH: ${{ steps.pages.outputs.base_path }}
           NODE_OPTIONS: --max-old-space-size=6144
         run: npm run build:web --workspace=@getpaseo/app
+
+      # Upstream's own unit project; the browser and e2e projects need Playwright browsers.
+      # Runs after Build because both need the workspace packages that build:app-deps emits.
+      - name: Typecheck and unit tests
+        working-directory: upstream/packages/app
+        run: |
+          npm run typecheck
+          npx vitest run --project unit
 
       - name: Brand as feiyi
         working-directory: upstream/packages/app/dist

@@ -184,6 +184,7 @@ export default {
     ],
     experiments: {
       typedRoutes: true,
+      ...(process.env.EXPO_PUBLIC_PAGES_BASE_PATH ? { baseUrl: process.env.EXPO_PUBLIC_PAGES_BASE_PATH } : {}),
       reactCompiler: true,
       autolinkingModuleResolution: true,
     },

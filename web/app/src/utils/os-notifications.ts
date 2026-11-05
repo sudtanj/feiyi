@@ -143,11 +143,11 @@ function fallbackNavigateToNotificationTarget(data: Record<string, unknown> | un
     return;
   }
   if (typeof location.assign === "function") {
-    location.assign(route);
+    location.assign((process.env.EXPO_PUBLIC_PAGES_BASE_PATH || "") + route);
     return;
   }
   if (typeof location.href === "string") {
-    location.href = route;
+    location.href = (process.env.EXPO_PUBLIC_PAGES_BASE_PATH || "") + route;
   }
 }
 

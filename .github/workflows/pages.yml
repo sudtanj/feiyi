@@ -176,76 +176,20 @@ jobs:
           grep -q '^    <meta charset="utf-8" />$' index.html || { echo "::error::index.html head changed upstream"; exit 1; }
           sed -i "s|^    <meta charset=\"utf-8\" />\$|&\n    <meta http-equiv=\"Content-Security-Policy\" content=\"${csp}\" />\n    <meta name=\"referrer\" content=\"no-referrer\" />|" index.html
           echo "[*] CSP: $csp"
-          # Installed app: rotate freely (tablets, landscape phones, desktop windows), and a
-          # service worker so it opens offline and starts fast. Pages are network-first, so a
-          # deploy is picked up on the next online launch; /_expo/static files have hashed
-          # names, so cache-first is safe. Each deploy gets its own cache, filled on install.
+          # Installed app: rotate freely (tablets, landscape phones, desktop windows).
           sed -i '/^  "orientation": /d' manifest.json
           node -e 'JSON.parse(require("fs").readFileSync("manifest.json", "utf8"))'
-          cat > sw.js <<'EOF'
-          const CACHE = "paseo-__VERSION__";
-          const shell = new URL("./", self.registration.scope).href;
-          // Fill this deploy's cache with its own index and bundles before taking over, so the
-          // index and the files it names always sit in one cache and the app opens offline.
-          self.addEventListener("install", (e) => e.waitUntil((async () => {
-            const res = await fetch(shell, { cache: "reload" });
-            const html = await res.clone().text();
-            const urls = new Set([...html.matchAll(/(?:src|href)="([^"]*\/_expo\/static\/[^"]+)"/g)].map((m) => m[1])); // the CSS is both preloaded and linked
-            const c = await caches.open(CACHE);
-            await c.put(shell, res);
-            await c.addAll([...urls].map((u) => new Request(u, { cache: "reload" }))); // not a stale copy from the HTTP cache
-            await self.skipWaiting();
-          })()));
+          # No offline cache: every launch loads the latest deploy. Browsers that installed the
+          # old caching worker fetch this one on their next visit; it wipes the caches,
+          # unregisters itself and reloads open tabs from the network.
+          cat > sw.js <<'SW'
+          self.addEventListener("install", () => self.skipWaiting());
           self.addEventListener("activate", (e) => e.waitUntil((async () => {
-            for (const k of await caches.keys()) if (k.startsWith("paseo-") && k !== CACHE) await caches.delete(k);
-            await self.clients.claim();
+            for (const k of await caches.keys()) await caches.delete(k);
+            await self.registration.unregister();
+            for (const c of await self.clients.matchAll({ type: "window" })) c.navigate(c.url).catch(() => {});
           })()));
-          self.addEventListener("fetch", (e) => {
-            const req = e.request;
-            const url = new URL(req.url);
-            if (req.method !== "GET" || url.origin !== location.origin) return;
-            const keep = (key, res) => {
-              if (res.ok && !res.redirected) { const copy = res.clone(); e.waitUntil(caches.open(CACHE).then((c) => c.put(key, copy)).catch(() => {})); }
-              return res;
-            };
-            if (req.mode === "navigate") {
-              const page = url.origin + url.pathname; // no query: pairing links stay out of the cache
-              // Only a top-level page falls back to the app shell; the Mermaid iframe must not boot the app.
-              const cached = async () => (await caches.match(page)) || (req.destination === "iframe" ? undefined : await caches.match(shell));
-              const network = fetch(req).then((res) => keep(page, res));
-              e.waitUntil(network.catch(() => {})); // keeps the worker alive to cache it after a fallback
-              // A slow or captive network falls back to the cached app after 4 s.
-              const slow = new Promise((r) => setTimeout(r, 4000)).then(cached);
-              e.respondWith(Promise.race([network, slow.then((hit) => hit || network)])
-                .catch(async () => (await cached()) || Response.error()));
-            } else if (url.pathname.includes("/_expo/static/") || /\.(png|ico|ttf|woff2?)$/.test(url.pathname)) {
-              e.respondWith(caches.match(req).then((hit) => hit || fetch(req).then((res) => keep(req, res))));
-            }
-          });
-          EOF
-          sed -i "s|__VERSION__|${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}|" sw.js
-          # CSP allows only 'self' scripts, so registration lives in its own file.
-          # Auto-update: check for a new deploy hourly and on every return to the app; once a
-          # new worker takes over, reload while the app is in the background so it is unseen.
-          cat > sw-register.js <<'EOF'
-          if ("serviceWorker" in navigator) addEventListener("load", async () => {
-            const hadWorker = !!navigator.serviceWorker.controller; // first install also fires controllerchange
-            const reg = await navigator.serviceWorker.register("__BASE__/sw.js", { scope: "__BASE__/" });
-            let stale = false;
-            navigator.serviceWorker.addEventListener("controllerchange", () => {
-              if (!hadWorker) return;
-              stale = true;
-              if (document.hidden) location.reload();
-            });
-            document.addEventListener("visibilitychange", () => {
-              if (document.hidden) { if (stale) location.reload(); } else reg.update().catch(() => {});
-            });
-            setInterval(() => reg.update().catch(() => {}), 60 * 60 * 1000);
-          });
-          EOF
-          sed -i "s|__BASE__|$BASE|g" sw-register.js
-          grep -q '</head>' index.html || { echo "::error::index.html has no </head>"; exit 1; }
-          sed -i "s|</head>|<script src=\"$BASE/sw-register.js\" defer></script>&|" index.html
+          SW
           # Pages has no SPA rewrites: unknown paths (deep links, reloads) get the app too.
           cp index.html 404.html
           touch .nojekyll
@@ -271,7 +215,7 @@ jobs:
           if [ -n "$BASE" ]; then mkdir -p "$root$(dirname "$BASE")"; ln -s "$dist" "$root$BASE"; else root="$dist"; fi
           python3 -m http.server 8080 --bind 127.0.0.1 --directory "$root" >/dev/null 2>&1 &
           sleep 1
-          paths="$BASE/ $BASE/sw.js $BASE/sw-register.js $BASE/logo.svg $BASE/pwa-icon-512.png"; [ -f "$dist/mermaid-runtime.html" ] && paths="$paths $BASE/mermaid-runtime.html"
+          paths="$BASE/ $BASE/sw.js $BASE/logo.svg $BASE/pwa-icon-512.png"; [ -f "$dist/mermaid-runtime.html" ] && paths="$paths $BASE/mermaid-runtime.html"
           for path in $paths; do
             code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:8080$path")
             [ "$code" = 200 ] || { echo "::error::$path answered $code"; exit 1; }

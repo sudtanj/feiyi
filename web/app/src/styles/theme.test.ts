@@ -12,13 +12,13 @@ describe("Typography scale", () => {
   it("names 14px as the default interface tier", () => {
     expect(FONT_SIZE).toEqual({
       code: 12,
-      content: 15,
+      content: 16,
       sm: 12,
       base: 14,
       lg: 16,
-      xl: 18,
+      xl: 20,
       "2xl": 20,
-      "3xl": 22,
+      "3xl": 26,
       "4xl": 26,
     });
   });
@@ -83,10 +83,10 @@ describe("Sidebar interaction surfaces", () => {
 describe("Built-in light theme", () => {
   it("preserves its authored aliases and terminal contrast through the semantic builder", () => {
     expect(lightTheme.colors).toMatchObject({
-      primary: "#18181b",
+      primary: "#181B1A",
       primaryForeground: "#fafafa",
-      destructiveForeground: "#ffffff",
-      successForeground: "#ffffff",
+      destructiveForeground: "#FBFBFA",
+      successForeground: "#FBFBFA",
       terminal: {
         black: "#1a1a1e",
         brightBlack: "#3f3f46",

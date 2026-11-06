@@ -22,7 +22,10 @@ pub fn workspace_id(cwd: &str) -> String {
 pub fn checkout(cwd: &str) -> Value {
     match crate::checkout::probe(cwd) {
         // Git variant of ProjectCheckoutLite; remoteUrl stays null to avoid a git spawn per snapshot.
-        Some((root, branch)) => json!({ "cwd": cwd, "isGit": true, "currentBranch": branch, "remoteUrl": null, "worktreeRoot": root.to_string_lossy(), "isPaseoOwnedWorktree": false, "mainRepoRoot": null }),
+        Some((root, branch)) => {
+            let (owned, main_repo_root) = crate::worktrees::checkout_fields(&root);
+            json!({ "cwd": cwd, "isGit": true, "currentBranch": branch, "remoteUrl": null, "worktreeRoot": root.to_string_lossy(), "isPaseoOwnedWorktree": owned, "mainRepoRoot": main_repo_root })
+        }
         None => json!({ "cwd": cwd, "isGit": false, "currentBranch": null, "remoteUrl": null, "worktreeRoot": null, "isPaseoOwnedWorktree": false, "mainRepoRoot": null }),
     }
 }

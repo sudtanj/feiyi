@@ -220,6 +220,7 @@ impl Manager {
         cmds_tx: mpsc::UnboundedSender<Cmd>,
     ) -> (Manager, mpsc::UnboundedReceiver<ProviderEvent>) {
         let (events_tx, events_rx) = mpsc::unbounded_channel();
+        crate::worktrees::set_home(&cfg.home);
         let store = Store::new(cfg.home.clone());
         let mut agents = HashMap::new();
         for rec in store.load_agents() {

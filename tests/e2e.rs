@@ -1214,6 +1214,20 @@ async fn worktree_workspace_create_list_and_guarded_archive() {
     assert_eq!(git(&dir, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(), "brave-fox");
     let id = workspace["id"].as_str().unwrap().to_string();
 
+    let main_root = std::fs::canonicalize(&repo).unwrap();
+    let r = rpc(&mut ws, json!({ "type": "checkout_status_request", "requestId": "s1", "cwd": dir.to_string_lossy() }), "checkout_status_response").await;
+    assert_eq!(r["isPaseoOwnedWorktree"], true, "{r}");
+    assert_eq!(std::fs::canonicalize(r["mainRepoRoot"].as_str().unwrap()).unwrap(), main_root, "{r}");
+    let r = rpc(&mut ws, json!({ "type": "checkout_status_request", "requestId": "s2", "cwd": cwd }), "checkout_status_response").await;
+    assert_eq!(r["isPaseoOwnedWorktree"], false, "{r}");
+    assert!(r["mainRepoRoot"].is_null(), "{r}");
+    let linked = d.dir.join("linked");
+    git(&repo, &["worktree", "add", "-q", "-b", "elsewhere", &linked.to_string_lossy()]);
+    let r = rpc(&mut ws, json!({ "type": "checkout_status_request", "requestId": "s3", "cwd": linked.to_string_lossy() }), "checkout_status_response").await;
+    assert_eq!(r["isPaseoOwnedWorktree"], false, "{r}");
+    assert_eq!(std::fs::canonicalize(r["mainRepoRoot"].as_str().unwrap()).unwrap(), main_root, "{r}");
+    git(&repo, &["worktree", "remove", &linked.to_string_lossy()]);
+
     let r = rpc(&mut ws, json!({ "type": "fetch_workspaces_request", "requestId": "w2" }), "fetch_workspaces_response").await;
     assert!(r["entries"].as_array().unwrap().iter().any(|e| e["id"] == id.as_str()), "{r}");
     let r = rpc(&mut ws, json!({ "type": "paseo_worktree_list_request", "requestId": "w3", "cwd": cwd }), "paseo_worktree_list_response").await;
@@ -1514,6 +1528,59 @@ async fn worktree_archive_succeeds_when_its_directory_was_deleted_by_hand() {
     assert!(r["worktrees"].as_array().unwrap().is_empty(), "{r}");
     let r = rpc(&mut ws, json!({ "type": "fetch_workspaces_request", "requestId": "w4" }), "fetch_workspaces_response").await;
     assert!(!r["entries"].as_array().unwrap().iter().any(|e| e["id"] == id.as_str()), "{r}");
+}
+
+#[tokio::test]
+async fn worktree_checks_out_a_pull_request_head_from_origin() {
+    let d = start("wtpr", None);
+    let remote = d.dir.join("remote.git");
+    std::fs::create_dir_all(&remote).unwrap();
+    git(&remote, &["init", "-q", "--bare", "-b", "main"]);
+    let repo = d.dir.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    git(&repo, &["config", "user.name", "Test"]);
+    std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-q", "-m", "initial"]);
+    git(&repo, &["remote", "add", "origin", &remote.to_string_lossy()]);
+    git(&repo, &["checkout", "-q", "-b", "scratch"]);
+    std::fs::write(repo.join("b.txt"), "from the pr\n").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-q", "-m", "pr work"]);
+    git(&repo, &["push", "-q", "origin", "HEAD:refs/pull/1/head"]);
+    git(&repo, &["checkout", "-q", "main"]);
+    git(&repo, &["branch", "-q", "-D", "scratch"]);
+    let cwd = repo.to_string_lossy().to_string();
+    let mut ws = connect(d.port).await;
+    hello(&mut ws, None).await;
+
+    let request = |id: &str, number: i64, ref_name: Option<&str>| {
+        let mut source = json!({ "kind": "worktree", "cwd": cwd, "action": "checkout", "checkoutSource": { "kind": "change_request", "forge": "github", "number": number } });
+        if let Some(name) = ref_name {
+            source["refName"] = json!(name);
+        }
+        json!({ "type": "workspace.create.request", "requestId": id, "source": source })
+    };
+    let branch_of = |r: &Value| git(std::path::Path::new(r["workspace"]["workspaceDirectory"].as_str().unwrap()), &["rev-parse", "--abbrev-ref", "HEAD"]).trim().to_string();
+
+    let r = rpc(&mut ws, request("p1", 1, Some("feature/from-pr")), "workspace.create.response").await;
+    assert!(r["error"].is_null(), "{r}");
+    assert_eq!(branch_of(&r), "feature/from-pr");
+    let dir = std::path::PathBuf::from(r["workspace"]["workspaceDirectory"].as_str().unwrap());
+    assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "from the pr\n");
+
+    // The head branch name is taken, so the same PR lands on a numbered branch; no refName falls back to pr-<n>.
+    let r = rpc(&mut ws, request("p2", 1, Some("feature/from-pr")), "workspace.create.response").await;
+    assert_eq!(branch_of(&r), "feature/from-pr-2", "{r}");
+    let r = rpc(&mut ws, request("p3", 1, None), "workspace.create.response").await;
+    assert_eq!(branch_of(&r), "pr-1", "{r}");
+
+    let r = rpc(&mut ws, request("p4", 99, None), "workspace.create.response").await;
+    assert!(r["workspace"].is_null() && r["error"].as_str().unwrap().contains("Cannot fetch pull request 99"), "{r}");
+    let r = rpc(&mut ws, request("p5", 0, None), "workspace.create.response").await;
+    assert!(r["workspace"].is_null() && r["error"].as_str().unwrap().contains("positive integer"), "{r}");
 }
 
 #[tokio::test]

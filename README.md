@@ -122,14 +122,15 @@ feiyi speaks Paseo's core WebSocket protocol subset with the upstream message na
   polls the file once a second while it is subscribed (up to 32 per connection) and stops on unsubscribe or disconnect.
 
 - git worktrees: `workspace.create` with a `worktree` source (new branch cut from `refName`/`baseBranch` or the default
-  branch, or `action: "checkout"` of an existing branch), `create_paseo_worktree`, `paseo_worktree_list`,
+  branch, `action: "checkout"` of an existing branch, or of a GitHub pull request: `checkoutSource` / `githubPrNumber`
+  fetches `pull/<n>/head` from `origin` into a branch named after the head branch, else `pr-<n>`), `create_paseo_worktree`, `paseo_worktree_list`,
   `paseo_worktree_archive`, and `create_agent` with a `worktree` target or `git.createWorktree`. Worktrees live in
   `<PASEO_LITE_HOME>/worktrees/<repo hash>/<slug>` (upstream: `~/.paseo/worktrees/...`) and show up in the workspace
   list as `worktree` workspaces. Archiving the last workspace of a worktree removes the directory with
   `git worktree remove`, but archives nothing when it holds uncommitted or ignored non-regenerable files or commits on a
   detached HEAD: the app gets the reason. The branch always stays. `PASEO_DELETE_PROJECT_FILES=never` keeps the
-  directory, `all` removes it with `--force`. Not supported: checking out a pull request into a worktree, setup
-  scripts (`paseo.json`), and the worktree fields of `checkout_status`.
+  directory, `all` removes it with `--force`. `checkout_status` reports `isPaseoOwnedWorktree` and `mainRepoRoot`. Not supported: setup
+  scripts (`paseo.json`).
 
 - terminals: `create_terminal`, `list_terminals`, `subscribe_terminals` (live list), `subscribe_terminal` /
   `unsubscribe_terminal`, `terminal_input` (input, resize), `kill_terminal`, `terminal.rename`, with upstream's

@@ -114,6 +114,7 @@ pub struct WorkspaceRecord {
     pub main_repo_root: Option<String>,
 }
 
+#[derive(Clone)]
 pub struct Store {
     root: PathBuf,
 }
@@ -196,8 +197,18 @@ impl Store {
     }
 
     pub fn load_timeline(&self, agent_id: &str) -> Vec<Row> {
+        let (rows, lines) = self.read_timeline(agent_id);
+        if lines > 64 && lines > rows.len() * 2 {
+            self.rewrite_timeline(agent_id, &rows);
+        }
+        rows
+    }
+
+    /// The rows and the line count of the file. It never writes, so it is safe
+    /// off the manager task (a rewrite there could clobber rows appended meanwhile).
+    pub fn read_timeline(&self, agent_id: &str) -> (Vec<Row>, usize) {
         let path = self.timeline_path(agent_id);
-        let Ok(file) = std::fs::File::open(&path) else { return Vec::new() };
+        let Ok(file) = std::fs::File::open(&path) else { return (Vec::new(), 0) };
         let mut rows: BTreeMap<u64, Row> = BTreeMap::new();
         let mut lines = 0usize;
         for line in std::io::BufReader::new(file).lines() {
@@ -207,11 +218,7 @@ impl Store {
                 rows.insert(row.seq_start, row);
             }
         }
-        let rows: Vec<Row> = rows.into_values().collect();
-        if lines > 64 && lines > rows.len() * 2 {
-            self.rewrite_timeline(agent_id, &rows);
-        }
-        rows
+        (rows.into_values().collect(), lines)
     }
 
     fn rewrite_timeline(&self, agent_id: &str, rows: &[Row]) {

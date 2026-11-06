@@ -601,6 +601,41 @@ async fn interrupted_turn_resumes_after_hard_kill() {
     assert!(texts.iter().any(|t| t.contains("restarted")), "{texts:?}");
 }
 
+/// An unloaded timeline is read from disk off the manager task; fetching it
+/// and listing its prompts must still answer with the saved rows.
+#[tokio::test]
+async fn cold_timeline_answers_fetch_and_list_prompts() {
+    let d = start_with(unique_dir("cold"), None, "ok", &[("PASEO_TIMELINE_UNLOAD_SECS", "1")]);
+    let cwd = d.dir.join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let mut ws = connect(d.port).await;
+    hello(&mut ws, None).await;
+    send(
+        &mut ws,
+        session(json!({ "type": "create_agent_request", "requestId": "k1", "config": { "provider": "claude", "cwd": cwd.to_string_lossy(), "modeId": "bypassPermissions" }, "initialPrompt": "say hi" })),
+    )
+    .await;
+    let agent_id = recv_until(&mut ws, |v| {
+        let p = &v["message"]["payload"];
+        (v["message"]["type"] == "status" && p["status"] == "agent_created").then(|| p["agentId"].as_str().unwrap().to_string())
+    })
+    .await;
+    recv_until(&mut ws, |v| (v["message"]["type"] == "agent_stream" && v["message"]["payload"]["event"]["type"] == "turn_completed").then_some(())).await;
+
+    // Housekeeping ticks every 2 s and unloads idle timelines older than the limit.
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    let tl = rpc(&mut ws, json!({ "type": "fetch_agent_timeline_request", "requestId": "k2", "agentId": agent_id, "direction": "tail", "limit": 50 }), "fetch_agent_timeline_response").await;
+    assert!(tl["error"].is_null(), "{tl}");
+    let items: Vec<&str> = tl["entries"].as_array().unwrap().iter().map(|e| e["item"]["type"].as_str().unwrap()).collect();
+    assert!(items.contains(&"user_message") && items.contains(&"assistant_message"), "{items:?}");
+
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    let prompts = rpc(&mut ws, json!({ "type": "agent.timeline.list_prompts.request", "requestId": "k3", "agentId": agent_id }), "agent.timeline.list_prompts.response").await;
+    assert!(prompts["error"].is_null(), "{prompts}");
+    let previews: Vec<&str> = prompts["prompts"].as_array().unwrap().iter().map(|p| p["preview"].as_str().unwrap()).collect();
+    assert_eq!(previews, ["say hi"], "{prompts}");
+}
+
 /// An app that was in the background catches up with `direction: "after"`.
 /// A tool call row is created "running" and later updated in place to
 /// "completed": catching up from a cursor at its start must return the update.

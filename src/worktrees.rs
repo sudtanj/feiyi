@@ -161,6 +161,7 @@ pub(crate) fn owned_root(home: &Path, dir: &str) -> Option<PathBuf> {
 static HOME: OnceLock<PathBuf> = OnceLock::new();
 
 /// Where the descriptor and status builders, which have no manager at hand, find feiyi's worktrees.
+/// The first call wins.
 pub(crate) fn set_home(home: &Path) {
     let _ = HOME.set(home.to_path_buf());
 }
@@ -267,14 +268,15 @@ async fn plan_checkout(repo: &Path, spec: &Spec) -> Result<Plan, Fail> {
     Ok(Plan { new_branch: None, start: name.clone(), branch: name })
 }
 
-/// Fetch the head of pull request `number` from origin into a new local branch,
-/// named after the PR's head branch (`refName`) when that is a usable name, else `pr-<number>`.
+/// Fetch the head of pull request `number` from origin and plan a new local branch at it, created
+/// together with the worktree so a failed add leaves nothing behind. The branch is named after the PR's head branch (`refName`) when that is a usable name, else `pr-<number>`.
 async fn plan_pull_request(repo: &Path, spec: &Spec, number: u64) -> Result<Plan, Fail> {
     let wanted = spec.ref_name.clone().unwrap_or_default();
     let name = if check_branch_name(repo, &wanted).await.is_ok() { wanted } else { format!("pr-{number}") };
     let branch = unique_branch(repo, &name).await?;
-    git(repo, &["fetch", "origin", &format!("pull/{number}/head:{branch}")]).await.map_err(|e| fail("unknown", format!("Cannot fetch pull request {number}: {e}")))?;
-    Ok(Plan { new_branch: None, start: branch.clone(), branch })
+    git(repo, &["fetch", "origin", &format!("pull/{number}/head")]).await.map_err(|e| fail("unknown", format!("Cannot fetch pull request {number}: {e}")))?;
+    let head = git(repo, &["rev-parse", "FETCH_HEAD"]).await.map_err(|e| fail("unknown", e))?;
+    Ok(Plan { new_branch: Some(branch.clone()), start: head.trim().to_string(), branch })
 }
 
 async fn create(home: &Path, spec: &Spec) -> Result<Created, Fail> {

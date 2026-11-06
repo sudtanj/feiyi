@@ -67,6 +67,18 @@ pub fn probe(cwd: &str) -> Option<(PathBuf, Option<String>)> {
     None
 }
 
+/// The main checkout when `root` is a linked worktree (its `.git` file points into `<main>/.git/worktrees/<name>`).
+pub(crate) fn linked_main_root(root: &Path) -> Option<PathBuf> {
+    let pointer = std::fs::read_to_string(root.join(".git")).ok()?;
+    let git_dir = root.join(pointer.strip_prefix("gitdir: ")?.trim());
+    let worktrees = git_dir.parent()?;
+    let common = worktrees.parent()?;
+    if worktrees.file_name()? != "worktrees" || common.file_name()? != ".git" {
+        return None;
+    }
+    common.parent().map(Path::to_path_buf)
+}
+
 /// Default branch name ("main"), as upstream resolves it.
 pub(crate) async fn default_branch(cwd: &Path) -> Option<String> {
     if let Some(r) = git_ok(cwd, &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"]).await {
@@ -125,9 +137,10 @@ pub async fn status(cwd: &str, request_id: &str) -> Value {
         None => None,
     };
     let remote_url = git_ok(&dir, &["remote", "get-url", "origin"]).await;
+    let (owned, main_repo_root) = crate::worktrees::checkout_fields(Path::new(&repo_root));
     json!({
         "cwd": cwd, "error": null, "requestId": request_id, "upstreamRef": upstream,
-        "isGit": true, "isPaseoOwnedWorktree": false, "repoRoot": repo_root, "mainRepoRoot": null,
+        "isGit": true, "isPaseoOwnedWorktree": owned, "repoRoot": repo_root, "mainRepoRoot": main_repo_root,
         "currentBranch": branch, "isDirty": dirty, "baseRef": base, "aheadBehind": ahead_behind,
         "aheadOfOrigin": ahead_origin, "behindOfOrigin": behind_origin,
         "hasRemote": remote_url.is_some(), "remoteUrl": remote_url,

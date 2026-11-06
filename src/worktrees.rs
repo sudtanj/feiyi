@@ -18,6 +18,7 @@ use crate::terminal;
 use crate::util::{new_id, now_iso};
 use serde_json::{json, Value};
 use std::path::{Component, Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -45,7 +46,7 @@ pub(crate) struct Spec {
     ref_name: Option<String>,
     branch: Option<String>,
     slug: Option<String>,
-    pull_request: bool,
+    pull_request: Option<Result<u64, &'static str>>,
 }
 
 struct Created {
@@ -64,8 +65,18 @@ fn text(v: &Value, key: &str) -> Option<String> {
     s(v, key).map(|t| t.trim().to_string()).filter(|t| !t.is_empty())
 }
 
-fn present(v: &Value, key: &str) -> bool {
-    v.get(key).is_some_and(|x| !x.is_null())
+/// The pull request asked for, from `checkoutSource` (`{ kind: "change_request", forge, number }`)
+/// or the legacy `githubPrNumber` / `prNumber`; None when the request names none.
+fn pull_request(v: &Value) -> Option<Result<u64, &'static str>> {
+    let source = v.get("checkoutSource").filter(|c| !c.is_null());
+    if source.is_some_and(|c| s(c, "forge").is_some_and(|f| f != "github")) {
+        return Some(Err("feiyi can only check out GitHub pull requests"));
+    }
+    let number = source.and_then(|c| c.get("number")).or_else(|| v.get("githubPrNumber")).or_else(|| v.get("prNumber")).filter(|n| !n.is_null());
+    match number {
+        Some(n) => Some(n.as_u64().filter(|n| *n > 0).ok_or("Pull request number must be a positive integer")),
+        None => source.map(|_| Err("checkoutSource needs a pull request number")),
+    }
 }
 
 impl Spec {
@@ -77,7 +88,7 @@ impl Spec {
             ref_name: text(v, "refName").or_else(|| text(v, "baseBranch")),
             branch: text(v, "branchName"),
             slug: text(v, "worktreeSlug"),
-            pull_request: present(v, "checkoutSource") || present(v, "githubPrNumber"),
+            pull_request: pull_request(v),
         }
     }
 }
@@ -94,7 +105,7 @@ pub(crate) fn agent_spec(msg: &Value, cwd: &str) -> Option<Spec> {
             ref_name: text(target, "base").or_else(|| text(target, "branch")),
             branch: text(target, "newBranch"),
             slug: name,
-            pull_request: mode == "checkout-pr",
+            pull_request: (mode == "checkout-pr").then(|| pull_request(target).unwrap_or(Err("checkout-pr needs a pull request number"))),
         });
     }
     let opts = msg.get("git").filter(|g| g.get("createWorktree").and_then(|c| c.as_bool()) == Some(true))?;
@@ -145,6 +156,22 @@ pub(crate) fn owned_root(home: &Path, dir: &str) -> Option<PathBuf> {
     let mut parts = rel.components();
     let (hash, slug) = (parts.next()?, parts.next()?);
     Some(base.join(hash.as_os_str()).join(slug.as_os_str()))
+}
+
+static HOME: OnceLock<PathBuf> = OnceLock::new();
+
+/// Where the descriptor and status builders, which have no manager at hand, find feiyi's worktrees.
+/// The first call wins.
+pub(crate) fn set_home(home: &Path) {
+    let _ = HOME.set(home.to_path_buf());
+}
+
+/// The checkout fields of `ProjectCheckout` a worktree root adds: `(isPaseoOwnedWorktree, mainRepoRoot)`.
+/// `mainRepoRoot` is set for any linked worktree and read from its `.git` file, so no git is spawned.
+pub(crate) fn checkout_fields(root: &Path) -> (bool, Option<String>) {
+    let main = crate::checkout::linked_main_root(root);
+    let owned = main.is_some() && HOME.get().is_some_and(|home| owned_root(home, &root.to_string_lossy()).is_some());
+    (owned, main.map(|m| m.to_string_lossy().into_owned()))
 }
 
 struct Entry {
@@ -241,10 +268,18 @@ async fn plan_checkout(repo: &Path, spec: &Spec) -> Result<Plan, Fail> {
     Ok(Plan { new_branch: None, start: name.clone(), branch: name })
 }
 
+/// Fetch the head of pull request `number` from origin and plan a new local branch at it, created
+/// together with the worktree so a failed add leaves nothing behind. The branch is named after the PR's head branch (`refName`) when that is a usable name, else `pr-<number>`.
+async fn plan_pull_request(repo: &Path, spec: &Spec, number: u64) -> Result<Plan, Fail> {
+    let wanted = spec.ref_name.clone().unwrap_or_default();
+    let name = if check_branch_name(repo, &wanted).await.is_ok() { wanted } else { format!("pr-{number}") };
+    let branch = unique_branch(repo, &name).await?;
+    git(repo, &["fetch", "origin", &format!("pull/{number}/head")]).await.map_err(|e| fail("unknown", format!("Cannot fetch pull request {number}: {e}")))?;
+    let head = git(repo, &["rev-parse", "FETCH_HEAD"]).await.map_err(|e| fail("unknown", e))?;
+    Ok(Plan { new_branch: Some(branch.clone()), start: head.trim().to_string(), branch })
+}
+
 async fn create(home: &Path, spec: &Spec) -> Result<Created, Fail> {
-    if spec.pull_request {
-        return Err(fail("unknown", "feiyi cannot check out a pull request into a worktree; pick a branch instead"));
-    }
     let dir = normalize_dir(&spec.cwd).map_err(|e| fail("unknown", format!("Directory not found: {e}")))?;
     let repo = repo_root(Path::new(&dir)).await?;
     let seed = match (&spec.slug, &spec.branch, &spec.ref_name) {
@@ -256,7 +291,13 @@ async fn create(home: &Path, spec: &Spec) -> Result<Created, Fail> {
     if let Some(e) = branch_slug_error(&slug) {
         return Err(fail("unknown", format!("Invalid worktree name: {e}")));
     }
-    let plan = if spec.checkout { plan_checkout(&repo, spec).await? } else { plan_branch_off(&repo, spec, &slug).await? };
+    let plan = if let Some(number) = spec.pull_request {
+        plan_pull_request(&repo, spec, number.map_err(|e| fail("unknown", e))?).await?
+    } else if spec.checkout {
+        plan_checkout(&repo, spec).await?
+    } else {
+        plan_branch_off(&repo, spec, &slug).await?
+    };
 
     let parent = home.join("worktrees").join(repo_hash(&repo));
     std::fs::create_dir_all(&parent).map_err(|e| fail("unknown", format!("Cannot create {}: {e}", parent.display())))?;
@@ -538,7 +579,7 @@ mod tests {
     fn agent_options_map_to_a_spec() {
         let msg = json!({ "worktreeName": "my-slug", "worktree": { "mode": "branch-off", "newBranch": "feat/x", "base": "main" } });
         let spec = agent_spec(&msg, "/repo").unwrap();
-        assert!(!spec.checkout && !spec.pull_request);
+        assert!(!spec.checkout && spec.pull_request.is_none());
         assert_eq!((spec.branch.as_deref(), spec.ref_name.as_deref(), spec.slug.as_deref()), (Some("feat/x"), Some("main"), Some("my-slug")));
         let msg = json!({ "git": { "createWorktree": true, "action": "checkout", "refName": "dev" } });
         let spec = agent_spec(&msg, "/repo").unwrap();
@@ -546,7 +587,21 @@ mod tests {
         assert_eq!(spec.ref_name.as_deref(), Some("dev"));
         assert!(agent_spec(&json!({ "git": { "createWorktree": false } }), "/repo").is_none());
         assert!(agent_spec(&json!({ "worktree": null }), "/repo").is_none());
-        assert!(agent_spec(&json!({ "worktree": { "mode": "checkout-pr", "prNumber": 3 } }), "/repo").unwrap().pull_request);
+        assert_eq!(agent_spec(&json!({ "worktree": { "mode": "checkout-pr", "prNumber": 3 } }), "/repo").unwrap().pull_request, Some(Ok(3)));
+        assert!(matches!(agent_spec(&json!({ "worktree": { "mode": "checkout-pr" } }), "/repo").unwrap().pull_request, Some(Err(_))));
+    }
+
+    #[test]
+    fn pull_request_sources() {
+        let of = |v: Value| Spec::from_request(&v).pull_request;
+        assert_eq!(of(json!({ "checkoutSource": { "kind": "change_request", "forge": "github", "number": 7 } })), Some(Ok(7)));
+        assert_eq!(of(json!({ "githubPrNumber": 8 })), Some(Ok(8)));
+        assert!(matches!(of(json!({ "githubPrNumber": 0 })), Some(Err(_))));
+        assert!(matches!(of(json!({ "githubPrNumber": -1 })), Some(Err(_))));
+        assert!(matches!(of(json!({ "githubPrNumber": "3" })), Some(Err(_))));
+        assert!(matches!(of(json!({ "checkoutSource": { "forge": "gitlab", "number": 1 } })), Some(Err(_))));
+        assert!(matches!(of(json!({ "checkoutSource": { "kind": "change_request" } })), Some(Err(_))));
+        assert_eq!(of(json!({ "action": "checkout", "refName": "main" })), None);
     }
 
     #[test]

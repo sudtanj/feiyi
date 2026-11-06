@@ -636,6 +636,145 @@ async fn cold_timeline_answers_fetch_and_list_prompts() {
     assert_eq!(previews, ["say hi"], "{prompts}");
 }
 
+/// Create an agent, let its first turn finish, and wait until housekeeping has
+/// unloaded its timeline (PASEO_TIMELINE_UNLOAD_SECS=1, tick every 2 s).
+async fn cold_agent(ws: &mut Ws, cwd: &std::path::Path) -> String {
+    send(
+        ws,
+        session(json!({ "type": "create_agent_request", "requestId": "c1", "config": { "provider": "claude", "cwd": cwd.to_string_lossy(), "modeId": "bypassPermissions" }, "initialPrompt": "say hi" })),
+    )
+    .await;
+    let agent_id = recv_until(ws, |v| {
+        let p = &v["message"]["payload"];
+        (v["message"]["type"] == "status" && p["status"] == "agent_created").then(|| p["agentId"].as_str().unwrap().to_string())
+    })
+    .await;
+    recv_until(ws, |v| (v["message"]["type"] == "agent_stream" && v["message"]["payload"]["event"]["type"] == "turn_completed").then_some(())).await;
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    agent_id
+}
+
+/// Several cold requests for one agent, sent back to back with a ping among
+/// them: each gets exactly one response, the same rows a warm fetch returns,
+/// and the manager answers the ping without waiting for the disk read.
+#[tokio::test]
+async fn concurrent_cold_requests_each_get_one_correct_response() {
+    let d = start_with(unique_dir("coldmany"), None, "ok", &[("PASEO_TIMELINE_UNLOAD_SECS", "1")]);
+    let cwd = d.dir.join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let mut ws = connect(d.port).await;
+    hello(&mut ws, None).await;
+    let agent_id = cold_agent(&mut ws, &cwd).await;
+
+    for i in 0..3 {
+        send(&mut ws, session(json!({ "type": "fetch_agent_timeline_request", "requestId": format!("f{i}"), "agentId": agent_id, "direction": "tail", "limit": 50 }))).await;
+        send(&mut ws, session(json!({ "type": "agent.timeline.list_prompts.request", "requestId": format!("l{i}"), "agentId": agent_id }))).await;
+    }
+    send(&mut ws, session(json!({ "type": "ping", "requestId": "pp", "clientSentAt": 1 }))).await;
+
+    let mut seen: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+    let mut pong = false;
+    while seen.len() < 6 || !pong {
+        let v = recv(&mut ws).await;
+        let m = &v["message"];
+        let ty = m["type"].as_str().unwrap_or("");
+        if ty == "pong" {
+            assert_eq!(m["payload"]["requestId"], "pp", "{m}");
+            pong = true;
+        } else if ty == "fetch_agent_timeline_response" || ty == "agent.timeline.list_prompts.response" {
+            let rid = m["payload"]["requestId"].as_str().unwrap().to_string();
+            assert!(seen.insert(rid.clone(), m["payload"].clone()).is_none(), "duplicate response for {rid}");
+        }
+    }
+    // A late duplicate would show up as one more response to a request already answered.
+    let warm = rpc(&mut ws, json!({ "type": "fetch_agent_timeline_request", "requestId": "w", "agentId": agent_id, "direction": "tail", "limit": 50 }), "fetch_agent_timeline_response").await;
+    let rows = |p: &Value| -> Vec<(u64, u64, String)> {
+        p["entries"].as_array().unwrap().iter().map(|e| (e["seqStart"].as_u64().unwrap(), e["seqEnd"].as_u64().unwrap(), e["item"]["type"].as_str().unwrap().to_string())).collect()
+    };
+    let expected = rows(&warm);
+    assert!(expected.len() >= 2, "{warm}");
+    for i in 0..3 {
+        let f = &seen[&format!("f{i}")];
+        assert!(f["error"].is_null(), "{f}");
+        assert_eq!(rows(f), expected, "{f}");
+        assert_eq!(f["window"], warm["window"], "{f}");
+        let l = &seen[&format!("l{i}")];
+        assert!(l["error"].is_null(), "{l}");
+        let previews: Vec<&str> = l["prompts"].as_array().unwrap().iter().map(|p| p["preview"].as_str().unwrap()).collect();
+        assert_eq!(previews, ["say hi"], "{l}");
+    }
+    let seqs: Vec<u64> = expected.iter().map(|r| r.0).collect();
+    assert!(seqs.windows(2).all(|w| w[0] < w[1]), "{seqs:?}");
+}
+
+/// A turn started after a cold load appends rows with seq continuing from the
+/// saved ones: nothing is overwritten and nothing collides, in memory or on disk.
+#[tokio::test]
+async fn new_turn_after_a_cold_load_continues_the_seq() {
+    let d = start_with(unique_dir("coldseq"), None, "ok", &[("PASEO_TIMELINE_UNLOAD_SECS", "1")]);
+    let cwd = d.dir.join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let mut ws = connect(d.port).await;
+    hello(&mut ws, None).await;
+    let agent_id = cold_agent(&mut ws, &cwd).await;
+
+    let fetch = |rid: &'static str| json!({ "type": "fetch_agent_timeline_request", "requestId": rid, "agentId": agent_id, "direction": "tail", "limit": 50 });
+    let before = rpc(&mut ws, fetch("s1"), "fetch_agent_timeline_response").await;
+    let old: Vec<(u64, u64)> = before["entries"].as_array().unwrap().iter().map(|e| (e["seqStart"].as_u64().unwrap(), e["seqEnd"].as_u64().unwrap())).collect();
+    let next_before = before["window"]["nextSeq"].as_u64().unwrap();
+    assert!(!old.is_empty() && old.iter().all(|r| r.1 < next_before), "{before}");
+
+    send(&mut ws, session(json!({ "type": "send_agent_message_request", "requestId": "m1", "agentId": agent_id, "text": "and again" }))).await;
+    recv_until(&mut ws, |v| (v["message"]["type"] == "agent_stream" && v["message"]["payload"]["event"]["type"] == "turn_completed").then_some(())).await;
+
+    let after = rpc(&mut ws, fetch("s2"), "fetch_agent_timeline_response").await;
+    let rows: Vec<(u64, u64, String)> = after["entries"].as_array().unwrap().iter().map(|e| (e["seqStart"].as_u64().unwrap(), e["seqEnd"].as_u64().unwrap(), e["item"]["type"].as_str().unwrap().to_string())).collect();
+    assert_eq!(&rows[..old.len()].iter().map(|r| (r.0, r.1)).collect::<Vec<_>>(), &old, "saved rows changed: {after}");
+    let new = &rows[old.len()..];
+    assert!(new.iter().any(|r| r.2 == "user_message") && new.iter().any(|r| r.2 == "assistant_message"), "{rows:?}");
+    assert!(new.iter().all(|r| r.0 >= next_before), "new rows reuse old seqs: {rows:?}");
+    let starts: Vec<u64> = rows.iter().map(|r| r.0).collect();
+    assert!(starts.windows(2).all(|w| w[0] < w[1]), "{starts:?}");
+    let prompts = rpc(&mut ws, json!({ "type": "agent.timeline.list_prompts.request", "requestId": "s3", "agentId": agent_id }), "agent.timeline.list_prompts.response").await;
+    let previews: Vec<&str> = prompts["prompts"].as_array().unwrap().iter().map(|p| p["preview"].as_str().unwrap()).collect();
+    assert_eq!(previews, ["say hi", "and again"], "{prompts}");
+}
+
+/// Unknown agents fail the same way whether or not the cold path is involved.
+#[tokio::test]
+async fn timeline_requests_for_an_unknown_agent_report_not_found() {
+    let d = start("coldnone", None);
+    let mut ws = connect(d.port).await;
+    hello(&mut ws, None).await;
+    let tl = rpc(&mut ws, json!({ "type": "fetch_agent_timeline_request", "requestId": "n1", "agentId": "no-such-agent", "direction": "tail", "limit": 50 }), "fetch_agent_timeline_response").await;
+    assert_eq!(tl["error"], "agent not found", "{tl}");
+    assert_eq!(tl["requestId"], "n1");
+    assert!(tl["entries"].as_array().unwrap().is_empty(), "{tl}");
+    let pr = rpc(&mut ws, json!({ "type": "agent.timeline.list_prompts.request", "requestId": "n2", "agentId": "no-such-agent" }), "agent.timeline.list_prompts.response").await;
+    assert_eq!(pr["error"], "agent not found", "{pr}");
+    assert!(pr["prompts"].as_array().unwrap().is_empty(), "{pr}");
+}
+
+/// The first thing to touch a cold agent is a new prompt, not a fetch: its
+/// rows must still continue after the saved ones.
+#[tokio::test]
+async fn prompt_to_a_cold_agent_then_fetch_keeps_every_row() {
+    let d = start_with(unique_dir("coldprompt"), None, "ok", &[("PASEO_TIMELINE_UNLOAD_SECS", "1")]);
+    let cwd = d.dir.join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let mut ws = connect(d.port).await;
+    hello(&mut ws, None).await;
+    let agent_id = cold_agent(&mut ws, &cwd).await;
+    send(&mut ws, session(json!({ "type": "send_agent_message_request", "requestId": "m1", "agentId": agent_id, "text": "second" }))).await;
+    recv_until(&mut ws, |v| (v["message"]["type"] == "agent_stream" && v["message"]["payload"]["event"]["type"] == "turn_completed").then_some(())).await;
+    let tl = rpc(&mut ws, json!({ "type": "fetch_agent_timeline_request", "requestId": "q1", "agentId": agent_id, "direction": "tail", "limit": 50 }), "fetch_agent_timeline_response").await;
+    let entries = tl["entries"].as_array().unwrap();
+    let users: Vec<&str> = entries.iter().filter(|e| e["item"]["type"] == "user_message").map(|e| e["item"]["text"].as_str().unwrap()).collect();
+    assert_eq!(users, ["say hi", "second"], "{tl}");
+    let starts: Vec<u64> = entries.iter().map(|e| e["seqStart"].as_u64().unwrap()).collect();
+    assert!(starts.windows(2).all(|w| w[0] < w[1]), "{starts:?}");
+}
+
 /// An app that was in the background catches up with `direction: "after"`.
 /// A tool call row is created "running" and later updated in place to
 /// "completed": catching up from a cursor at its start must return the update.

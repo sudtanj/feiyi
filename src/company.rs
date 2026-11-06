@@ -12,7 +12,7 @@
 use serde_json::{json, Map, Value};
 use std::path::{Path, PathBuf};
 
-const SHARED: &str = "You are part of a one-person company, working for the lead who briefed you. The user is not watching: do not ask questions, make the sensible call and say which. Finish the whole brief. Before writing prose, code or UI, load the matching skill (feiyi-anti-slop-writing, feiyi-anti-slop-code, feiyi-anti-slop-ui). Use feiyi-systematic-debugging for bugs and feiyi-verification-before-completion before you claim anything is done. Report tersely: done / evidence / not verified / risks.";
+const SHARED: &str = "You are part of a one-person company, working for the lead who briefed you. The user is not watching: do not ask questions, make the sensible call and say which. Finish the whole brief. Before writing prose, code or UI, load the matching skill (feiyi-anti-slop-writing, feiyi-anti-slop-code, feiyi-anti-slop-ui). Use feiyi-systematic-debugging for bugs, feiyi-reverse-engineering to work out how a binary, app, APK or capture works, and feiyi-verification-before-completion before you claim anything is done. Report tersely: done / evidence / not verified / risks.";
 
 /// Built-in skills, adapted from MIT anti-slop skills (sources in each file).
 const SKILLS: &[(&str, &str)] = &[
@@ -21,6 +21,7 @@ const SKILLS: &[(&str, &str)] = &[
     ("anti-slop-ui", include_str!("../skills/anti-slop-ui/SKILL.md")),
     ("verification-before-completion", include_str!("../skills/verification-before-completion/SKILL.md")),
     ("systematic-debugging", include_str!("../skills/systematic-debugging/SKILL.md")),
+    ("reverse-engineering", include_str!("../skills/reverse-engineering/SKILL.md")),
 ];
 
 // Prompts paraphrase role files from msitarzewski/agency-agents (MIT).

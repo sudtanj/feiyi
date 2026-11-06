@@ -460,7 +460,14 @@ async fn agent_turn_with_fake_claude() {
         (m["type"] == "clear_agent_attention_response").then(|| m["payload"].clone())
     })
     .await;
-    assert!(updated, "no agent_update before the response");
+    // The update rides the broadcast channel and the response the connection's own, so either can arrive first.
+    if !updated {
+        recv_until(&mut ws, |v| {
+            let m = &v["message"];
+            (m["type"] == "agent_update" && m["payload"]["kind"] == "upsert" && m["payload"]["agent"]["id"] == agent_id && m["payload"]["agent"]["requiresAttention"] == false).then_some(())
+        })
+        .await;
+    }
     assert_eq!(cleared["requestId"], "c1", "{cleared}");
     assert_eq!(cleared["agents"].as_array().unwrap().len(), 1, "{cleared}");
     assert_eq!(cleared["agents"][0]["id"], agent_id, "{cleared}");

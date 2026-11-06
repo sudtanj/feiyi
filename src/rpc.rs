@@ -155,6 +155,7 @@ impl Manager {
                     Some(Value::String(one)) => vec![one.clone()],
                     _ => vec![],
                 };
+                let mut agents = Vec::new();
                 for key in ids {
                     if let Some(id) = self.resolve(&key) {
                         if let Some(a) = self.agents.get_mut(&id) {
@@ -163,10 +164,13 @@ impl Manager {
                         }
                         self.agents_dirty = true;
                         self.publish_agent(&id);
+                        if let Some(a) = self.agents.get(&id) {
+                            agents.push(a.snapshot());
+                        }
                     }
                 }
                 if request_id.is_some() {
-                    reply(out, json!({ "type": "clear_agent_attention_response", "payload": { "requestId": rid, "agentId": msg.get("agentId").cloned().unwrap_or(Value::Null), "ok": true } }));
+                    reply(out, json!({ "type": "clear_agent_attention_response", "payload": { "requestId": rid, "agentId": msg.get("agentId").cloned().unwrap_or(Value::Null), "agents": agents } }));
                 }
             }
             "fetch_agent_timeline_request" => self.fetch_timeline(&msg, &agent_key, &rid, out),

@@ -450,6 +450,29 @@ async fn agent_turn_with_fake_claude() {
     assert_eq!(mine["id"], "claude");
     assert_eq!(balance(&mine, "agent-tokens"), 110);
 
+    // Clearing attention answers with the agents' snapshots, as the app's schema requires,
+    // and still broadcasts the agent_update.
+    send(&mut ws, session(json!({ "type": "clear_agent_attention", "requestId": "c1", "agentId": [agent_id] }))).await;
+    let mut updated = false;
+    let cleared = recv_until(&mut ws, |v| {
+        let m = &v["message"];
+        updated |= m["type"] == "agent_update" && m["payload"]["kind"] == "upsert" && m["payload"]["agent"]["id"] == agent_id && m["payload"]["agent"]["requiresAttention"] == false;
+        (m["type"] == "clear_agent_attention_response").then(|| m["payload"].clone())
+    })
+    .await;
+    assert!(updated, "no agent_update before the response");
+    assert_eq!(cleared["requestId"], "c1", "{cleared}");
+    assert_eq!(cleared["agents"].as_array().unwrap().len(), 1, "{cleared}");
+    assert_eq!(cleared["agents"][0]["id"], agent_id, "{cleared}");
+    assert_eq!(cleared["agents"][0]["requiresAttention"], false, "{cleared}");
+    assert!(cleared["agents"][0]["attentionReason"].is_null(), "{cleared}");
+    let single = rpc(&mut ws, json!({ "type": "clear_agent_attention", "requestId": "c2", "agentId": agent_id }), "clear_agent_attention_response").await;
+    assert_eq!(single["agentId"], agent_id, "{single}");
+    assert_eq!(single["agents"][0]["id"], agent_id, "{single}");
+    let unknown = rpc(&mut ws, json!({ "type": "clear_agent_attention", "requestId": "c3", "agentId": "no-such-agent" }), "clear_agent_attention_response").await;
+    assert_eq!(unknown["agents"], json!([]), "{unknown}");
+    assert_eq!(unknown["requestId"], "c3", "{unknown}");
+
     // History lists the agent, and it can be archived.
     send(&mut ws, session(json!({ "type": "fetch_agent_history_request", "requestId": "h1" }))).await;
     let hist = recv_until(&mut ws, |v| (v["message"]["type"] == "fetch_agent_history_response").then(|| v["message"]["payload"].clone())).await;

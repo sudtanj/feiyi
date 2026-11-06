@@ -191,6 +191,7 @@ pub struct Manager {
     /// their envelopes) sent to the app by an order of magnitude.
     chunks: HashMap<String, (String, String)>,
     chunk_deadline: Option<Instant>,
+    last_trim: Instant,
 }
 
 /// A client blocked in `wait_for_finish_request` until the agent stops
@@ -242,7 +243,7 @@ impl Manager {
         if let crate::capacity::Mode::Fixed(n) = cfg.claude_max_live {
             claude.set_max_live(n);
         }
-        let mut manager = Manager { cfg, server_id, store, agents, claude, codex, active_cli: None, running: HashSet::new(), cli_queue: VecDeque::new(), capacity, claude_warm_at: None, codex_warm_at: None, bcast, events_tx, agents_dirty: false, pairing_url, projects, workspaces, cmds_tx, checkout: crate::checkout::Watcher::start(), started_at: now_iso(), waiters: Vec::new(), push_tokens, clients: Vec::new(), daemon_config, usage, schedules, chunks: HashMap::new(), chunk_deadline: None };
+        let mut manager = Manager { cfg, server_id, store, agents, claude, codex, active_cli: None, running: HashSet::new(), cli_queue: VecDeque::new(), capacity, claude_warm_at: None, codex_warm_at: None, bcast, events_tx, agents_dirty: false, pairing_url, projects, workspaces, cmds_tx, checkout: crate::checkout::Watcher::start(), started_at: now_iso(), waiters: Vec::new(), push_tokens, clients: Vec::new(), daemon_config, usage, schedules, chunks: HashMap::new(), chunk_deadline: None, last_trim: Instant::now() };
         manager.migrate_agent_workspaces();
         (manager, events_rx)
     }
@@ -327,8 +328,13 @@ impl Manager {
         self.codex.reap();
         self.update_capacity();
         #[cfg(unix)]
-        for file in crate::providers::trim_task_outputs() {
-            crate::warn!("emptied runaway background task output {} (over 256 MB)", file.display());
+        if self.last_trim.elapsed() >= Duration::from_secs(30) {
+            self.last_trim = Instant::now();
+            tokio::task::spawn_blocking(|| {
+                for file in crate::providers::trim_task_outputs() {
+                    crate::warn!("emptied runaway background task output {} (over 256 MB)", file.display());
+                }
+            });
         }
         self.keep_warm();
         self.run_retries_and_watchdog();
@@ -400,6 +406,22 @@ impl Manager {
             }
             _ => {}
         }
+    }
+
+    /// Read a cold agent's timeline off the manager task, install it unless
+    /// something loaded it meanwhile, then run `then`. Agents with dirty rows or
+    /// a running turn are kept resident, so a cold agent's file is current.
+    pub(crate) fn load_timeline_then(&self, id: &str, then: impl FnOnce(&mut Manager) + Send + 'static) {
+        let (store, id, cmds) = (self.store.clone(), id.to_string(), self.cmds_tx.clone());
+        tokio::task::spawn_blocking(move || {
+            let (rows, _) = store.read_timeline(&id);
+            let _ = cmds.send(Cmd::Run(Box::new(move |m: &mut Manager| {
+                if let Some(agent) = m.agents.get_mut(&id) {
+                    agent.install_timeline(rows);
+                }
+                then(m);
+            })));
+        });
     }
 
     pub fn flush_all(&mut self) {
@@ -1549,13 +1571,19 @@ impl Agent {
 
     pub fn ensure_timeline(&mut self, store: &Store) {
         if self.timeline.is_none() {
-            let rows = store.load_timeline(&self.rec.id);
-            if let Some(last) = rows.last() {
-                self.rec.next_seq = self.rec.next_seq.max(last.seq_end + 1);
-            }
-            self.timeline = Some(rows);
+            self.install_timeline(store.load_timeline(&self.rec.id));
         }
         self.last_touch = Instant::now();
+    }
+
+    fn install_timeline(&mut self, rows: Vec<Row>) {
+        if self.timeline.is_some() {
+            return;
+        }
+        if let Some(last) = rows.last() {
+            self.rec.next_seq = self.rec.next_seq.max(last.seq_end + 1);
+        }
+        self.timeline = Some(rows);
     }
 
     pub fn flush(&mut self, store: &Store) {

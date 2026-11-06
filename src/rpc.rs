@@ -591,6 +591,10 @@ impl Manager {
                 "window": { "minSeq": 0, "maxSeq": 0, "nextSeq": 0 }, "startCursor": null, "endCursor": null,
                 "hasOlder": false, "hasNewer": false, "entries": [], "error": "agent not found" } }));
         };
+        if self.agents[&id].timeline.is_none() {
+            let (msg, agent_key, rid, out) = (msg.clone(), agent_key.to_string(), rid.to_string(), out.clone());
+            return self.load_timeline_then(&id, move |m| m.fetch_timeline(&msg, &agent_key, &rid, &out));
+        }
         let store = &self.store;
         let agent = self.agents.get_mut(&id).expect("resolved");
         agent.ensure_timeline(store);

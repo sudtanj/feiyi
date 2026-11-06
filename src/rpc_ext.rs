@@ -330,6 +330,10 @@ impl Manager {
         let Some(id) = self.resolve(agent_key) else { return reply(out, not_found()) };
         let store = &self.store;
         let Some(a) = self.agents.get_mut(&id) else { return reply(out, not_found()) };
+        if a.timeline.is_none() {
+            let (agent_key, rid, out) = (agent_key.to_string(), rid.to_string(), out.clone());
+            return self.load_timeline_then(&id, move |m| m.list_prompts(&agent_key, &rid, &out));
+        }
         a.ensure_timeline(store);
         let prompts: Vec<Value> = a
             .timeline

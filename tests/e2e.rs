@@ -1584,6 +1584,86 @@ async fn worktree_checks_out_a_pull_request_head_from_origin() {
 }
 
 #[tokio::test]
+async fn pull_request_checkout_rejects_bad_input_cleanly_and_archive_keeps_the_branch() {
+    let d = start("wtpr2", None);
+    let remote = d.dir.join("remote.git");
+    std::fs::create_dir_all(&remote).unwrap();
+    git(&remote, &["init", "-q", "--bare", "-b", "main"]);
+    let repo = d.dir.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    git(&repo, &["config", "user.name", "Test"]);
+    std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-q", "-m", "initial"]);
+    git(&repo, &["remote", "add", "origin", &remote.to_string_lossy()]);
+    git(&repo, &["checkout", "-q", "-b", "taken"]);
+    std::fs::write(repo.join("b.txt"), "local work\n").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-q", "-m", "local work"]);
+    git(&repo, &["push", "-q", "origin", "HEAD:refs/pull/1/head"]);
+    git(&repo, &["checkout", "-q", "main"]);
+    let cwd = repo.to_string_lossy().to_string();
+    let mut ws = connect(d.port).await;
+    hello(&mut ws, None).await;
+
+    let request = |id: &str, checkout_source: Value, ref_name: Option<&str>| {
+        let mut source = json!({ "kind": "worktree", "cwd": cwd, "action": "checkout", "checkoutSource": checkout_source });
+        if let Some(name) = ref_name {
+            source["refName"] = json!(name);
+        }
+        json!({ "type": "workspace.create.request", "requestId": id, "source": source })
+    };
+    let github = |number: Value| json!({ "kind": "change_request", "forge": "github", "number": number });
+    let state = || (git(&repo, &["branch", "--format=%(refname:short)"]), git(&repo, &["worktree", "list", "--porcelain"]));
+    let before = state();
+
+    let r = rpc(&mut ws, request("f1", github(json!(99)), None), "workspace.create.response").await;
+    assert!(r["workspace"].is_null() && r["error"].as_str().unwrap().contains("Cannot fetch pull request 99"), "{r}");
+    assert_eq!(state(), before, "a failed fetch left a branch or worktree behind");
+
+    for (id, number) in [("n0", json!(0)), ("n1", json!(-1)), ("n2", json!("1")), ("n3", json!(1.5))] {
+        let r = rpc(&mut ws, request(id, github(number.clone()), None), "workspace.create.response").await;
+        assert!(r["workspace"].is_null() && r["error"].as_str().unwrap().contains("positive integer"), "{number}: {r}");
+        assert_eq!(state(), before, "{number} changed the repo");
+    }
+    let r = rpc(&mut ws, json!({ "type": "workspace.create.request", "requestId": "n5", "source": { "kind": "worktree", "cwd": cwd, "action": "checkout", "githubPrNumber": 0 } }), "workspace.create.response").await;
+    assert!(r["workspace"].is_null() && r["error"].as_str().unwrap().contains("positive integer"), "{r}");
+
+    let gitlab = json!({ "kind": "change_request", "forge": "gitlab", "number": 1 });
+    let r = rpc(&mut ws, request("g1", gitlab, None), "workspace.create.response").await;
+    assert!(r["workspace"].is_null() && r["error"].as_str().unwrap().contains("GitHub"), "{r}");
+    assert_eq!(state(), before, "a non-github forge changed the repo");
+
+    // A ref name git would read as an option, or that is not a valid ref, falls back to pr-<n>.
+    for (id, name) in [("o1", "--upload-pack=touch pwned"), ("o2", "-x"), ("o3", "a..b")] {
+        let r = rpc(&mut ws, request(id, github(json!(1)), Some(name)), "workspace.create.response").await;
+        assert!(r["error"].is_null(), "{name}: {r}");
+        let dir = std::path::PathBuf::from(r["workspace"]["workspaceDirectory"].as_str().unwrap());
+        let branch = git(&dir, &["rev-parse", "--abbrev-ref", "HEAD"]).trim().to_string();
+        assert!(branch.starts_with("pr-1"), "{name} gave {branch}");
+        assert!(!repo.join("pwned").exists());
+    }
+
+    // An unrelated local branch has the name: the PR takes the next free one and `taken` does not move.
+    let taken_head = git(&repo, &["rev-parse", "taken"]);
+    let main_head = git(&repo, &["rev-parse", "main"]);
+    let r = rpc(&mut ws, request("c1", github(json!(1)), Some("taken")), "workspace.create.response").await;
+    assert!(r["error"].is_null(), "{r}");
+    let dir = std::path::PathBuf::from(r["workspace"]["workspaceDirectory"].as_str().unwrap());
+    assert_eq!(git(&dir, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(), "taken-2");
+    assert_eq!(git(&repo, &["rev-parse", "taken"]), taken_head);
+    assert_eq!(git(&repo, &["rev-parse", "taken-2"]), taken_head);
+    assert_eq!(git(&repo, &["rev-parse", "main"]), main_head);
+
+    let r = rpc(&mut ws, json!({ "type": "paseo_worktree_archive_request", "requestId": "a1", "worktreePath": dir.to_string_lossy(), "scope": "worktree" }), "paseo_worktree_archive_response").await;
+    assert_eq!(r["success"], true, "{r}");
+    assert!(!dir.exists(), "archive left the directory");
+    assert!(git(&repo, &["branch", "--format=%(refname:short)"]).lines().any(|b| b == "taken-2"), "archive deleted the PR branch");
+}
+
+#[tokio::test]
 async fn archiving_a_workspace_ends_its_terminals() {
     let d = start_with(unique_dir("termarch"), None, "ok", &[("SHELL", "/bin/sh")]);
     let proj = d.dir.join("proj");

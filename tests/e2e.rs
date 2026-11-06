@@ -450,6 +450,11 @@ async fn agent_turn_with_fake_claude() {
     assert_eq!(mine["id"], "claude");
     assert_eq!(balance(&mine, "agent-tokens"), 110);
 
+    // Clearing attention answers with the agents' snapshots, as the app's schema requires.
+    let cleared = rpc(&mut ws, json!({ "type": "clear_agent_attention", "requestId": "c1", "agentId": [agent_id] }), "clear_agent_attention_response").await;
+    assert_eq!(cleared["agents"][0]["id"], agent_id, "{cleared}");
+    assert!(cleared["agents"][0]["attentionReason"].is_null(), "{cleared}");
+
     // History lists the agent, and it can be archived.
     send(&mut ws, session(json!({ "type": "fetch_agent_history_request", "requestId": "h1" }))).await;
     let hist = recv_until(&mut ws, |v| (v["message"]["type"] == "fetch_agent_history_response").then(|| v["message"]["payload"].clone())).await;

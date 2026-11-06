@@ -31,19 +31,19 @@ rabin2 -E target | head -80   # exports
 rabin2 -l target              # linked libraries
 rabin2 -zz target | rg -i 'http|/api|key|token|error|usage|\.so|\.dll' | head -80
 readelf -hlSd target          # ELF headers, segments, sections, dynamic tags
-nm -DC target | head; objdump -d --no-show-raw-insn -C target | less
+nm -DC target | head; objdump -d --no-show-raw-insn -C target | head -200
 ```
 
 Trace one behavior at a time: find a string or import tied to it, then follow references.
 
 ```sh
-r2 -q -c 'aa; axt @@ str.*Usage*' target                 # who uses the string
+r2 -q -c 'aa; axt @@ str.*sage*' target                  # who uses the string
 r2 -q -c 'aa; s sym.main; af; pdf' target | head -150   # disassemble one function
 r2 -q -c 'aa; afl~name' target                          # functions matching a name
 r2 -q -c 'aa; s 0x401234; af; pdc' target | head -150   # rough pseudocode
 ```
 
-Use `aa`, not `aaa`, on binaries over a few MB; `aaa` can exhaust memory. Go and Rust binaries keep many symbol names even when stripped: `rabin2 -s target | rg 'main\.|::'`. Demangle C++ and Rust names with `c++filt`.
+objdump and nm read only the host architecture; for ARM, PE or Mach-O use rabin2 and r2. Stripped binaries have no `sym.main`: start from `entry0` or `afl`. Use `aa`, not `aaa`, on binaries over a few MB; `aaa` can exhaust memory. Go and Rust binaries keep many symbol names even when stripped: `rabin2 -s target | rg 'main\.|::'`. Demangle C++ and Rust names with `c++filt`.
 
 ## JavaScript and Electron apps
 
@@ -55,7 +55,7 @@ Extract an asar without Node:
 hlen=$(od -An -tu4 -j12 -N4 app.asar | tr -d ' ')
 base=$(( 8 + $(od -An -tu4 -j4 -N4 app.asar | tr -d ' ') ))
 tail -c +17 app.asar | head -c "$hlen" > header.json
-jq -r 'paths(type=="object" and has("offset")) | map(select(.!="files")) | join("/")' header.json | head -100
+jq -r 'paths(type=="object" and (has("offset") or .unpacked==true)) | map(select(.!="files")) | join("/")' header.json | head -100
 f=$(jq -c '.files["package.json"]' header.json)
 tail -c +$(( base + $(jq -r .offset <<<"$f") + 1 )) app.asar | head -c "$(jq -r .size <<<"$f")"
 ```
@@ -66,8 +66,17 @@ Then:
 
 - `package.json`: `main`, scripts, dependencies, versions.
 - Source maps restore original files: `jq -r '.sources[]' x.js.map`, and `jq -r '.sourcesContent[N]' x.js.map` for file N.
-- Entry points and wiring: `rg -o 'ipcMain\.(handle|on)\("[^"]+' -r '' --no-filename`, `rg -o 'ipcRenderer\.(invoke|send)\("[^"]+'`, `rg -o 'https?://[^"'\''` ]+' | sort -u`, `rg 'fetch\(|axios|XMLHttpRequest|new WebSocket'`, `rg -o '"/api/[^"]+' | sort -u`.
 - Minified code: search with `rg -o '.{0,120}needle.{0,120}'` rather than opening whole lines.
+
+Entry points and wiring:
+
+```sh
+rg -o --no-filename 'ipcMain\.(?:handle|on)\("([^"]+)' -r '$1' | sort -u
+rg -o --no-filename 'ipcRenderer\.(?:invoke|send)\("([^"]+)' -r '$1' | sort -u
+rg -o --no-filename "https?://[^\"'\` ]+" | sort -u
+rg -o --no-filename '"/api/[^"]+' | sort -u
+rg -l 'fetch\(|axios|XMLHttpRequest|new WebSocket'
+```
 
 ## Network captures
 
@@ -100,7 +109,7 @@ TLS payloads are unreadable without a key log; report the hosts and timing inste
 unzip -l app.apk | rg 'classes.*\.dex|lib/|assets/|\.so$|flutter|index.android.bundle'
 export JAVA_OPTS=-Xmx384m
 jadx -j 1 --no-src -d out app.apk                              # resources, AndroidManifest.xml
-jadx -j 1 --no-res --single-class com.example.Foo -d out app.apk  # one class
+jadx -j 1 --no-res --single-class com.example.Foo -d out app.apk  # out/sources/com/example/Foo.java
 ```
 
 Read `out/resources/AndroidManifest.xml` first: package, permissions, exported activities, services, receivers, providers, deep links. Decompile only the classes you need; a full `jadx` run on a large APK may not fit in memory. Other formats inside the APK:

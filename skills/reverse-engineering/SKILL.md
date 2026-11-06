@@ -66,16 +66,16 @@ Then:
 
 - `package.json`: `main`, scripts, dependencies, versions.
 - Source maps restore original files: `jq -r '.sources[]' x.js.map`, and `jq -r '.sourcesContent[N]' x.js.map` for file N.
-- Minified code: search with `rg -o '.{0,120}needle.{0,120}'` rather than opening whole lines.
+- Minified code: search with `rg -o '.{0,120}needle.{0,120}' .` rather than opening whole lines.
 
 Entry points and wiring:
 
 ```sh
-rg -o --no-filename 'ipcMain\.(?:handle|on)\("([^"]+)' -r '$1' | sort -u
-rg -o --no-filename 'ipcRenderer\.(?:invoke|send)\("([^"]+)' -r '$1' | sort -u
-rg -o --no-filename "https?://[^\"'\` ]+" | sort -u
-rg -o --no-filename '"/api/[^"]+' | sort -u
-rg -l 'fetch\(|axios|XMLHttpRequest|new WebSocket'
+rg -o --no-filename 'ipcMain\.(?:handle|on)\("([^"]+)' -r '$1' . | sort -u
+rg -o --no-filename 'ipcRenderer\.(?:invoke|send)\("([^"]+)' -r '$1' . | sort -u
+rg -o --no-filename "https?://[^\"'\` ]+" . | sort -u
+rg -o --no-filename '"/api/[^"]+' . | sort -u
+rg -l 'fetch\(|axios|XMLHttpRequest|new WebSocket' .
 ```
 
 ## Network captures

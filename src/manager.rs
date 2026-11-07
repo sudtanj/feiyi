@@ -1593,13 +1593,14 @@ impl Manager {
     /// thread, drop the session, and mark the next turn to carry the earlier
     /// conversation. Mode and thinking fall back to the defaults when the new
     /// provider has no such value.
-    pub fn switch_provider(&mut self, agent_id: &str, provider: &str) -> Result<(), &'static str> {
+    pub fn switch_provider(&mut self, agent_id: &str, provider: &str, model: Option<String>) -> Result<(), &'static str> {
         let agent = self.agents.get_mut(agent_id).ok_or("agent not found")?;
         if agent.status == "running" {
             return Err("the agent is running: wait for it to finish before switching provider");
         }
         let rec = &mut agent.rec;
         rec.provider = provider.to_string();
+        rec.model = model;
         rec.session_id = None;
         rec.handoff_pending = true;
         if rec.mode_id.as_deref().is_some_and(|m| !modes_for(provider).as_array().is_some_and(|modes| modes.iter().any(|x| x["id"] == m))) {

@@ -198,7 +198,7 @@ impl Manager {
                         _ => (current.clone(), requested),
                     };
                     if target != current {
-                        if let Err(error) = self.switch_provider(&id, &target) {
+                        if let Err(error) = self.switch_provider(&id, &target, model.clone()) {
                             return reply(out, json!({ "type": response_type, "payload": { "requestId": rid, "agentId": id, "accepted": false, "error": error } }));
                         }
                     }

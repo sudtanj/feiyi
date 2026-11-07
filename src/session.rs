@@ -9,6 +9,10 @@ use tokio::sync::{broadcast, mpsc};
 
 pub const WS_PROTOCOL_VERSION: i64 = 1;
 
+/// First byte of a deflate-compressed JSON frame. 0xC0 is never valid UTF-8 and is no file or terminal opcode.
+const COMPRESSED_FRAME: u8 = 0xC0;
+const COMPRESS_MIN_BYTES: usize = 1024;
+
 /// A frame from the client: JSON text, or binary (file-transfer and terminal frames).
 pub enum Inbound {
     Text(String),
@@ -24,6 +28,20 @@ pub enum Outbound {
 /// Whether a client frame stays binary; anything else must be UTF-8 JSON.
 pub fn is_binary_frame(bytes: &[u8]) -> bool {
     crate::uploads::is_file_frame(bytes) || terminal::is_frame(bytes)
+}
+
+/// JSON text as a frame: raw-deflated behind `COMPRESSED_FRAME` when the client asked for it and it pays off.
+fn pack(text: Arc<str>, compress: bool) -> Outbound {
+    if !compress || text.len() < COMPRESS_MIN_BYTES {
+        return Outbound::Text(text);
+    }
+    let mut frame = vec![COMPRESSED_FRAME];
+    frame.extend(miniz_oxide::deflate::compress_to_vec(text.as_bytes(), 4));
+    if frame.len() < text.len() {
+        Outbound::Binary(frame)
+    } else {
+        Outbound::Text(text)
+    }
 }
 
 pub struct Ctx {
@@ -90,6 +108,7 @@ fn server_info(ctx: &Ctx) -> Arc<str> {
 pub async fn run(ctx: Arc<Ctx>, mut inbound: mpsc::Receiver<Inbound>, outbound: mpsc::Sender<Outbound>, via_relay: bool) {
     // Phase 1: wait for hello. Relay sockets are already authenticated by the
     // E2EE key exchange (same policy as the Node daemon).
+    let mut compress = false;
     loop {
         let Some(frame) = inbound.recv().await else { return };
         let Inbound::Text(text) = frame else { continue };
@@ -118,6 +137,7 @@ pub async fn run(ctx: Arc<Ctx>, mut inbound: mpsc::Receiver<Inbound>, outbound: 
                         _ => {}
                     }
                 }
+                compress = msg.pointer("/capabilities/frame_compression").and_then(|c| c.as_str()) == Some("deflate");
                 if outbound.send(Outbound::Text(server_info(&ctx))).await.is_err() {
                     return;
                 }
@@ -192,7 +212,7 @@ pub async fn run(ctx: Arc<Ctx>, mut inbound: mpsc::Receiver<Inbound>, outbound: 
             }
             Some(out) = reply_rx.recv() => {
                 crate::egress::count(&out);
-                if outbound.send(Outbound::Text(out)).await.is_err() { return; }
+                if outbound.send(pack(out, compress)).await.is_err() { return; }
             }
             Ok(()) = terminal_news.changed() => {
                 for frame in terminals.pump() {
@@ -202,7 +222,7 @@ pub async fn run(ctx: Arc<Ctx>, mut inbound: mpsc::Receiver<Inbound>, outbound: 
             ev = events.recv() => match ev {
                 Ok(out) => {
                     crate::egress::count(&out);
-                    if outbound.send(Outbound::Text(out)).await.is_err() { return; }
+                    if outbound.send(pack(out, compress)).await.is_err() { return; }
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     // A slow or just-resumed client missed events it cannot know about. End the
@@ -214,5 +234,32 @@ pub async fn run(ctx: Arc<Ctx>, mut inbound: mpsc::Receiver<Inbound>, outbound: 
                 Err(broadcast::error::RecvError::Closed) => return,
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn big_json() -> Arc<str> {
+        Arc::from(format!(r#"{{"type":"x","items":"{}"}}"#, "abcdef".repeat(1000)))
+    }
+
+    #[test]
+    fn compressed_frame_round_trips() {
+        let text = big_json();
+        let Outbound::Binary(frame) = pack(text.clone(), true) else { panic!("expected a binary frame") };
+        assert_eq!(frame[0], COMPRESSED_FRAME);
+        assert!(!is_binary_frame(&frame));
+        let plain = miniz_oxide::inflate::decompress_to_vec(&frame[1..]).unwrap();
+        assert_eq!(plain, text.as_bytes());
+    }
+
+    #[test]
+    fn plain_text_when_client_did_not_advertise_or_payload_is_small() {
+        let text = big_json();
+        assert!(matches!(pack(text.clone(), false), Outbound::Text(t) if t == text));
+        let small: Arc<str> = Arc::from(r#"{"type":"pong"}"#);
+        assert!(matches!(pack(small, true), Outbound::Text(_)));
     }
 }

@@ -87,6 +87,7 @@ import { projectIconCache } from "@/projects/icon-cache";
 import { nativePerformanceTrace } from "@/performance/native-trace";
 import { revokePushNotifications } from "@/push-notifications";
 import { createAppWebSocketFactory } from "./websocket-factory";
+import { frameCompressionSupported, installFrameCompression } from "./frame-compression";
 
 export type HostRuntimeConnectionStatus = "idle" | "connecting" | "online" | "offline" | "error";
 export type PairingNavigationTarget = "openProject" | "hostRoot" | "hostSettings";
@@ -543,6 +544,11 @@ function probeIntervalForConnection(
 }
 
 function createDefaultDeps(): HostRuntimeControllerDeps {
+  if (frameCompressionSupported) {
+    installFrameCompression(
+      DaemonClient.prototype as unknown as Parameters<typeof installFrameCompression>[0],
+    );
+  }
   const browserHostAvailable =
     typeof getDesktopHost()?.browser?.executeAutomationCommand === "function";
   const browserAutomationCapabilities = browserHostAvailable
@@ -568,7 +574,10 @@ function createDefaultDeps(): HostRuntimeControllerDeps {
         clientType: "mobile",
         appVersion: resolveAppVersion() ?? undefined,
         runtimeGeneration,
-        capabilities: appCapabilities,
+        capabilities: {
+          ...appCapabilities,
+          ...(frameCompressionSupported ? { frame_compression: "deflate" } : {}),
+        } as DaemonClientConfig["capabilities"],
         trace: nativePerformanceTrace,
         providerSnapshots: "wire",
         ...(host.password ? { password: host.password } : {}),

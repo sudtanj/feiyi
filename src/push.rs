@@ -167,6 +167,9 @@ pub(crate) async fn request(method: &str, host: &str, path: &str, body: Option<&
             None => format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {agent}\r\n{headers}Connection: close\r\n\r\n"),
         };
         tls.write_all(request.as_bytes()).await.map_err(|e| e.to_string())?;
+        // Large bodies leave TLS records buffered once the socket fills; without a flush
+        // the server waits for the rest of the body while we wait for its reply.
+        tls.flush().await.map_err(|e| e.to_string())?;
         let mut raw = Vec::new();
         // Servers may skip TLS close_notify on Connection: close; keep what arrived.
         let _ = (&mut tls).take(max).read_to_end(&mut raw).await;

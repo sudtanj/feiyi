@@ -2079,6 +2079,33 @@ async fn switching_to_codex_maps_mode_and_thinking() {
     assert!(saved["sessionId"].is_null() && saved["handoffPending"] == true, "{saved}");
 }
 
+/// A thinking level the target model doesn't list is dropped on a switch
+/// (Haiku has no effort levels); a model missing from the catalog keeps it
+/// (see `switching_to_codex_maps_mode_and_thinking`, which ends on `claude-test`).
+#[tokio::test]
+async fn switching_to_a_model_without_the_thinking_level_drops_it() {
+    let dir = unique_dir("switch-drop-thinking");
+    let cwd = dir.join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let codex = fake_codex(&dir);
+    let d = start_with(dir.clone(), None, "ok", &[("PASEO_CODEX_BIN", codex.to_str().unwrap())]);
+    let mut ws = connect(d.port).await;
+    hello(&mut ws, None).await;
+    let agent_id = create_agent_with(&mut ws, json!({ "provider": "claude", "cwd": cwd.to_string_lossy(), "modeId": "bypassPermissions", "thinkingOptionId": "max" }), "hi").await;
+    let agents_file = dir.join("home").join("agents.json");
+    wait_for_saved_agent(&agents_file, "claude session never saved", |a| a["sessionId"].is_string()).await;
+    assert_eq!(set_model(&mut ws, &agent_id, "codex:gpt-test").await["accepted"], true);
+    let saved = wait_for_saved_agent(&agents_file, "switch never saved", |a| a["provider"] == "codex").await;
+    assert_eq!(saved["thinkingOptionId"], "xhigh", "{saved}");
+
+    send_and_wait(&mut ws, &agent_id, "on codex").await;
+    assert_eq!(set_model(&mut ws, &agent_id, "claude:claude-haiku-4-5").await["accepted"], true);
+    let saved = wait_for_saved_agent(&agents_file, "switch back never saved", |a| a["provider"] == "claude").await;
+    assert_eq!(saved["model"], "claude-haiku-4-5", "{saved}");
+    assert!(saved["thinkingOptionId"].is_null(), "{saved}");
+    assert_eq!(saved["modeId"], "bypassPermissions", "{saved}");
+}
+
 /// A model id with no provider prefix, or with the current provider's prefix,
 /// only changes the model: session kept, no handoff, no notice. An unknown
 /// prefix is part of the model id.

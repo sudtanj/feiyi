@@ -109,6 +109,8 @@ done
         "limit" => limit,
         // Like "ok", and saves its arguments (one per line) for the test to check.
         "args" => format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n{}", dir.join("claude-args").display(), script.trim_start_matches("#!/bin/sh\n")),
+        // Like "ok", and appends every user line it receives to `claude-stdin`.
+        "stdin" => script.replace("n=$((n+1))", &format!("n=$((n+1)); printf '%s\\n' \"$line\" >> '{}'", dir.join("claude-stdin").display())),
         // Like "args", and also saves the environment it was started with.
         "env" => format!(
             "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n/usr/bin/env > '{}'\n{}",
@@ -1995,4 +1997,152 @@ async fn switching_provider_is_refused_while_the_agent_runs() {
     assert!(refused["error"].as_str().unwrap().contains("running"), "{refused}");
     let saved = wait_for_saved_agent(&d.dir.join("home").join("agents.json"), "agent never saved", |_| true).await;
     assert_eq!(saved["provider"], "claude", "{saved}");
+}
+
+async fn create_agent_with(ws: &mut Ws, config: Value, prompt: &str) -> String {
+    send(ws, session(json!({ "type": "create_agent_request", "requestId": "c0", "config": config, "initialPrompt": prompt }))).await;
+    let id = recv_until(ws, |v| {
+        let p = &v["message"]["payload"];
+        (v["message"]["type"] == "status" && p["status"] == "agent_created").then(|| p["agentId"].as_str().unwrap().to_string())
+    })
+    .await;
+    recv_until(ws, |v| (v["message"]["type"] == "agent_stream" && v["message"]["payload"]["event"]["type"] == "turn_completed").then_some(())).await;
+    id
+}
+
+async fn set_model(ws: &mut Ws, agent_id: &str, model_id: &str) -> Value {
+    rpc(ws, json!({ "type": "set_agent_model_request", "requestId": "sm", "agentId": agent_id, "modelId": model_id }), "set_agent_model_response").await
+}
+
+async fn send_and_wait(ws: &mut Ws, agent_id: &str, text: &str) {
+    send(ws, session(json!({ "type": "send_agent_message_request", "requestId": "sw", "agentId": agent_id, "text": text }))).await;
+    recv_until(ws, |v| (v["message"]["type"] == "agent_stream" && v["message"]["payload"]["event"]["type"] == "turn_completed").then_some(())).await;
+}
+
+/// Codex to Claude Code: the new Claude process gets the earlier chat once,
+/// Codex-only mode drops to the default, and a thinking level both know stays.
+#[tokio::test]
+async fn switching_from_codex_to_claude_carries_the_chat_and_resets_the_mode() {
+    let dir = unique_dir("switch-back");
+    let cwd = dir.join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let codex = fake_codex(&dir);
+    let d = start_with(dir.clone(), None, "stdin", &[("PASEO_CODEX_BIN", codex.to_str().unwrap())]);
+    let mut ws = connect(d.port).await;
+    hello(&mut ws, None).await;
+    let agent_id = create_agent_with(&mut ws, json!({ "provider": "codex", "cwd": cwd.to_string_lossy(), "modeId": "full-access", "thinkingOptionId": "xhigh" }), "codex question").await;
+
+    let switched = set_model(&mut ws, &agent_id, "claude:claude-test").await;
+    assert_eq!(switched["accepted"], true, "{switched}");
+    let agents_file = dir.join("home").join("agents.json");
+    let saved = wait_for_saved_agent(&agents_file, "switch never saved", |a| a["provider"] == "claude").await;
+    assert_eq!(saved["model"], "claude-test", "{saved}");
+    assert!(saved["modeId"].is_null(), "codex-only mode kept: {saved}");
+    assert_eq!(saved["thinkingOptionId"], "xhigh", "{saved}");
+    assert!(saved["sessionId"].is_null() && saved["handoffPending"] == true, "{saved}");
+
+    for text in ["claude one", "claude two"] {
+        send_and_wait(&mut ws, &agent_id, text).await;
+    }
+    let sent: Vec<String> = std::fs::read_to_string(dir.join("claude-stdin")).unwrap().lines().map(String::from).collect();
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    assert!(sent[0].contains("User: codex question") && sent[0].contains("claude one"), "{}", sent[0]);
+    assert!(sent[1].contains("claude two") && !sent[1].contains("earlier session"), "{}", sent[1]);
+    let tl = rpc(&mut ws, json!({ "type": "fetch_agent_timeline_request", "requestId": "t", "agentId": agent_id, "direction": "tail", "limit": 50 }), "fetch_agent_timeline_response").await;
+    let notes: Vec<&str> = tl["entries"].as_array().unwrap().iter().filter(|e| e["item"]["type"] == "notification").filter_map(|e| e["item"]["message"].as_str()).collect();
+    assert!(notes.contains(&"Switched to Claude Code"), "{notes:?}");
+}
+
+/// Claude-only mode and the `max` effort do not exist on Codex: both reset.
+/// Switching back and forth keeps the agent usable.
+#[tokio::test]
+async fn switching_to_codex_resets_claude_only_mode_and_thinking() {
+    let dir = unique_dir("switch-reset");
+    let cwd = dir.join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let codex = fake_codex(&dir);
+    let d = start_with(dir.clone(), None, "ok", &[("PASEO_CODEX_BIN", codex.to_str().unwrap())]);
+    let mut ws = connect(d.port).await;
+    hello(&mut ws, None).await;
+    let agent_id = create_agent_with(&mut ws, json!({ "provider": "claude", "cwd": cwd.to_string_lossy(), "modeId": "bypassPermissions", "thinkingOptionId": "max" }), "hi").await;
+    let agents_file = dir.join("home").join("agents.json");
+    wait_for_saved_agent(&agents_file, "claude session never saved", |a| a["sessionId"].is_string()).await;
+    assert_eq!(set_model(&mut ws, &agent_id, "codex:gpt-test").await["accepted"], true);
+    let saved = wait_for_saved_agent(&agents_file, "switch never saved", |a| a["provider"] == "codex").await;
+    assert!(saved["modeId"].is_null() && saved["thinkingOptionId"].is_null(), "{saved}");
+
+    send_and_wait(&mut ws, &agent_id, "on codex").await;
+    assert_eq!(set_model(&mut ws, &agent_id, "claude:claude-test").await["accepted"], true);
+    let saved = wait_for_saved_agent(&agents_file, "switch back never saved", |a| a["provider"] == "claude").await;
+    assert_eq!(saved["model"], "claude-test", "{saved}");
+    assert!(saved["sessionId"].is_null() && saved["handoffPending"] == true, "{saved}");
+}
+
+/// A model id with no provider prefix, or with the current provider's prefix,
+/// only changes the model: session kept, no handoff, no notice. An unknown
+/// prefix is part of the model id.
+#[tokio::test]
+async fn model_change_without_a_provider_change_keeps_the_session() {
+    let d = start_at(unique_dir("switch-same"), None, "ok");
+    let cwd = d.dir.join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let mut ws = connect(d.port).await;
+    hello(&mut ws, None).await;
+    let agent_id = create_agent_with(&mut ws, json!({ "provider": "claude", "cwd": cwd.to_string_lossy(), "modeId": "bypassPermissions", "thinkingOptionId": "max" }), "hi").await;
+    let agents_file = d.dir.join("home").join("agents.json");
+    let before = wait_for_saved_agent(&agents_file, "session never saved", |a| a["sessionId"].is_string()).await;
+
+    for (requested, expected) in [("claude-plain", "claude-plain"), ("claude:claude-prefixed", "claude-prefixed"), ("ollama:llama", "ollama:llama")] {
+        assert_eq!(set_model(&mut ws, &agent_id, requested).await["accepted"], true);
+        let saved = wait_for_saved_agent(&agents_file, "model never saved", |a| a["model"] == expected).await;
+        assert_eq!(saved["provider"], "claude", "{saved}");
+        assert_eq!(saved["sessionId"], before["sessionId"], "{saved}");
+        assert_eq!(saved["modeId"], "bypassPermissions", "{saved}");
+        assert_eq!(saved["thinkingOptionId"], "max", "{saved}");
+        assert_ne!(saved["handoffPending"], true, "{saved}");
+    }
+    let tl = rpc(&mut ws, json!({ "type": "fetch_agent_timeline_request", "requestId": "t", "agentId": agent_id, "direction": "tail", "limit": 50 }), "fetch_agent_timeline_response").await;
+    assert!(!tl["entries"].as_array().unwrap().iter().any(|e| e["item"]["type"] == "notification"), "{tl}");
+}
+
+/// The handoff flag is on disk: a daemon killed right after the switch still
+/// sends the earlier chat with the first prompt after it comes back.
+#[tokio::test]
+async fn handoff_survives_a_daemon_restart() {
+    let dir = unique_dir("switch-restart");
+    let cwd = dir.join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let codex = fake_codex(&dir);
+    let daemon_vars = [("PASEO_CODEX_BIN", codex.to_str().unwrap())];
+    let mut first = start_with(dir.clone(), None, "ok", &daemon_vars);
+    let mut ws = connect(first.port).await;
+    hello(&mut ws, None).await;
+    let agent_id = create_agent_with(&mut ws, json!({ "provider": "claude", "cwd": cwd.to_string_lossy(), "modeId": "bypassPermissions" }), "before the restart").await;
+    let agents_file = dir.join("home").join("agents.json");
+    wait_for_saved_agent(&agents_file, "claude session never saved", |a| a["sessionId"].is_string()).await;
+    assert_eq!(set_model(&mut ws, &agent_id, "codex:gpt-test").await["accepted"], true);
+    wait_for_saved_agent(&agents_file, "switch never saved", |a| a["provider"] == "codex" && a["handoffPending"] == true).await;
+    first.child.kill().unwrap();
+    let _ = first.child.wait();
+    std::mem::forget(first);
+
+    let second = start_with(dir.clone(), None, "ok", &daemon_vars);
+    let mut ws = connect(second.port).await;
+    hello(&mut ws, None).await;
+    send_and_wait(&mut ws, &agent_id, "after the restart").await;
+    let sent = std::fs::read_to_string(dir.join("codex-turns")).unwrap();
+    assert_eq!(sent.lines().count(), 1, "{sent}");
+    for earlier in ["earlier session", "User: before the restart", "Assistant: hello from fake claude", "after the restart"] {
+        assert!(sent.contains(earlier), "{earlier}: {sent}");
+    }
+    assert_eq!(saved_agent(&agents_file)["handoffPending"], false);
+}
+
+#[tokio::test]
+async fn switching_an_unknown_agent_is_refused() {
+    let d = start("switch-unknown", None);
+    let mut ws = connect(d.port).await;
+    hello(&mut ws, None).await;
+    let r = set_model(&mut ws, "no-such-agent", "codex:gpt-test").await;
+    assert_eq!(r["accepted"], false, "{r}");
 }

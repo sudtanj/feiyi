@@ -1753,6 +1753,25 @@ mod tests {
     }
 
     #[test]
+    fn handoff_with_multibyte_text_stays_whole_and_within_the_limit() {
+        let rows: Vec<Row> = (0..50).map(|i| row("assistant_message", &format!("{i:03}{}", "é".repeat(999)))).collect();
+        let block = handoff_block(&rows);
+        assert_eq!(block.matches("Assistant: ").count(), 20, "{}", block.len());
+        assert!(block.contains(&format!("Assistant: 030{}", "é".repeat(999))) && block.contains("Assistant: 049"), "newest items kept whole");
+        assert!(!block.contains("Assistant: 029"));
+        assert!(block.len() < HANDOFF_BYTES + 400, "{}", block.len());
+    }
+
+    #[test]
+    fn handoff_skips_blank_text_and_trims_the_rest() {
+        let rows = [row("user_message", "  hello \n"), row("assistant_message", "   "), row("assistant_message", "hi")];
+        let block = handoff_block(&rows);
+        assert!(block.contains("User: hello\n\nAssistant: hi\n\n[End"), "{block}");
+        assert_eq!(handoff_block(&[row("user_message", " ")]), "");
+        assert_eq!(handoff_block(&[]), "");
+    }
+
+    #[test]
     fn transient_errors_are_retryable() {
         assert!(retryable_error("claude exited unexpectedly"));
         assert!(retryable_error("codex app-server exited"));

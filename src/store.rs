@@ -62,6 +62,10 @@ pub struct AgentRecord {
     /// Follow-up prompts queued behind the running turn.
     #[serde(default)]
     pub pending_queue: Vec<String>,
+    /// The turn ended while background work ran, so its "finished" notice was
+    /// held back. Still set when that work is lost: the notice is sent then.
+    #[serde(default)]
+    pub finish_deferred: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -263,5 +267,27 @@ impl Store {
 
     pub fn delete_timeline(&self, agent_id: &str) {
         let _ = std::fs::remove_file(self.timeline_path(agent_id));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const OLD_RECORD: &str = r#"{"id":"a1","provider":"claude","cwd":"/w","createdAt":"t","updatedAt":"t"}"#;
+
+    #[test]
+    fn record_without_finish_deferred_loads_as_false() {
+        let rec: AgentRecord = serde_json::from_str(OLD_RECORD).unwrap();
+        assert!(!rec.finish_deferred);
+    }
+
+    #[test]
+    fn finish_deferred_round_trips_in_camel_case() {
+        let mut rec: AgentRecord = serde_json::from_str(OLD_RECORD).unwrap();
+        rec.finish_deferred = true;
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(json.contains("\"finishDeferred\":true"), "{json}");
+        assert!(serde_json::from_str::<AgentRecord>(&json).unwrap().finish_deferred);
     }
 }

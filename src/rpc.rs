@@ -556,6 +556,7 @@ impl Manager {
             thinking_option_id: s(&config, "thinkingOptionId").filter(|t| !t.is_empty() && t != "default"),
             pending_turn: None,
             pending_queue: Vec::new(),
+            finish_deferred: false,
         };
         let id = rec.id.clone();
         if let Some(model) = rec.model.clone() {

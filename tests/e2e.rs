@@ -676,6 +676,121 @@ async fn held_finished_notice_is_sent_after_restart() {
     }
 }
 
+/// Run one agent through a finished turn on a throwaway daemon, kill the
+/// daemon, and return its directory and `agents.json` for the test to edit.
+async fn finished_agent_dir(tag: &str) -> (PathBuf, PathBuf) {
+    let dir = unique_dir(tag);
+    let cwd = dir.join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let mut first = start_at(dir.clone(), None, "ok");
+    let mut ws = connect(first.port).await;
+    hello(&mut ws, None).await;
+    send(
+        &mut ws,
+        session(json!({ "type": "create_agent_request", "requestId": "r1", "config": { "provider": "claude", "cwd": cwd.to_string_lossy(), "modeId": "bypassPermissions" }, "initialPrompt": "say hi" })),
+    )
+    .await;
+    recv_until(&mut ws, |v| (v["message"]["type"] == "agent_stream" && v["message"]["payload"]["event"]["type"] == "turn_completed").then_some(())).await;
+    let agents_file = dir.join("home").join("agents.json");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !std::fs::read_to_string(&agents_file).unwrap_or_default().contains("\"attentionReason\":\"finished\"") {
+        assert!(Instant::now() < deadline, "finished turn never saved");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    first.child.kill().unwrap();
+    let _ = first.child.wait();
+    std::mem::forget(first);
+    (dir, agents_file)
+}
+
+fn edit_agent(agents_file: &std::path::Path, edit: impl FnOnce(&mut Value)) {
+    let mut agents: Value = serde_json::from_slice(&std::fs::read(agents_file).unwrap()).unwrap();
+    edit(&mut agents[0]);
+    std::fs::write(agents_file, serde_json::to_vec(&agents).unwrap()).unwrap();
+}
+
+fn saved_agent(agents_file: &std::path::Path) -> Value {
+    let saved: Value = serde_json::from_slice(&std::fs::read(agents_file).unwrap()).unwrap();
+    saved[0].clone()
+}
+
+/// An agent that still has a turn or follow-ups to run is not idle with lost
+/// background work: the restart resumes it and sends no "finished" notice.
+#[tokio::test]
+async fn held_finished_notice_waits_for_pending_work_after_restart() {
+    for (tag, pending_turn, pending_queue) in [("held-pt", Some("do the thing"), json!([])), ("held-pq", None, json!(["next one"]))] {
+        let (dir, agents_file) = finished_agent_dir(tag).await;
+        edit_agent(&agents_file, |a| {
+            a["finishDeferred"] = json!(true);
+            a["attentionReason"] = Value::Null;
+            a["attentionAt"] = Value::Null;
+            a["pendingTurn"] = pending_turn.map(|t| json!(t)).unwrap_or(Value::Null);
+            a["pendingQueue"] = pending_queue.clone();
+        });
+        // The fake CLI hangs on the resumed prompt, so the turn stays running.
+        let mut d = start_at(dir, None, "hang");
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        let a = saved_agent(&agents_file);
+        assert!(a["attentionReason"].is_null(), "{tag}: notified while work pending: {a}");
+        if pending_turn.is_none() {
+            // The follow-up started as a new user turn, which drops the held notice.
+            assert_eq!(a["finishDeferred"], false, "{tag}: {a}");
+        }
+        d.child.kill().unwrap();
+        let _ = d.child.wait();
+    }
+}
+
+/// An `agents.json` written before the flag existed loads, keeps its saved
+/// attention, and is not notified again.
+#[tokio::test]
+async fn agents_file_without_finish_deferred_loads() {
+    let (dir, agents_file) = finished_agent_dir("held-old").await;
+    edit_agent(&agents_file, |a| {
+        a.as_object_mut().unwrap().remove("finishDeferred");
+    });
+    let before = saved_agent(&agents_file);
+    assert!(before.get("finishDeferred").is_none());
+    let d = start_at(dir, None, "ok");
+    let mut ws = connect(d.port).await;
+    hello(&mut ws, None).await;
+    let listed = rpc(&mut ws, json!({ "type": "fetch_agents_request", "requestId": "f1" }), "fetch_agents_response").await;
+    assert_eq!(listed["entries"].as_array().map(|e| e.len()), Some(1), "{listed}");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let after = saved_agent(&agents_file);
+    assert_eq!(after["attentionReason"], "finished", "{after}");
+    assert_eq!(after["attentionAt"], before["attentionAt"], "no new notice for an old record: {after}");
+    assert_ne!(after["finishDeferred"], true, "{after}");
+}
+
+/// The held notice goes out once: later restarts leave it alone.
+#[tokio::test]
+async fn held_finished_notice_is_not_repeated() {
+    let (dir, agents_file) = finished_agent_dir("held-once").await;
+    edit_agent(&agents_file, |a| {
+        a["finishDeferred"] = json!(true);
+        a["attentionReason"] = Value::Null;
+        a["attentionAt"] = Value::Null;
+    });
+    let mut second = start_at(dir.clone(), None, "ok");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let sent = loop {
+        let a = saved_agent(&agents_file);
+        if a["attentionReason"] == "finished" && a["finishDeferred"] == false {
+            break a;
+        }
+        assert!(Instant::now() < deadline, "held notice not sent: {a}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    second.child.kill().unwrap();
+    let _ = second.child.wait();
+    let _third = start_at(dir, None, "ok");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let after = saved_agent(&agents_file);
+    assert_eq!(after["attentionAt"], sent["attentionAt"], "notice repeated: {after}");
+    assert_eq!(after["finishDeferred"], false, "{after}");
+}
+
 /// An unloaded timeline is read from disk off the manager task; fetching it
 /// and listing its prompts must still answer with the saved rows.
 #[tokio::test]

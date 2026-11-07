@@ -2038,7 +2038,7 @@ async fn switching_from_codex_to_claude_carries_the_chat_and_resets_the_mode() {
     let saved = wait_for_saved_agent(&agents_file, "switch never saved", |a| a["provider"] == "claude").await;
     assert_eq!(saved["model"], "claude-test", "{saved}");
     assert!(saved["modeId"].is_null(), "codex-only mode kept: {saved}");
-    assert_eq!(saved["thinkingOptionId"], "xhigh", "{saved}");
+    assert!(saved["thinkingOptionId"].is_null(), "{saved}");
     assert!(saved["sessionId"].is_null() && saved["handoffPending"] == true, "{saved}");
 
     for text in ["claude one", "claude two"] {
@@ -2145,4 +2145,25 @@ async fn switching_an_unknown_agent_is_refused() {
     hello(&mut ws, None).await;
     let r = set_model(&mut ws, "no-such-agent", "codex:gpt-test").await;
     assert_eq!(r["accepted"], false, "{r}");
+}
+
+/// A slash command is not wrapped in the handoff (it would stop being a
+/// command): the earlier chat waits for the first ordinary message.
+#[tokio::test]
+async fn slash_command_after_a_switch_keeps_the_handoff_for_the_next_message() {
+    let dir = unique_dir("switch-slash");
+    let cwd = dir.join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let codex = fake_codex(&dir);
+    let d = start_with(dir.clone(), None, "ok", &[("PASEO_CODEX_BIN", codex.to_str().unwrap())]);
+    let mut ws = connect(d.port).await;
+    hello(&mut ws, None).await;
+    let agent_id = create_agent_with(&mut ws, json!({ "provider": "claude", "cwd": cwd.to_string_lossy(), "modeId": "bypassPermissions" }), "first question").await;
+    assert_eq!(set_model(&mut ws, &agent_id, "codex:gpt-test").await["accepted"], true);
+    send_and_wait(&mut ws, &agent_id, "/init").await;
+    send_and_wait(&mut ws, &agent_id, "real question").await;
+    let sent: Vec<String> = std::fs::read_to_string(dir.join("codex-turns")).unwrap().lines().map(String::from).collect();
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    assert!(sent[0].contains("\"text\":\"/init\"") && !sent[0].contains("earlier session"), "{}", sent[0]);
+    assert!(sent[1].contains("User: first question") && sent[1].contains("real question"), "{}", sent[1]);
 }

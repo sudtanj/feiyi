@@ -641,7 +641,7 @@ impl Manager {
         let background = self.claude.working_in_background(agent_id);
         let provider = {
             let Some(agent) = self.agents.get_mut(agent_id) else { return };
-            if agent.rec.handoff_pending {
+            if agent.rec.handoff_pending && !text.trim_start().starts_with('/') {
                 agent.rec.handoff_pending = false;
                 agent.ensure_timeline(&self.store);
                 let earlier = handoff_block(agent.timeline.as_deref().unwrap_or_default());
@@ -1591,9 +1591,12 @@ impl Manager {
 
     /// Move an idle agent to the other provider: stop its old process or
     /// thread, drop the session, and mark the next turn to carry the earlier
-    /// conversation. Mode and thinking fall back to the defaults when the new
-    /// provider has no such value.
+    /// conversation. Thinking falls back to the default; so does the mode when
+    /// the new provider has no such one.
     pub fn switch_provider(&mut self, agent_id: &str, provider: &str, model: Option<String>) -> Result<(), &'static str> {
+        if self.claude.holding(agent_id) {
+            return Err("background work is still running: wait for it to finish before switching provider");
+        }
         let agent = self.agents.get_mut(agent_id).ok_or("agent not found")?;
         if agent.status == "running" {
             return Err("the agent is running: wait for it to finish before switching provider");
@@ -1606,9 +1609,7 @@ impl Manager {
         if rec.mode_id.as_deref().is_some_and(|m| !modes_for(provider).as_array().is_some_and(|modes| modes.iter().any(|x| x["id"] == m))) {
             rec.mode_id = None;
         }
-        if rec.thinking_option_id.as_deref().is_some_and(|t| !(matches!(t, "low" | "medium" | "high" | "xhigh") || (provider == "claude" && t == "max"))) {
-            rec.thinking_option_id = None;
-        }
+        rec.thinking_option_id = None;
         self.claude.stop(agent_id);
         self.codex.abandon(agent_id);
         self.append_item(agent_id, json!({ "type": "notification", "level": "info", "message": format!("Switched to {}", cli_label(cli_of(provider))) }));
@@ -1763,6 +1764,14 @@ mod tests {
     }
 
     #[test]
+    fn handoff_keeps_the_tail_of_a_newest_item_over_the_limit() {
+        let long = format!("{}{}end", "é".repeat(HANDOFF_BYTES), "z".repeat(10));
+        let block = handoff_block(&[row("user_message", "older"), row("assistant_message", &long)]);
+        assert!(block.contains("Assistant: ") && block.contains("zzzzzzzzzzend\n\n[End") && !block.contains("older"), "{}", block.len());
+        assert!(block.len() < HANDOFF_BYTES + 400, "{}", block.len());
+    }
+
+    #[test]
     fn handoff_skips_blank_text_and_trims_the_rest() {
         let rows = [row("user_message", "  hello \n"), row("assistant_message", "   "), row("assistant_message", "hi")];
         let block = handoff_block(&rows);
@@ -1849,6 +1858,14 @@ fn handoff_block(rows: &[Row]) -> String {
         }
         size += who.len() + text.len() + 4;
         if size > HANDOFF_BYTES {
+            if turns.is_empty() {
+                // The newest item alone is over the cap: keep its tail.
+                let mut start = text.len() - (HANDOFF_BYTES - who.len() - 4);
+                while !text.is_char_boundary(start) {
+                    start += 1;
+                }
+                turns.push(format!("{who}: {}", &text[start..]));
+            }
             break;
         }
         turns.push(format!("{who}: {text}"));

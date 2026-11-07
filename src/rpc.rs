@@ -194,7 +194,7 @@ impl Manager {
                     // The request has no provider field: a switch to the other
                     // provider arrives as "<provider>:<modelId>".
                     let (target, model) = match requested.as_deref().and_then(|m| m.split_once(':')) {
-                        Some((p @ ("claude" | "codex"), m)) => (p.to_string(), Some(m.to_string())),
+                        Some((p @ ("claude" | "codex"), m)) => (p.to_string(), (!m.is_empty()).then(|| m.to_string())),
                         _ => (current.clone(), requested),
                     };
                     if target != current {

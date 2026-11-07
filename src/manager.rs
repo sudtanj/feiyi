@@ -38,6 +38,20 @@ fn cli_label(cli: &str) -> &'static str {
     if cli == "codex" { "Codex" } else { "Claude Code" }
 }
 
+/// The mode on `provider` closest to `mode` from the other provider.
+fn equivalent_mode<'a>(mode: &'a str, provider: &str) -> &'a str {
+    match (mode, provider) {
+        ("bypassPermissions", "codex") => "full-access",
+        ("plan", "codex") => "read-only",
+        ("full-access", "claude") => "bypassPermissions",
+        ("read-only", "claude") => "plan",
+        ("auto", "claude") => "acceptEdits",
+        ("acceptEdits", "codex") => "auto",
+        _ if modes_for(provider).as_array().is_some_and(|ms| ms.iter().any(|x| x["id"] == mode)) => mode,
+        _ => crate::providers::default_mode(provider),
+    }
+}
+
 /// How long streamed text is held to be sent as one message.
 const CHUNK_DELAY: Duration = Duration::from_millis(150);
 
@@ -1591,9 +1605,9 @@ impl Manager {
 
     /// Move an idle agent to the other provider: stop its old process or
     /// thread, drop the session, and mark the next turn to carry the earlier
-    /// conversation. Thinking falls back to the default; so does the mode when
-    /// the new provider has no such one.
+    /// conversation. Mode and thinking carry over to their nearest equivalents.
     pub fn switch_provider(&mut self, agent_id: &str, provider: &str, model: Option<String>) -> Result<(), &'static str> {
+        let models = if provider == "codex" { self.codex.cached_models() } else { Some(crate::providers::claude_models()) };
         if self.claude.holding(agent_id) {
             return Err("background work is still running: wait for it to finish before switching provider");
         }
@@ -1606,10 +1620,17 @@ impl Manager {
         rec.model = model;
         rec.session_id = None;
         rec.handoff_pending = true;
-        if rec.mode_id.as_deref().is_some_and(|m| !modes_for(provider).as_array().is_some_and(|modes| modes.iter().any(|x| x["id"] == m))) {
-            rec.mode_id = None;
-        }
-        rec.thinking_option_id = None;
+        // Keep the user's choices: carry mode and effort over to the nearest
+        // equivalent on the new provider.
+        rec.mode_id = rec.mode_id.take().map(|m| equivalent_mode(&m, provider).to_string());
+        let mapped = rec.thinking_option_id.take().map(|t| match (t.as_str(), provider) {
+            ("max", "codex") => "xhigh".to_string(),
+            ("minimal", "claude") => "low".to_string(),
+            _ => t,
+        });
+        // Drop a level the new model doesn't list, so the first turn isn't refused.
+        let listed = models.as_ref().and_then(|ms| ms.as_array()?.iter().find(|m| rec.model.as_deref().map_or(m["isDefault"] == true, |id| m["id"] == id)).map(|m| m["thinkingOptions"].clone()));
+        rec.thinking_option_id = mapped.filter(|t| listed.as_ref().map_or(true, |opts| opts.as_array().is_some_and(|o| o.iter().any(|x| x["id"] == t.as_str()))));
         self.claude.stop(agent_id);
         self.codex.abandon(agent_id);
         self.append_item(agent_id, json!({ "type": "notification", "level": "info", "message": format!("Switched to {}", cli_label(cli_of(provider))) }));
@@ -1742,6 +1763,18 @@ mod tests {
 
     fn row(kind: &str, text: &str) -> Row {
         Row { seq_start: 0, seq_end: 0, ranges: vec![], collapsed: vec![], item: json!({ "type": kind, "text": text }), turn_id: None, timestamp: String::new() }
+    }
+
+    #[test]
+    fn modes_map_to_the_nearest_equivalent() {
+        for (from, to, want) in [
+            ("bypassPermissions", "codex", "full-access"), ("full-access", "claude", "bypassPermissions"),
+            ("plan", "codex", "read-only"), ("read-only", "claude", "plan"),
+            ("acceptEdits", "codex", "auto"), ("auto", "claude", "acceptEdits"),
+            ("default", "codex", "auto"), ("default", "claude", "default"),
+        ] {
+            assert_eq!(equivalent_mode(from, to), want, "{from} on {to}");
+        }
     }
 
     #[test]

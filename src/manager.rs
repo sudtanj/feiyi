@@ -1026,7 +1026,8 @@ impl Manager {
     /// Send the "finished" notice a turn held back for background work that
     /// is gone now. Once: the flag is cleared.
     fn send_deferred_finish(&mut self, agent_id: &str) {
-        let Some(a) = self.agents.get_mut(agent_id).filter(|a| std::mem::take(&mut a.rec.finish_deferred)) else { return };
+        let Some(a) = self.agents.get_mut(agent_id).filter(|a| a.rec.finish_deferred) else { return };
+        a.rec.finish_deferred = false;
         a.rec.attention_reason = Some("finished".into());
         a.rec.attention_at = Some(now_iso());
         crate::log!("agent {agent_id}: background work ended without reporting back; sending the held finished notice");

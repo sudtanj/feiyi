@@ -832,10 +832,10 @@ mod tests {
             "zilongApiKey": "k1",
             "providers": { "claude": { "enabled": false, "apiKey": "k2", "authToken": "t1" } },
             "list": [{ "secret": "s1", "keep": 1 }],
-            "backup": { "tursoUrl": "libsql://x", "tursoToken": "t2", "passphrase": "pp" },
+            "backup": { "tursoUrl": "libsql://x", "tursoToken": "t2", "passphrase": "pass-zz9" },
         });
         let row = String::from_utf8(config_row(raw.to_string().as_bytes()).unwrap()).unwrap();
-        for leaked in ["p1", "k1", "k2", "t1", "s1", "t2", "pp", "libsql", "backup"] {
+        for leaked in ["p1", "k1", "k2", "t1", "s1", "t2", "pass-zz9", "libsql", "backup"] {
             assert!(!row.contains(leaked), "{leaked} in {row}");
         }
         let kept: Value = serde_json::from_str(&row).unwrap();

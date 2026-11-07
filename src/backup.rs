@@ -35,7 +35,7 @@ const CHUNK_BYTES: usize = 512 * 1024;
 const REQUEST_BYTES: usize = 2 * 1024 * 1024;
 const REQUEST_STATEMENTS: usize = 64;
 /// An item whose plaintext is larger is skipped, and so is refused when opening a row.
-const MAX_ITEM_BYTES: usize = 128 * 1024 * 1024;
+const MAX_ITEM_BYTES: usize = 64 * 1024 * 1024;
 const RESTORE_TIMEOUT: Duration = Duration::from_secs(300);
 const META: &str = "meta";
 const VERIFIER: &[u8] = b"feiyi-backup-v1";
@@ -956,13 +956,37 @@ fn item_groups(remote: &BTreeSet<String>) -> Vec<Group> {
     by_item.into_iter().map(|(item, keys)| Group { item: item.to_string(), keys }).collect()
 }
 
+/// Largest sealed (base64) size of an item of `plain` bytes: the envelope
+/// (key name up to 256 bytes), deflate's worst case (stored blocks, with
+/// generous headroom), nonce and tag, then base64. Whatever the backup
+/// accepts (`MAX_ITEM_BYTES`), a restore accepts.
+const fn sealed_bound(plain: usize) -> usize {
+    let envelope = plain + 2 + 256;
+    (envelope + envelope / 8 + 40) * 4 / 3 + 4
+}
+
+const SEALED_ITEM_MAX: usize = sealed_bound(MAX_ITEM_BYTES);
+
+/// A fetched row must fit a chunk, and the rows of one item its bound. Checked
+/// as each row arrives, before it is kept: a hostile remote cannot make a restore buffer more.
+fn check_row(key: &str, data: &str, item_total: &mut usize) -> Result<(), String> {
+    *item_total += data.len();
+    if data.len() > CHUNK_BYTES || *item_total > SEALED_ITEM_MAX {
+        return Err(format!("{key}: the row is larger than any backup writes"));
+    }
+    Ok(())
+}
+
 /// The data of each row key, in order, in requests of at most `ROWS_PER_REQUEST` rows.
 async fn fetch_rows(turso: &Turso, keys: &[String]) -> Result<Vec<String>, String> {
     let mut data = Vec::with_capacity(keys.len());
+    let mut total = 0;
     for part in keys.chunks(ROWS_PER_REQUEST) {
         let res = turso.run(part.iter().map(|k| Stmt { sql: SELECT_ROW, args: vec![text(k)] }).collect()).await?;
         for (key, rows) in part.iter().zip(res) {
-            data.push(rows.into_iter().next().and_then(|r| r.into_iter().next()).ok_or_else(|| format!("{key}: the row is gone"))?);
+            let row = rows.into_iter().next().and_then(|r| r.into_iter().next()).ok_or_else(|| format!("{key}: the row is gone"))?;
+            check_row(key, &row, &mut total)?;
+            data.push(row);
         }
     }
     Ok(data)
@@ -998,7 +1022,7 @@ async fn restore(home: &Path, ready: &Ready) -> Result<Option<Restored>, String>
             rows += groups[end].keys.len();
             end += 1;
         }
-        if let Some(g) = groups[start..end].iter().find(|g| g.keys.len() * CHUNK_BYTES > MAX_ITEM_BYTES + CHUNK_BYTES) {
+        if let Some(g) = groups[start..end].iter().find(|g| g.keys.len() > SEALED_ITEM_MAX / CHUNK_BYTES + 1) {
             return Err(format!("{}: too large to restore", g.item));
         }
         let keys: Vec<String> = groups[start..end].iter().flat_map(|g| g.keys.clone()).collect();
@@ -1789,6 +1813,37 @@ mod tests {
         let done = stream(&home, &key, &store, |_| {}).unwrap();
         assert_eq!((done.agents, done.projects, done.timelines), (1, 1, 0), "timelines already on disk are kept");
         assert!(has_local_state(&home));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn oversized_rows_are_rejected_and_the_restore_bound_covers_what_the_backup_accepts() {
+        let mut total = 0;
+        assert!(check_row("k", &"a".repeat(CHUNK_BYTES), &mut total).is_ok(), "a full chunk is fine");
+        assert!(check_row("k", &"a".repeat(CHUNK_BYTES + 1), &mut 0).is_err(), "one byte over a chunk");
+        assert!(check_row("k", "aa", &mut (SEALED_ITEM_MAX - 1)).is_err(), "the item's running total is bounded");
+
+        // Incompressible data is the worst case: sealed size must stay within the bound,
+        // so the rows pass `check_row` and the item restores.
+        let (_, key) = make_meta("pw", &FAST).unwrap();
+        let home = temp_home();
+        let mut seed = 99u32;
+        for size in [1usize, 1000, 70_000, 1 << 20] {
+            let noise: Vec<u8> = (0..size).map(|_| { seed = seed.wrapping_mul(1664525).wrapping_add(1013904223); (seed >> 24) as u8 }).collect();
+            let item = format!("timeline/n{size}");
+            let sealed = seal(&key, &item, &noise).unwrap();
+            assert!(sealed.len() <= sealed_bound(size), "{size}: {} > {}", sealed.len(), sealed_bound(size));
+            let rows = split_chunks(&item, sealed);
+            let mut total = 0;
+            assert!(rows.iter().all(|(k, d)| check_row(k, d, &mut total).is_ok()));
+            let group = Group { item: item.clone(), keys: rows.iter().map(|(k, _)| k.clone()).collect() };
+            let (mut small, mut timelines) = (BTreeMap::new(), 0);
+            absorb(&home, &key, &group, rows.into_iter().map(|(_, d)| d).collect(), &mut small, &mut timelines).unwrap();
+            assert_eq!(std::fs::read(home.join(format!("timelines/n{size}.jsonl"))).unwrap(), noise);
+        }
+        // At the backup's own limit the bound still fits the row count a restore allows.
+        assert!(SEALED_ITEM_MAX >= MAX_ITEM_BYTES, "base64 and overhead only add");
+        assert!(SEALED_ITEM_MAX.div_ceil(CHUNK_BYTES) <= SEALED_ITEM_MAX / CHUNK_BYTES + 1);
         let _ = std::fs::remove_dir_all(&home);
     }
 

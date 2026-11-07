@@ -302,6 +302,7 @@ impl Manager {
             "uptimeSecs": uptime,
             "daemonRssKib": crate::rpc_ext::rss_kib(),
             "config": redacted_config(&self.cfg),
+            "backup": crate::backup::status(),
             "runtime": self.runtime_status(),
             "capacity": self.capacity.debug_status(),
             "machine": machine_status(),
@@ -480,6 +481,7 @@ fn redacted_config(cfg: &crate::config::Config) -> Value {
             "rtk": cfg.rtk,
             "rtkClaudeSettings": crate::token_saver::claude_settings(cfg).map(|p| p.display().to_string()),
         },
+        "backup": cfg.backup.redacted(),
         "mcp": {
             "zilongRouterUrl": cfg.zilong_mcp_url.as_deref().map(redact_url),
             "zilongApiKeySet": cfg.zilong_api_key.is_some(),

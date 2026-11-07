@@ -110,6 +110,8 @@ pub struct Config {
     pub ponytail: Option<String>,
     /// RTK tool-output compression for Claude Code's Bash tool: always on.
     pub rtk: bool,
+    /// Remote backup to a Turso database (backup.rs).
+    pub backup: crate::backup::BackupConfig,
 }
 
 fn env(key: &str) -> Option<String> {
@@ -162,6 +164,7 @@ impl Config {
         let relay_public_use_tls = env_bool("PASEO_RELAY_PUBLIC_USE_TLS").unwrap_or(relay_use_tls);
         let debug_mcp_off = env("PASEO_DEBUG_MCP").map(|v| matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no")).unwrap_or(false);
         let debug_mcp = if debug_mcp_off { None } else { crate::mcp::DebugMcp::for_listen(&listen) };
+        let backup = crate::backup::BackupConfig::load(&home);
         Config {
             home,
             listen,
@@ -216,6 +219,7 @@ impl Config {
             caveman: env_level("PASEO_CAVEMAN", crate::token_saver::prompts::CAVEMAN_LEVELS),
             ponytail: env_level("PASEO_PONYTAIL", crate::token_saver::prompts::PONYTAIL_LEVELS),
             rtk: true,
+            backup,
         }
     }
 }

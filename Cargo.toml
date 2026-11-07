@@ -26,6 +26,8 @@ humantime = "2"
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 libc = "0.2"
 miniz_oxide = "0.8"
+argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
+crypto_secretbox = "0.1"
 
 [profile.release]
 opt-level = "z"

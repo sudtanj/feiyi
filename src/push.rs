@@ -143,15 +143,16 @@ pub async fn send(tokens: Vec<String>, payload: Value) -> Vec<String> {
 
 /// Minimal HTTPS POST (HTTP/1.1, `Connection: close`) returning status and body.
 async fn post_json(host: &str, path: &str, body: &str) -> Result<(u16, String), String> {
-    request("POST", host, path, Some(body), 256 * 1024, Duration::from_secs(20)).await
+    request("POST", host, path, Some(body), "", 256 * 1024, Duration::from_secs(20)).await
 }
 
 /// Minimal HTTPS GET returning status and body (at most `max` bytes read).
 pub async fn get(host: &str, path: &str, max: u64, timeout: Duration) -> Result<(u16, String), String> {
-    request("GET", host, path, None, max, timeout).await
+    request("GET", host, path, None, "", max, timeout).await
 }
 
-async fn request(method: &str, host: &str, path: &str, body: Option<&str>, max: u64, timeout: Duration) -> Result<(u16, String), String> {
+/// `headers`: extra request header lines, each ending in `\r\n`.
+pub(crate) async fn request(method: &str, host: &str, path: &str, body: Option<&str>, headers: &str, max: u64, timeout: Duration) -> Result<(u16, String), String> {
     let work = async {
         let tcp = tokio::net::TcpStream::connect((host, 443)).await.map_err(|e| e.to_string())?;
         let _ = tcp.set_nodelay(true);
@@ -160,10 +161,10 @@ async fn request(method: &str, host: &str, path: &str, body: Option<&str>, max: 
         let agent = format!("feiyi/{}", env!("CARGO_PKG_VERSION"));
         let request = match body {
             Some(body) => format!(
-                "{method} {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nAccept: application/json\r\nUser-Agent: {agent}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                "{method} {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nAccept: application/json\r\nUser-Agent: {agent}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             ),
-            None => format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {agent}\r\nConnection: close\r\n\r\n"),
+            None => format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {agent}\r\n{headers}Connection: close\r\n\r\n"),
         };
         tls.write_all(request.as_bytes()).await.map_err(|e| e.to_string())?;
         let mut raw = Vec::new();

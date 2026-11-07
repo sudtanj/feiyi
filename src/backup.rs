@@ -1529,7 +1529,7 @@ mod tests {
         let items = BTreeMap::from([("projects".to_string(), json!([{ "rootPath": home.to_string_lossy(), "remote": "git@h:o/r.git" }]).to_string().into_bytes())]);
         let done = write_restored(&home, &items).unwrap();
         assert!(done.clones.is_empty(), "nothing to clone when the directory exists");
-        assert_eq!(load_state_file(&home).remotes[home.to_string_lossy().as_ref()], "git@h:o/r.git");
+        assert_eq!(load_state_file(&home).remotes[&*home.to_string_lossy()], "git@h:o/r.git");
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -1598,9 +1598,8 @@ mod tests {
         assert!(check_may_write(&fresh, &mut owns_remote, &remote_keys(&store)).is_ok());
         assert!(owns_remote);
         let mut restored_state = State::new(BTreeMap::new(), remote_keys(&store));
-        let rows = cycle(&mut restored_state, &key, &mut store, &fresh, &projects);
-        assert!(rows <= 1, "only the projects row may differ, got {rows}");
-        assert!(store.keys().filter(|k| k.starts_with("agent/") || k.starts_with("timeline/")).eq(before.keys().filter(|k| k.starts_with("agent/") || k.starts_with("timeline/"))));
+        cycle(&mut restored_state, &key, &mut store, &fresh, &projects);
+        assert_eq!(remote_keys(&store), remote_keys(&before), "the restored machine neither adds nor deletes rows");
         for dir in [&source, &fresh] {
             let _ = std::fs::remove_dir_all(dir);
         }

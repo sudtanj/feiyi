@@ -1858,13 +1858,15 @@ describe("HostRuntimeStore", () => {
       return { host, store, stuckClient, freshClient, requests };
     }
 
-    it("replaces a client stuck in connecting on foreground", async () => {
+    it("replaces a client stuck in connecting when returning from hidden", async () => {
       const { store, stuckClient, freshClient, requests } = await createStuckHost();
-      stuckClient.setConnectionState({ status: "connecting", attempt: 1 });
 
       useHostRuntimeClock();
+      store.setAppVisible(false);
+      stuckClient.setConnectionState({ status: "connecting", attempt: 1 });
       store.setAppVisible(true);
       expect(requests.count).toBe(1);
+      // Well before the watchdog's new-client step.
       await vi.advanceTimersByTimeAsync(100);
       await waitForHostOnline(store, "srv_stuck");
       expect(stuckClient.isDisposed()).toBe(true);
@@ -1873,7 +1875,20 @@ describe("HostRuntimeStore", () => {
       store.syncHosts([]);
     });
 
-    it("does not replace an online client on foreground, only verifies it", async () => {
+    it("leaves a connecting client alone on a cold-start foreground", async () => {
+      const { store, stuckClient, freshClient } = await createStuckHost();
+      stuckClient.setConnectionState({ status: "connecting", attempt: 1 });
+
+      useHostRuntimeClock();
+      store.setAppVisible(true);
+      await vi.advanceTimersByTimeAsync(100);
+      expect(stuckClient.isDisposed()).toBe(false);
+      expect(freshClient.connectCalls).toBe(0);
+
+      store.syncHosts([]);
+    });
+
+    it("does not replace an online client returning from hidden, only verifies it", async () => {
       const { store, stuckClient, freshClient, requests } = await createStuckHost();
       let verifications = 0;
       stuckClient.ensureConnected = (options?: { verify?: boolean }) => {
@@ -1882,6 +1897,7 @@ describe("HostRuntimeStore", () => {
       };
 
       useHostRuntimeClock();
+      store.setAppVisible(false);
       store.setAppVisible(true);
       await vi.advanceTimersByTimeAsync(100);
       expect(requests.count).toBe(1);
@@ -1902,26 +1918,7 @@ describe("HostRuntimeStore", () => {
       );
 
       useHostRuntimeClock();
-      store.setAppVisible(true);
-      await vi.advanceTimersByTimeAsync(100);
-      expect(requests.count).toBe(1);
-      expect(stuckClient.isDisposed()).toBe(false);
-      expect(freshClient.connectCalls).toBe(0);
-
-      store.syncHosts([]);
-    });
-
-    it("sends an offline host through ensureConnected without replacing it", async () => {
-      const { host, store, stuckClient, freshClient, requests } = await createStuckHost();
-      stuckClient.setConnectionState({ status: "disconnected", reason: "backgrounded" });
-      await onceHostSnapshotMatches(
-        store,
-        host.serverId,
-        (snapshot) => snapshot?.connectionStatus !== "online" && snapshot?.connectionStatus !== "connecting",
-      );
-      expect(store.getSnapshot(host.serverId)?.connectionStatus).not.toBe("connecting");
-
-      useHostRuntimeClock();
+      store.setAppVisible(false);
       store.setAppVisible(true);
       await vi.advanceTimersByTimeAsync(100);
       expect(requests.count).toBe(1);

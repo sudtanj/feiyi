@@ -16,7 +16,7 @@ pub const HOOK_CMD: &str = "guard-hook";
 pub const MATCHER: &str = "Read|Edit|MultiEdit|Write|Grep|Glob|Bash|NotebookEdit";
 
 /// Variables holding secrets, by name (GH_TOKEN is left out: agents push with it).
-const SECRET_VARS: &[&str] = &["PASEO_ZILONG_API_KEY", "PASEO_LITE_MCP_TOKEN", "PASEO_PASSWORD", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_MESSAGING_TOKEN", "CODEX_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"];
+const SECRET_VARS: &[&str] = &["PASEO_ZILONG_API_KEY", "PASEO_LITE_MCP_TOKEN", "PASEO_PASSWORD", "FEIYI_BACKUP_PASSPHRASE", "FEIYI_BACKUP_TURSO_TOKEN", "FEIYI_BACKUP_TURSO_URL", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_MESSAGING_TOKEN", "CODEX_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"];
 /// Paths that are secret wherever the home directory is.
 const SECRET_PATHS: &[&str] = &["/.claude/.credentials.json", "/.codex/auth.json", "/.ssh"];
 /// What an agent may still read inside the state dir.

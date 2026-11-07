@@ -302,6 +302,7 @@ impl Manager {
             "uptimeSecs": uptime,
             "daemonRssKib": crate::rpc_ext::rss_kib(),
             "config": redacted_config(&self.cfg),
+            "backup": crate::backup::status(),
             "runtime": self.runtime_status(),
             "capacity": self.capacity.debug_status(),
             "machine": machine_status(),
@@ -480,6 +481,7 @@ fn redacted_config(cfg: &crate::config::Config) -> Value {
             "rtk": cfg.rtk,
             "rtkClaudeSettings": crate::token_saver::claude_settings(cfg).map(|p| p.display().to_string()),
         },
+        "backup": cfg.backup.redacted(),
         "mcp": {
             "zilongRouterUrl": cfg.zilong_mcp_url.as_deref().map(redact_url),
             "zilongApiKeySet": cfg.zilong_api_key.is_some(),
@@ -488,16 +490,18 @@ fn redacted_config(cfg: &crate::config::Config) -> Value {
     })
 }
 
-/// A URL without credentials, query or fragment.
-fn redact_url(url: &str) -> String {
+/// A URL without credentials, query or fragment. An `ssh://` URL keeps its
+/// user name (`git@`, needed to clone), minus any `:password`.
+pub(crate) fn redact_url(url: &str) -> String {
     let url = url.split(|c: char| c == '?' || c == '#').next().unwrap_or("");
     let Some((scheme, rest)) = url.split_once("://") else { return url.to_string() };
     let (authority, path) = match rest.find('/') {
         Some(i) => rest.split_at(i),
         None => (rest, ""),
     };
-    let host = authority.rsplit('@').next().unwrap_or(authority);
-    format!("{scheme}://{host}{path}")
+    let (userinfo, host) = authority.rsplit_once('@').unwrap_or(("", authority));
+    let user = userinfo.split(':').next().filter(|u| scheme == "ssh" && !u.is_empty());
+    format!("{scheme}://{}{host}{path}", user.map(|u| format!("{u}@")).unwrap_or_default())
 }
 
 fn read_trimmed(path: &str) -> Option<String> {
@@ -753,6 +757,9 @@ mod tests {
     fn urls_lose_credentials_and_queries() {
         assert_eq!(redact_url("http://user:pw@pi:20128/mcp?key=x#f"), "http://pi:20128/mcp");
         assert_eq!(redact_url("http://pi:20128"), "http://pi:20128");
+        assert_eq!(redact_url("ssh://git@github.com/o/r.git"), "ssh://git@github.com/o/r.git");
+        assert_eq!(redact_url("ssh://git:pw@github.com:22/o/r.git"), "ssh://git@github.com:22/o/r.git");
+        assert_eq!(redact_url("https://git:tok@github.com/o/r.git"), "https://github.com/o/r.git");
     }
 
     #[test]

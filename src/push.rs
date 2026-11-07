@@ -143,15 +143,16 @@ pub async fn send(tokens: Vec<String>, payload: Value) -> Vec<String> {
 
 /// Minimal HTTPS POST (HTTP/1.1, `Connection: close`) returning status and body.
 async fn post_json(host: &str, path: &str, body: &str) -> Result<(u16, String), String> {
-    request("POST", host, path, Some(body), 256 * 1024, Duration::from_secs(20)).await
+    request("POST", host, path, Some(body), "", 256 * 1024, Duration::from_secs(20)).await
 }
 
 /// Minimal HTTPS GET returning status and body (at most `max` bytes read).
 pub async fn get(host: &str, path: &str, max: u64, timeout: Duration) -> Result<(u16, String), String> {
-    request("GET", host, path, None, max, timeout).await
+    request("GET", host, path, None, "", max, timeout).await
 }
 
-async fn request(method: &str, host: &str, path: &str, body: Option<&str>, max: u64, timeout: Duration) -> Result<(u16, String), String> {
+/// `headers`: extra request header lines, each ending in `\r\n`.
+pub(crate) async fn request(method: &str, host: &str, path: &str, body: Option<&str>, headers: &str, max: u64, timeout: Duration) -> Result<(u16, String), String> {
     let work = async {
         let tcp = tokio::net::TcpStream::connect((host, 443)).await.map_err(|e| e.to_string())?;
         let _ = tcp.set_nodelay(true);
@@ -160,10 +161,10 @@ async fn request(method: &str, host: &str, path: &str, body: Option<&str>, max: 
         let agent = format!("feiyi/{}", env!("CARGO_PKG_VERSION"));
         let request = match body {
             Some(body) => format!(
-                "{method} {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nAccept: application/json\r\nUser-Agent: {agent}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                "{method} {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nAccept: application/json\r\nUser-Agent: {agent}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             ),
-            None => format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {agent}\r\nConnection: close\r\n\r\n"),
+            None => format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {agent}\r\n{headers}Connection: close\r\n\r\n"),
         };
         tls.write_all(request.as_bytes()).await.map_err(|e| e.to_string())?;
         let mut raw = Vec::new();
@@ -254,5 +255,31 @@ mod tests {
         again.revoke("ExponentPushToken[abc]");
         assert!(again.active().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn turso_style_responses_survive_chunking_and_report_errors() {
+        let json = r#"{"results":[{"type":"ok","response":{"type":"execute","result":{"rows":[]}}}]}"#;
+        let (a, b) = json.split_at(23);
+        let chunked = format!("HTTP/1.1 200 OK\r\ntransfer-encoding: Chunked\r\nContent-Type: application/json\r\n\r\n{:X};ext=1\r\n{a}\r\n{:x}\r\n{b}\r\n0\r\n\r\n", a.len(), b.len());
+        assert_eq!(parse_response(chunked.as_bytes()).unwrap(), (200, json.to_string()));
+
+        let unauthorized = b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 25\r\n\r\n{\"error\":\"Unauthorized\"}";
+        assert_eq!(parse_response(unauthorized).unwrap(), (401, "{\"error\":\"Unauthorized\"}".to_string()));
+
+        let server_error = b"HTTP/1.1 500 Internal Server Error\r\nTransfer-Encoding: chunked\r\n\r\n5\r\noops!\r\n0\r\n\r\n";
+        assert_eq!(parse_response(server_error).unwrap(), (500, "oops!".to_string()));
+
+        assert_eq!(parse_response(b"HTTP/1.1 204 No Content\r\n\r\n").unwrap(), (204, String::new()));
+        assert!(parse_response(b"HTTP/1.1 200 OK\r\nContent-Length: 2").is_err(), "no end of headers");
+        assert!(parse_response(b"HTTP/1.1 abc\r\n\r\n").is_err());
+        assert!(parse_response(b"").is_err());
+    }
+
+    #[test]
+    fn a_response_cut_off_mid_chunk_keeps_only_whole_chunks() {
+        let cut = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n9\r\nshort";
+        assert_eq!(parse_response(cut).unwrap(), (200, "abc".to_string()));
+        assert_eq!(dechunk("2\r\n\u{e9}\r\n0\r\n\r\n"), "\u{e9}");
     }
 }

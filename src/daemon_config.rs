@@ -146,6 +146,7 @@ impl DaemonConfig {
         out.insert("hostnames".into(), json!(cfg.hostnames));
         out.insert("app".into(), json!({ "baseUrl": cfg.app_base_url }));
         out.insert("relay".into(), json!({ "enabled": cfg.relay_enabled }));
+        out.remove("backup");
         out.entry("providers").or_insert_with(|| json!({}));
         out.entry("appendSystemPrompt").or_insert_with(|| json!(""));
         Value::Object(out)
@@ -185,8 +186,8 @@ impl DaemonConfig {
                         }
                     }
                 }
-                // Environment-controlled in feiyi; not stored.
-                "mcp" | "hostnames" | "app" | "relay" => {}
+                // Environment-controlled in feiyi (backup: edited by hand, it holds secrets); not stored.
+                "mcp" | "hostnames" | "app" | "relay" | "backup" => {}
                 _ => {
                     self.stored.insert(key.clone(), value.clone());
                 }
@@ -274,5 +275,18 @@ mod tests {
         let mut c = config();
         c.apply_patch(&json!({ "relay": { "enabled": false }, "hostnames": ["x"] }));
         assert!(c.stored.get("relay").is_none() && c.stored.get("hostnames").is_none());
+    }
+
+    #[test]
+    fn the_app_cannot_write_the_backup_section_but_a_hand_edited_one_survives_saves() {
+        let dir = std::env::temp_dir().join(format!("feiyi-cfg-{}", crate::util::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("daemon-config.json"), r#"{"backup":{"tursoToken":"tok-keep"}}"#).unwrap();
+        let mut c = DaemonConfig::load(&dir);
+        c.apply_patch(&json!({ "backup": { "tursoToken": "tok-app" }, "appendSystemPrompt": "x" }));
+        let saved: Value = serde_json::from_slice(&std::fs::read(dir.join("daemon-config.json")).unwrap()).unwrap();
+        assert_eq!(saved["backup"]["tursoToken"], "tok-keep");
+        assert_eq!(saved["appendSystemPrompt"], "x");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

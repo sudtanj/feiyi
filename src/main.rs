@@ -1,3 +1,4 @@
+mod backup;
 mod capacity;
 mod checkout;
 mod cleanup;
@@ -49,6 +50,7 @@ USAGE:
 ENVIRONMENT (selection):
     PASEO_LITE_HOME          state dir (default ~/.paseo-lite)
     PASEO_LISTEN             default 127.0.0.1:6768
+    FEIYI_BACKUP_TURSO_URL / _TURSO_TOKEN / _PASSPHRASE / _INTERVAL_SECS  encrypted Turso backup; same as the backup section of daemon-config.json, which wins (needs URL, token and passphrase)
     PASEO_PASSWORD           require this password for direct connections
     PASEO_RELAY_ENABLED=false  disable the relay
     PASEO_HOSTNAMES          extra allowed Host names (comma separated, .suffix ok)
@@ -119,6 +121,7 @@ fn main() {
 }
 
 async fn run(cfg: Config, identity: Arc<e2ee::DaemonIdentity>) {
+    backup::restore_if_empty(&cfg).await;
     let pairing = cfg.relay_enabled.then(|| identity.pairing_url(&cfg.app_base_url, &cfg.relay_public_endpoint, cfg.relay_public_use_tls));
     let (bcast, _) = tokio::sync::broadcast::channel(2048);
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -139,6 +142,7 @@ async fn run(cfg: Config, identity: Arc<e2ee::DaemonIdentity>) {
     crate::log!("feiyi {} serverId={} home={}", env!("CARGO_PKG_VERSION"), identity.server_id, cfg.home.display());
     mcp::write_claude_config(&cfg);
     token_saver::write_claude_settings(&cfg);
+    backup::spawn(&cfg);
     uploads::prune(&cfg.home);
     usage::load_prices(&cfg.home);
     tokio::spawn(usage::refresh_prices(cfg.home.clone()));

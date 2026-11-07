@@ -194,7 +194,7 @@ fn spawn(cwd: &str, command: Option<(&str, &[String])>, rows: u16, cols: u16) ->
     };
     cmd.current_dir(cwd).env("TERM", "xterm-256color").env("COLORTERM", "truecolor");
     for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("PASEO_") {
+        if key.to_string_lossy().starts_with("PASEO_") || key.to_string_lossy().starts_with("FEIYI_BACKUP_") {
             cmd.env_remove(key);
         }
     }

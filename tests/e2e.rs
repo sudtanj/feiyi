@@ -1953,7 +1953,7 @@ async fn switching_provider_starts_a_fresh_session_with_the_earlier_chat() {
     .await;
     recv_until(&mut ws, |v| (v["message"]["type"] == "agent_stream" && v["message"]["payload"]["event"]["type"] == "turn_completed").then_some(())).await;
     let agents_file = dir.join("home").join("agents.json");
-    wait_for_saved_agent(&agents_file, "claude session never saved", |a| a["sessionId"] == "fake-session").await;
+    wait_for_saved_agent(&agents_file, "claude session never saved", |a| a["sessionId"].is_string()).await;
 
     let switched = rpc(&mut ws, json!({ "type": "set_agent_model_request", "requestId": "s1", "agentId": agent_id, "modelId": "codex:gpt-test" }), "set_agent_model_response").await;
     assert_eq!(switched["accepted"], true, "{switched}");

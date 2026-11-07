@@ -66,6 +66,10 @@ pub struct AgentRecord {
     /// held back. Still set when that work is lost: the notice is sent then.
     #[serde(default)]
     pub finish_deferred: bool,
+    /// The provider was switched in place: the next turn starts a fresh
+    /// session and carries the earlier conversation as context.
+    #[serde(default)]
+    pub handoff_pending: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

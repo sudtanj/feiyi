@@ -36,6 +36,8 @@ const REQUEST_STATEMENTS: usize = 64;
 const MAX_ITEM_BYTES: usize = 128 * 1024 * 1024;
 const RESTORE_TIMEOUT: Duration = Duration::from_secs(300);
 const PAGE_ROWS: usize = 10;
+/// Raw (encrypted) rows a restore may pull before it gives up.
+const MAX_RESTORE_BYTES: usize = 256 * 1024 * 1024;
 const META: &str = "meta";
 const VERIFIER: &[u8] = b"feiyi-backup-v1";
 const DEFAULT_INTERVAL_SECS: u64 = 900;
@@ -511,7 +513,8 @@ struct State {
 impl State {
     /// Hashes survive a restart, but only for items the remote still has.
     fn new(mut hashes: BTreeMap<String, u64>, remote: BTreeSet<String>) -> State {
-        hashes.retain(|item, _| remote.iter().any(|k| belongs(k, item)));
+        let held: BTreeSet<&str> = remote.iter().map(|k| item_of(k)).collect();
+        hashes.retain(|item, _| held.contains(item.as_str()));
         State { hashes, remote }
     }
 
@@ -525,8 +528,14 @@ impl State {
     }
 
     /// Hands each change to `sink` as soon as it is sealed, so only one item
-    /// is in memory at a time; the sink returns false to stop.
+    /// is in memory at a time; the sink returns false to stop. Only items this
+    /// machine has uploaded (it holds a hash) are ever deleted remotely: rows
+    /// another machine wrote are left alone.
     fn plan_with(&self, key: &SecretKey, items: &BTreeMap<String, Item>, sink: &mut dyn FnMut(Change) -> bool) -> Result<(), String> {
+        let mut rows_of: BTreeMap<&str, Vec<&String>> = BTreeMap::new();
+        for k in &self.remote {
+            rows_of.entry(item_of(k)).or_default().push(k);
+        }
         let mut present = BTreeSet::new();
         for (item, source) in items {
             let Some(bytes) = source.bytes()? else { continue };
@@ -540,14 +549,16 @@ impl State {
                 continue;
             }
             let put = split_chunks(item, seal(key, item, &bytes)?);
-            let delete = self.remote.iter().filter(|k| belongs(k, item) && !put.iter().any(|(p, _)| p == *k)).cloned().collect();
+            let delete = rows_of.get(item.as_str()).into_iter().flatten().filter(|k| !put.iter().any(|(p, _)| p == **k)).map(|k| (*k).clone()).collect();
             if !sink(Change { item: item.clone(), hash: Some(hash), put, delete }) {
                 return Ok(());
             }
         }
-        let gone: BTreeSet<&str> = self.remote.iter().map(|k| item_of(k)).filter(|i| *i != META && !present.contains(i)).collect();
-        for item in gone {
-            let delete = self.remote.iter().filter(|k| belongs(k, item)).cloned().collect();
+        for (item, rows) in &rows_of {
+            if *item == META || present.contains(item) || !self.hashes.contains_key(*item) {
+                continue;
+            }
+            let delete = rows.iter().map(|k| (*k).clone()).collect();
             if !sink(Change { item: item.to_string(), hash: None, put: Vec::new(), delete }) {
                 break;
             }
@@ -792,6 +803,16 @@ fn has_local_state(home: &Path) -> bool {
     ["agents.json", "projects.json", "workspaces.json"].iter().any(|f| list_has_entries(&home.join(f)))
 }
 
+/// `has_local_state`, and a leftover restore-pending marker goes away once
+/// the machine has state: the empty-local guard still protects the remote.
+fn has_state_clearing_marker(home: &Path) -> bool {
+    let has = has_local_state(home);
+    if has {
+        let _ = std::fs::remove_file(home.join(RESTORE_PENDING));
+    }
+    has
+}
+
 #[derive(Default, Debug)]
 struct Restored {
     agents: usize,
@@ -886,11 +907,16 @@ fn write_restored(home: &Path, items: &BTreeMap<String, Vec<u8>>) -> Result<Rest
 async fn fetch_items(ready: &Ready, key: &SecretKey) -> Result<BTreeMap<String, Vec<u8>>, String> {
     let mut rows = BTreeMap::new();
     let mut after = String::new();
+    let mut total = 0usize;
     loop {
         let page = ready.turso.run(vec![Stmt { sql: SELECT_PAGE, args: vec![text(&after)] }]).await?.remove(0);
         let more = page.len() == PAGE_ROWS;
         for row in page {
             let [k, d] = <[String; 2]>::try_from(row).map_err(|_| "unexpected row shape".to_string())?;
+            total += k.len() + d.len();
+            if total > MAX_RESTORE_BYTES {
+                return Err(format!("the backup holds more than {} MiB; restore aborted", MAX_RESTORE_BYTES >> 20));
+            }
             after = k.clone();
             rows.insert(k, d);
         }
@@ -923,7 +949,7 @@ pub async fn restore_if_empty(cfg: &crate::config::Config) {
         Ok(None) => return,
         Err(e) => return crate::warn!("backup restore skipped: {e}"),
     };
-    if has_local_state(&cfg.home) {
+    if has_state_clearing_marker(&cfg.home) {
         return crate::log!("backup restore skipped: local state exists");
     }
     let marker = cfg.home.join(RESTORE_PENDING);
@@ -1617,6 +1643,29 @@ mod tests {
         let mut state = State::new(BTreeMap::new(), remote);
         assert!(cycle(&mut state, &key, &mut store, &home, &[]) > 0);
         assert!(store.contains_key("projects"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn only_items_this_machine_uploaded_are_deleted_remotely() {
+        let (_, key) = make_meta("pw", &FAST).unwrap();
+        let remote = BTreeSet::from([META.to_string(), "agent/mine".to_string(), "agent/theirs".to_string(), "timeline/theirs#0".to_string(), "timeline/theirs#1".to_string()]);
+        let state = State::new(BTreeMap::from([("agent/mine".to_string(), 1)]), remote);
+        let changes = state.plan(&key, &BTreeMap::new()).unwrap();
+        assert_eq!(changes.iter().map(|c| c.item.as_str()).collect::<Vec<_>>(), ["agent/mine"]);
+        assert_eq!(changes[0].delete, ["agent/mine"]);
+    }
+
+    #[test]
+    fn a_stale_restore_marker_goes_away_once_the_machine_has_state() {
+        let home = temp_home();
+        let marker = home.join(RESTORE_PENDING);
+        std::fs::write(&marker, "").unwrap();
+        assert!(!has_state_clearing_marker(&home));
+        assert!(marker.exists(), "an empty machine keeps the marker");
+        std::fs::write(home.join("agents.json"), r#"[{"id":"a"}]"#).unwrap();
+        assert!(has_state_clearing_marker(&home));
+        assert!(!marker.exists());
         let _ = std::fs::remove_dir_all(&home);
     }
 }

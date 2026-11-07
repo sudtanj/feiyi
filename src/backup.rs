@@ -950,4 +950,268 @@ mod tests {
         assert_eq!(host_of("https://h.turso.io/").unwrap(), "h.turso.io");
         assert!(host_of("http://h.turso.io").is_err() && host_of("libsql://").is_err());
     }
+
+    fn sealed_bytes(sealed: &str) -> Vec<u8> {
+        STANDARD.decode(sealed).unwrap()
+    }
+
+    #[test]
+    fn tampered_or_truncated_rows_are_rejected() {
+        let (_, key) = make_meta("pw", &FAST).unwrap();
+        let sealed = seal(&key, b"payload payload payload").unwrap();
+        let raw = sealed_bytes(&sealed);
+        for at in [0, 23, 24, raw.len() - 1] {
+            let mut bad = raw.clone();
+            bad[at] ^= 0x01;
+            assert!(open(&key, &STANDARD.encode(bad)).is_err(), "flip at byte {at}");
+        }
+        assert_eq!(open(&key, &STANDARD.encode(&raw[..raw.len() - 1])).unwrap_err(), "decryption failed");
+        assert_eq!(open(&key, &STANDARD.encode(&raw[..23])).unwrap_err(), "row too short");
+        assert!(open(&key, "").is_err());
+        assert!(open(&key, "not base64!").is_err());
+    }
+
+    #[test]
+    fn nonces_differ_between_encryptions_of_the_same_data() {
+        let (_, key) = make_meta("pw", &FAST).unwrap();
+        let nonces: BTreeSet<Vec<u8>> = (0..8).map(|_| sealed_bytes(&seal(&key, b"same").unwrap())[..24].to_vec()).collect();
+        assert_eq!(nonces.len(), 8);
+    }
+
+    #[test]
+    fn bad_meta_rows_are_rejected_before_any_write() {
+        let (meta, _) = make_meta("pw", &FAST).unwrap();
+        let edit = |f: &dyn Fn(&mut Value)| {
+            let mut v: Value = serde_json::from_str(&meta).unwrap();
+            f(&mut v);
+            v.to_string()
+        };
+        assert!(unlock(&edit(&|v| v["m"] = json!(MAX_KDF_MEMORY_KIB + 1)), "pw").unwrap_err().contains("too much KDF memory"));
+        assert!(unlock(&edit(&|v| v["v"] = json!(2)), "pw").unwrap_err().contains("unsupported backup format"));
+        assert!(unlock(&edit(&|v| v["kdf"] = json!("scrypt")), "pw").unwrap_err().contains("unsupported backup format"));
+        assert!(unlock(&edit(&|v| v["salt"] = json!("***")), "pw").unwrap_err().contains("bad salt"));
+        assert_eq!(unlock(&edit(&|v| v["verifier"] = json!("AAAA")), "pw").unwrap_err(), "wrong backup passphrase");
+        assert!(unlock("{not json", "pw").unwrap_err().contains("unreadable backup meta row"));
+        let (other, _) = make_meta("pw", &FAST).unwrap();
+        let swapped = edit(&|v| v["verifier"] = serde_json::from_str::<Value>(&other).unwrap()["verifier"].clone());
+        assert_eq!(unlock(&swapped, "pw").unwrap_err(), "wrong backup passphrase", "a verifier sealed under another salt");
+    }
+
+    #[test]
+    fn chunking_at_the_size_boundary() {
+        assert_eq!(split_chunks("x", String::new()), vec![("x".to_string(), String::new())]);
+        let exact = "a".repeat(CHUNK_BYTES);
+        assert_eq!(split_chunks("x", exact.clone()), vec![("x".to_string(), exact.clone())]);
+        let over = format!("{exact}b");
+        let rows = split_chunks("x", over.clone());
+        assert_eq!(rows.iter().map(|(k, d)| (k.as_str(), d.len())).collect::<Vec<_>>(), [("x#0", CHUNK_BYTES), ("x#1", 1)]);
+        let two = "c".repeat(CHUNK_BYTES * 2);
+        assert_eq!(split_chunks("x", two.clone()).len(), 2);
+        for text in [String::new(), exact, over, two] {
+            let joined = join_chunks(split_chunks("x", text.clone()).into_iter().collect()).unwrap();
+            assert_eq!(joined["x"], text);
+        }
+    }
+
+    #[test]
+    fn chunks_sort_numerically_when_there_are_more_than_ten() {
+        let text: String = (0..CHUNK_BYTES * 11 + 5).map(|i| (b'a' + (i % 7) as u8) as char).collect();
+        let rows = split_chunks("timeline/t", text.clone());
+        assert_eq!(rows.len(), 12);
+        assert_eq!(join_chunks(rows.into_iter().collect()).unwrap()["timeline/t"], text);
+    }
+
+    #[test]
+    fn a_deleted_item_becomes_a_remote_delete_and_the_meta_row_is_kept() {
+        let (_, key) = make_meta("pw", &FAST).unwrap();
+        let remote = BTreeSet::from([META.to_string(), "agent/a".to_string(), "timeline/t#0".to_string(), "timeline/t#1".to_string()]);
+        let state = State::new(BTreeMap::from([("agent/a".to_string(), 1), ("timeline/t".to_string(), 2)]), remote);
+        let changes = state.plan(&key, &BTreeMap::new()).unwrap();
+        let mut deleted: Vec<String> = changes.iter().flat_map(|c| c.delete.clone()).collect();
+        deleted.sort();
+        assert_eq!(deleted, ["agent/a", "timeline/t#0", "timeline/t#1"]);
+        assert!(changes.iter().all(|c| c.put.is_empty() && c.hash.is_none()));
+        let sql: Vec<&str> = changes.iter().flat_map(|c| c.statements(0)).map(|s| s.sql).collect();
+        assert!(sql.iter().all(|s| *s == DELETE));
+    }
+
+    #[test]
+    fn a_file_that_vanished_since_listing_is_skipped() {
+        let (_, key) = make_meta("pw", &FAST).unwrap();
+        let state = State::new(BTreeMap::new(), BTreeSet::from([META.to_string()]));
+        let items = BTreeMap::from([("timeline/t".to_string(), Item::File(temp_home().join("missing.jsonl")))]);
+        assert!(state.plan(&key, &items).unwrap().is_empty());
+    }
+
+    #[test]
+    fn status_and_redacted_config_hold_no_secrets() {
+        let section = json!({ "tursoUrl": "libsql://db-org.turso.io", "tursoToken": "TOKEN-9f3a", "passphrase": "PASS-7c1d" });
+        let cfg = BackupConfig::from_value(Some(&section), Some("ENV-PASS-5b"));
+        let shown = format!("{}{}", cfg.redacted(), status());
+        for secret in ["TOKEN-9f3a", "PASS-7c1d", "ENV-PASS-5b", "db-org"] {
+            assert!(!shown.contains(secret), "{secret} in {shown}");
+        }
+        let redacted = cfg.redacted();
+        assert_eq!((&redacted["enabled"], &redacted["urlSet"], &redacted["tokenSet"], &redacted["passphraseSet"]), (&json!(true), &json!(true), &json!(true), &json!(true)));
+        let bad_url = BackupConfig::from_value(Some(&json!({ "tursoUrl": "http://x", "tursoToken": "t", "passphrase": "p" })), None);
+        assert_eq!(bad_url.redacted()["enabled"], false);
+        assert!(bad_url.ready().is_err());
+    }
+
+    #[test]
+    fn passphrase_in_the_file_wins_over_the_environment_and_blank_values_count_as_unset() {
+        let section = json!({ "tursoUrl": " ", "tursoToken": "t\nx", "passphrase": "file" });
+        let cfg = BackupConfig::from_value(Some(&section), Some("env"));
+        assert_eq!(cfg.passphrase.as_deref(), Some("file"));
+        assert!(cfg.url.is_none() && cfg.token.is_none());
+        assert!(BackupConfig::from_value(Some(&json!({ "passphrase": "" })), Some("  ")).passphrase.is_none());
+    }
+
+    #[test]
+    fn config_row_matches_secret_words_case_insensitively_as_substrings() {
+        let row = config_row(br#"{"tokensPerMin":5,"Password":"x","nested":{"PASSPHRASE":"y","ok":true}}"#).unwrap();
+        let kept: Value = serde_json::from_slice(&row).unwrap();
+        assert_eq!(kept, json!({ "nested": { "ok": true } }), "key matching is case-insensitive and substring based");
+        assert!(config_row(b"[1]").is_none());
+        assert!(config_row(b"{broken").is_none());
+    }
+
+    /// An in-memory stand-in for the Turso table: runs the statements a cycle sends.
+    fn apply(store: &mut BTreeMap<String, String>, stmts: Vec<Stmt>) {
+        let key = |s: &Stmt| s.args[0]["value"].as_str().unwrap().to_string();
+        for s in stmts {
+            match s.sql {
+                UPSERT => {
+                    store.insert(key(&s), s.args[2]["value"].as_str().unwrap().to_string());
+                }
+                DELETE => {
+                    store.remove(&key(&s));
+                }
+                other => panic!("unexpected statement {other}"),
+            }
+        }
+    }
+
+    fn cycle(state: &mut State, key: &SecretKey, store: &mut BTreeMap<String, String>, home: &Path, projects: &[Value]) -> usize {
+        let changes = state.plan(key, &items(home, projects).unwrap()).unwrap();
+        let rows = changes.iter().map(|c| c.put.len() + c.delete.len()).sum();
+        for c in &changes {
+            apply(store, c.statements(0));
+            state.commit(c);
+        }
+        rows
+    }
+
+    fn restore_from(store: &BTreeMap<String, String>, key: &SecretKey, home: &Path) -> Restored {
+        let rows = store.iter().filter(|(k, _)| k.as_str() != META).map(|(k, d)| (k.clone(), d.clone())).collect();
+        let opened = join_chunks(rows).unwrap().into_iter().map(|(item, sealed)| (item, open(key, &sealed).unwrap())).collect();
+        write_restored(home, &opened).unwrap()
+    }
+
+    #[test]
+    fn full_backup_then_restore_into_an_empty_home_matches_the_original_minus_secrets() {
+        let home = temp_home();
+        let project_dir = temp_home();
+        let config = json!({ "appendSystemPrompt": "be brief", "providers": { "claude": { "enabled": false, "apiKey": "K-1" } }, "password": "P-1",
+            "backup": { "tursoUrl": "libsql://db.turso.io", "tursoToken": "T-1", "passphrase": "PASS-1" } });
+        std::fs::write(home.join("daemon-config.json"), config.to_string()).unwrap();
+        std::fs::write(home.join("daemon-keypair.json"), r#"{"secretKey":"KEYPAIR-1"}"#).unwrap();
+        std::fs::write(home.join("server-id"), "SERVER-ID-1").unwrap();
+        std::fs::write(home.join("backup-state.json"), "{}").unwrap();
+        std::fs::write(home.join("workspaces.json"), r#"[{"id":"w1"}]"#).unwrap();
+        let agents = json!([{ "id": "a1", "provider": "claude", "title": "one" }, { "id": "a2", "provider": "codex" }]);
+        std::fs::write(home.join("agents.json"), agents.to_string()).unwrap();
+        std::fs::create_dir_all(home.join("timelines")).unwrap();
+        let mut seed = 0x2545F491u32;
+        let big: Vec<u8> = (0..600_000).map(|_| { seed = seed.wrapping_mul(1664525).wrapping_add(1013904223); (seed >> 24) as u8 }).collect();
+        std::fs::write(home.join("timelines/a1.jsonl"), &big).unwrap();
+        std::fs::write(home.join("timelines/a2.jsonl"), "{\"n\":1}\n").unwrap();
+        std::fs::write(home.join("timelines/notes.txt"), "not a timeline").unwrap();
+        let gone = home.join("elsewhere");
+        let projects = [json!({ "rootPath": project_dir.to_string_lossy(), "name": "here" }), json!({ "rootPath": gone.to_string_lossy(), "remote": "git@h:o/r.git" })];
+        std::fs::write(home.join("projects.json"), json!(projects).to_string()).unwrap();
+
+        let (meta, key) = make_meta("PASS-1", &FAST).unwrap();
+        let mut store = BTreeMap::from([(META.to_string(), meta.clone())]);
+        let mut state = State::new(BTreeMap::new(), BTreeSet::from([META.to_string()]));
+        let written = cycle(&mut state, &key, &mut store, &home, &projects);
+        assert!(written > 0);
+        assert!(store.contains_key("timeline/a1#0") && store.contains_key("timeline/a1#1"), "600 KB of noise needs two chunks: {:?}", store.keys().collect::<Vec<_>>());
+        let everything = format!("{}{}", store.keys().cloned().collect::<String>(), store.values().cloned().collect::<String>());
+        for plain in ["be brief", "K-1", "P-1", "T-1", "PASS-1", "KEYPAIR-1", "SERVER-ID-1"] {
+            assert!(!everything.contains(plain), "{plain} readable in the remote rows");
+        }
+        assert_eq!(unlock(&meta, "PASS-1").unwrap(), key);
+        assert_eq!(cycle(&mut state, &key, &mut store, &home, &projects), 0, "nothing changed");
+
+        let fresh = temp_home();
+        assert!(!has_local_state(&fresh));
+        let done = restore_from(&store, &key, &fresh);
+        assert_eq!((done.agents, done.timelines, done.projects), (2, 2, 2));
+        assert_eq!(done.clones, vec![(gone.to_string_lossy().into_owned(), "git@h:o/r.git".to_string())]);
+        assert!(has_local_state(&fresh));
+        assert_eq!(std::fs::read(fresh.join("timelines/a1.jsonl")).unwrap(), big);
+        assert_eq!(std::fs::read(fresh.join("timelines/a2.jsonl")).unwrap(), b"{\"n\":1}\n");
+        assert!(!fresh.join("timelines/notes.txt").exists());
+        let read = |name: &str| serde_json::from_slice::<Value>(&std::fs::read(fresh.join(name)).unwrap()).unwrap();
+        assert_eq!(read("agents.json"), agents);
+        assert_eq!(read("workspaces.json"), json!([{ "id": "w1" }]));
+        assert_eq!(read("daemon-config.json"), json!({ "appendSystemPrompt": "be brief", "providers": { "claude": { "enabled": false } } }));
+        assert_eq!(read("projects.json"), json!([{ "rootPath": project_dir.to_string_lossy(), "name": "here" }, { "rootPath": gone.to_string_lossy() }]));
+        for secret_file in ["daemon-keypair.json", "server-id", "backup-state.json"] {
+            assert!(!fresh.join(secret_file).exists(), "{secret_file} must not be restored");
+        }
+
+        std::fs::remove_file(home.join("timelines/a1.jsonl")).unwrap();
+        let rows = cycle(&mut state, &key, &mut store, &home, &projects);
+        assert_eq!(rows, 2);
+        assert!(!store.keys().any(|k| k.starts_with("timeline/a1")) && store.contains_key("timeline/a2"));
+        for dir in [&home, &project_dir, &fresh] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn restore_skips_unsafe_timeline_ids_and_rejects_a_corrupt_config_row() {
+        let home = temp_home();
+        let items = BTreeMap::from([("timeline/a b".to_string(), b"x".to_vec()), ("timeline/ok-1".to_string(), b"y".to_vec())]);
+        let done = write_restored(&home, &items).unwrap();
+        assert_eq!(done.timelines, 1);
+        assert_eq!(std::fs::read_dir(home.join("timelines")).unwrap().count(), 1);
+        let bad = BTreeMap::from([("config".to_string(), b"[1]".to_vec())]);
+        assert!(write_restored(&home, &bad).unwrap_err().starts_with("config row"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn pipeline_errors_and_odd_responses() {
+        let rows = r#"{"results":[{"type":"ok","response":{"type":"execute","result":{"rows":[[{"type":"integer","value":"7"},{"type":"text","value":"é"}]]}}},{"type":"ok","response":{"type":"close"}}]}"#;
+        assert_eq!(parse_pipeline(rows, 1).unwrap(), vec![vec![vec!["7".to_string(), "é".to_string()]]]);
+        let auth = r#"{"error":"Unauthorized"}"#;
+        assert!(parse_pipeline(auth, 1).is_err());
+        let no_message = r#"{"results":[{"type":"error"}]}"#;
+        assert!(parse_pipeline(no_message, 1).unwrap_err().contains("unknown error"));
+        let first_error = r#"{"results":[{"type":"error","error":{"message":"first"}},{"type":"error","error":{"message":"second"}}]}"#;
+        assert!(parse_pipeline(first_error, 2).unwrap_err().contains("first"));
+        assert_eq!(parse_pipeline(r#"{"results":[{"type":"ok","response":{"type":"execute","result":{"rows":[]}}}]}"#, 1).unwrap(), vec![Rows::new()]);
+        let body = pipeline_body(&[]);
+        assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["requests"], json!([{ "type": "close" }]));
+    }
+
+    #[test]
+    fn pipeline_body_escapes_data_so_it_cannot_inject_statements() {
+        let evil = "x\"}],\"requests\":[{\"type\":\"close\"}";
+        let body = pipeline_body(&[Stmt { sql: DELETE, args: vec![text(evil)] }]);
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["requests"].as_array().unwrap().len(), 2);
+        assert_eq!(v["requests"][0]["stmt"]["args"][0]["value"], evil);
+    }
+
+    #[test]
+    fn host_of_rejects_credentials_ports_and_other_schemes() {
+        for bad in ["http://h", "libsql://", "libsql://u:p@h.turso.io", "libsql://h:8080", "libsql://a b", "ftp://h", "h.turso.io", "https:///path"] {
+            assert!(host_of(bad).is_err(), "{bad}");
+        }
+        assert_eq!(host_of("libsql://h.turso.io/v2/pipeline").unwrap(), "h.turso.io");
+    }
 }

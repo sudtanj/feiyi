@@ -256,4 +256,30 @@ mod tests {
         assert!(again.active().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn turso_style_responses_survive_chunking_and_report_errors() {
+        let json = r#"{"results":[{"type":"ok","response":{"type":"execute","result":{"rows":[]}}}]}"#;
+        let (a, b) = json.split_at(23);
+        let chunked = format!("HTTP/1.1 200 OK\r\ntransfer-encoding: Chunked\r\nContent-Type: application/json\r\n\r\n{:X};ext=1\r\n{a}\r\n{:x}\r\n{b}\r\n0\r\n\r\n", a.len(), b.len());
+        assert_eq!(parse_response(chunked.as_bytes()).unwrap(), (200, json.to_string()));
+
+        let unauthorized = b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 25\r\n\r\n{\"error\":\"Unauthorized\"}";
+        assert_eq!(parse_response(unauthorized).unwrap(), (401, "{\"error\":\"Unauthorized\"}".to_string()));
+
+        let server_error = b"HTTP/1.1 500 Internal Server Error\r\nTransfer-Encoding: chunked\r\n\r\n5\r\noops!\r\n0\r\n\r\n";
+        assert_eq!(parse_response(server_error).unwrap(), (500, "oops!".to_string()));
+
+        assert_eq!(parse_response(b"HTTP/1.1 204 No Content\r\n\r\n").unwrap(), (204, String::new()));
+        assert!(parse_response(b"HTTP/1.1 200 OK\r\nContent-Length: 2").is_err(), "no end of headers");
+        assert!(parse_response(b"HTTP/1.1 abc\r\n\r\n").is_err());
+        assert!(parse_response(b"").is_err());
+    }
+
+    #[test]
+    fn a_response_cut_off_mid_chunk_keeps_only_whole_chunks() {
+        let cut = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n9\r\nshort";
+        assert_eq!(parse_response(cut).unwrap(), (200, "abc".to_string()));
+        assert_eq!(dechunk("2\r\n\u{e9}\r\n0\r\n\r\n"), "\u{e9}");
+    }
 }

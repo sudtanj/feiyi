@@ -2617,6 +2617,11 @@ export class HostRuntimeStore {
     }
 
     this.ensureConnectedAll({ verify: true });
+    // ensureConnected ignores a client that is already "connecting". An attempt started
+    // while hidden can sit on an OS-suspended socket until its 15 s timeout, so start fresh.
+    for (const controller of this.controllers.values()) {
+      if (controller.getSnapshot().connectionStatus === "connecting") controller.reconnectWithNewClient();
+    }
     this.watchForegroundReconnect(0);
   }
 

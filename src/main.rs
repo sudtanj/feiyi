@@ -50,7 +50,7 @@ USAGE:
 ENVIRONMENT (selection):
     PASEO_LITE_HOME          state dir (default ~/.paseo-lite)
     PASEO_LISTEN             default 127.0.0.1:6768
-    FEIYI_BACKUP_PASSPHRASE  passphrase for the encrypted Turso backup (backup section of daemon-config.json)
+    FEIYI_BACKUP_TURSO_URL / _TURSO_TOKEN / _PASSPHRASE / _INTERVAL_SECS  encrypted Turso backup; same as the backup section of daemon-config.json, which wins (needs URL, token and passphrase)
     PASEO_PASSWORD           require this password for direct connections
     PASEO_RELAY_ENABLED=false  disable the relay
     PASEO_HOSTNAMES          extra allowed Host names (comma separated, .suffix ok)

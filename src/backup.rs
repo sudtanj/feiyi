@@ -3,7 +3,9 @@
 //!
 //! Configured by a `backup` section in `daemon-config.json` (edited by hand,
 //! never served to the app): `tursoUrl`, `tursoToken`, `passphrase` (or env
-//! `FEIYI_BACKUP_PASSPHRASE`) and `intervalSecs` (default 900).
+//! `FEIYI_BACKUP_PASSPHRASE`) and `intervalSecs` (default 900). Each can also
+//! come from `FEIYI_BACKUP_TURSO_URL`, `_TURSO_TOKEN`, `_PASSPHRASE` and
+//! `_INTERVAL_SECS`; the file wins.
 //!
 //! Table `feiyi_backup(key, updated_at, data)`, one row per item: `config`
 //! (secrets removed), `projects` (with each git origin), `workspaces`,
@@ -96,22 +98,51 @@ fn clean(v: Option<&str>) -> Option<String> {
     v.map(str::trim).filter(|s| !s.is_empty() && !s.contains(char::is_control)).map(String::from)
 }
 
+/// `FEIYI_BACKUP_*` environment values; the file's `backup` section wins over them.
+#[derive(Default)]
+struct EnvSettings {
+    url: Option<String>,
+    token: Option<String>,
+    passphrase: Option<String>,
+    interval_secs: Option<u64>,
+}
+
+impl EnvSettings {
+    /// Read and remove the variables: agents and terminals inherit the daemon's environment.
+    fn take() -> EnvSettings {
+        let take = |name: &str| {
+            let value = std::env::var(name).ok();
+            std::env::remove_var(name);
+            value
+        };
+        EnvSettings {
+            url: take("FEIYI_BACKUP_TURSO_URL"),
+            token: take("FEIYI_BACKUP_TURSO_TOKEN"),
+            passphrase: take("FEIYI_BACKUP_PASSPHRASE"),
+            interval_secs: take("FEIYI_BACKUP_INTERVAL_SECS").and_then(|v| v.trim().parse().ok()),
+        }
+    }
+}
+
 impl BackupConfig {
     pub fn load(home: &Path) -> BackupConfig {
         let file = std::fs::read(home.join("daemon-config.json")).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok());
-        let env_passphrase = std::env::var("FEIYI_BACKUP_PASSPHRASE").ok();
-        // Agents and terminals inherit the daemon's environment.
-        std::env::remove_var("FEIYI_BACKUP_PASSPHRASE");
-        BackupConfig::from_value(file.as_ref().and_then(|v| v.get("backup")), env_passphrase.as_deref())
+        BackupConfig::from_sources(file.as_ref().and_then(|v| v.get("backup")), &EnvSettings::take())
     }
 
+    #[cfg(test)]
     fn from_value(section: Option<&Value>, env_passphrase: Option<&str>) -> BackupConfig {
-        let text = |key: &str| clean(section.and_then(|s| s.get(key)).and_then(Value::as_str));
+        BackupConfig::from_sources(section, &EnvSettings { passphrase: env_passphrase.map(String::from), ..EnvSettings::default() })
+    }
+
+    fn from_sources(section: Option<&Value>, env: &EnvSettings) -> BackupConfig {
+        let text = |key: &str, from_env: &Option<String>| clean(section.and_then(|s| s.get(key)).and_then(Value::as_str)).or_else(|| clean(from_env.as_deref()));
+        let interval = section.and_then(|s| s.get("intervalSecs")).and_then(Value::as_u64).or(env.interval_secs).unwrap_or(DEFAULT_INTERVAL_SECS);
         BackupConfig {
-            url: text("tursoUrl"),
-            token: text("tursoToken"),
-            passphrase: text("passphrase").or_else(|| clean(env_passphrase)),
-            interval: Duration::from_secs(section.and_then(|s| s.get("intervalSecs")).and_then(Value::as_u64).unwrap_or(DEFAULT_INTERVAL_SECS).clamp(60, 86_400)),
+            url: text("tursoUrl", &env.url),
+            token: text("tursoToken", &env.token),
+            passphrase: text("passphrase", &env.passphrase),
+            interval: Duration::from_secs(interval.clamp(60, 86_400)),
         }
     }
 
@@ -1759,5 +1790,25 @@ mod tests {
         assert_eq!((done.agents, done.projects, done.timelines), (1, 1, 0), "timelines already on disk are kept");
         assert!(has_local_state(&home));
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn variables_alone_can_enable_the_backup_and_the_file_overrides_them() {
+        let vars = EnvSettings { url: Some("libsql://one.turso.io".into()), token: Some("tok-one".into()), passphrase: Some("pass-one".into()), interval_secs: Some(120) };
+        let cfg = BackupConfig::from_sources(None, &vars);
+        let ready = cfg.ready().unwrap().unwrap();
+        assert_eq!((ready.turso.host.as_str(), ready.turso.token.as_str(), ready.passphrase.as_str()), ("one.turso.io", "tok-one", "pass-one"));
+        assert_eq!(cfg.interval, Duration::from_secs(120));
+
+        let section = json!({ "tursoUrl": "https://two.turso.io", "tursoToken": "tok-two", "intervalSecs": 300 });
+        let mixed = BackupConfig::from_sources(Some(&section), &vars);
+        let ready = mixed.ready().unwrap().unwrap();
+        assert_eq!((ready.turso.host.as_str(), ready.turso.token.as_str(), ready.passphrase.as_str()), ("two.turso.io", "tok-two", "pass-one"));
+        assert_eq!(mixed.interval, Duration::from_secs(300));
+
+        let blank = EnvSettings { url: Some("  ".into()), token: Some(String::new()), passphrase: Some("p".into()), interval_secs: None };
+        let cfg = BackupConfig::from_sources(None, &blank);
+        assert!(cfg.ready().unwrap().is_none(), "blank values are unset");
+        assert_eq!(cfg.interval, Duration::from_secs(DEFAULT_INTERVAL_SECS));
     }
 }

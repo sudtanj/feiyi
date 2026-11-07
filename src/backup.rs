@@ -381,7 +381,7 @@ fn config_row(raw: &[u8]) -> Option<Vec<u8>> {
 
 async fn origin_of(dir: &str) -> Option<String> {
     let out = crate::projects::run("git", &["remote", "get-url", "origin"], Some(Path::new(dir)), GIT_TIMEOUT).await.ok()?;
-    clean(Some(&out))
+    clean(Some(out.as_str()))
 }
 
 async fn gather(home: &Path) -> Result<BTreeMap<String, Item>, String> {

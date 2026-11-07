@@ -35,9 +35,6 @@ const REQUEST_STATEMENTS: usize = 64;
 /// An item whose plaintext is larger is skipped, and so is refused when opening a row.
 const MAX_ITEM_BYTES: usize = 128 * 1024 * 1024;
 const RESTORE_TIMEOUT: Duration = Duration::from_secs(300);
-const PAGE_ROWS: usize = 10;
-/// Raw (encrypted) rows a restore may pull before it gives up.
-const MAX_RESTORE_BYTES: usize = 256 * 1024 * 1024;
 const META: &str = "meta";
 const VERIFIER: &[u8] = b"feiyi-backup-v1";
 const DEFAULT_INTERVAL_SECS: u64 = 900;
@@ -60,7 +57,9 @@ const INSERT_META: &str = "INSERT INTO feiyi_backup(key, updated_at, data) VALUE
 const DELETE: &str = "DELETE FROM feiyi_backup WHERE key = ?";
 const SELECT_META: &str = "SELECT data FROM feiyi_backup WHERE key = 'meta'";
 const SELECT_KEYS: &str = "SELECT key FROM feiyi_backup";
-const SELECT_PAGE: &str = "SELECT key, data FROM feiyi_backup WHERE key > ? AND key != 'meta' ORDER BY key LIMIT 10";
+const SELECT_ROW: &str = "SELECT data FROM feiyi_backup WHERE key = ?";
+/// Rows fetched per request during a restore (about 4 MB at most).
+const ROWS_PER_REQUEST: usize = 8;
 
 type SecretKey = [u8; 32];
 type Rows = Vec<Vec<String>>;
@@ -822,6 +821,17 @@ struct Restored {
     clones: Vec<(String, String)>,
 }
 
+/// Write a restored timeline unless one is already on disk; whether it was written.
+fn write_timeline(home: &Path, id: &str, bytes: &[u8]) -> Result<bool, String> {
+    let safe: String = id.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').collect();
+    let path = home.join("timelines").join(format!("{safe}.jsonl"));
+    if safe.is_empty() || safe != id || path.exists() {
+        return Ok(false);
+    }
+    crate::util::write_atomic(&path, bytes, true).map_err(|e| format!("timelines/{safe}.jsonl: {e}"))?;
+    Ok(true)
+}
+
 /// A JSON list of objects.
 fn object_list(bytes: &[u8], what: &str) -> Result<Vec<Value>, String> {
     let list: Vec<Value> = serde_json::from_slice(bytes).map_err(|e| format!("{what}: {e}"))?;
@@ -878,11 +888,8 @@ fn write_restored(home: &Path, items: &BTreeMap<String, Vec<u8>>) -> Result<Rest
 
     let write = |name: &str, bytes: &[u8]| crate::util::write_atomic(&home.join(name), bytes, true).map_err(|e| format!("{name}: {e}"));
     for (key, bytes) in items {
-        let Some(id) = key.strip_prefix("timeline/") else { continue };
-        let safe: String = id.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').collect();
-        if !safe.is_empty() && safe == id && !home.join("timelines").join(format!("{safe}.jsonl")).exists() {
-            write(&format!("timelines/{safe}.jsonl"), bytes)?;
-            done.timelines += 1;
+        if let Some(id) = key.strip_prefix("timeline/") {
+            done.timelines += usize::from(write_timeline(home, id, bytes)?);
         }
     }
     if let Some(bytes) = &config_bytes {
@@ -904,39 +911,75 @@ fn write_restored(home: &Path, items: &BTreeMap<String, Vec<u8>>) -> Result<Rest
     Ok(done)
 }
 
-async fn fetch_items(ready: &Ready, key: &SecretKey) -> Result<BTreeMap<String, Vec<u8>>, String> {
-    let mut rows = BTreeMap::new();
-    let mut after = String::new();
-    let mut total = 0usize;
-    loop {
-        let page = ready.turso.run(vec![Stmt { sql: SELECT_PAGE, args: vec![text(&after)] }]).await?.remove(0);
-        let more = page.len() == PAGE_ROWS;
-        for row in page {
-            let [k, d] = <[String; 2]>::try_from(row).map_err(|_| "unexpected row shape".to_string())?;
-            total += k.len() + d.len();
-            if total > MAX_RESTORE_BYTES {
-                return Err(format!("the backup holds more than {} MiB; restore aborted", MAX_RESTORE_BYTES >> 20));
-            }
-            after = k.clone();
-            rows.insert(k, d);
-        }
-        if !more {
-            break;
-        }
-    }
-    let key = *key;
-    tokio::task::spawn_blocking(move || {
-        join_chunks(rows)?.into_iter().map(|(item, sealed)| Ok::<_, String>((item.clone(), open(&key, &item, &sealed).map_err(|e| format!("{item}: {e}"))?))).collect()
-    })
-    .await
-    .map_err(|e| e.to_string())?
+/// The remote rows of each item, without `meta`.
+struct Group {
+    item: String,
+    keys: Vec<String>,
 }
 
+fn item_groups(remote: &BTreeSet<String>) -> Vec<Group> {
+    let mut by_item: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    for key in remote.iter().filter(|k| *k != META) {
+        by_item.entry(item_of(key)).or_default().push(key.clone());
+    }
+    by_item.into_iter().map(|(item, keys)| Group { item: item.to_string(), keys }).collect()
+}
+
+/// The data of each row key, in order, in requests of at most `ROWS_PER_REQUEST` rows.
+async fn fetch_rows(turso: &Turso, keys: &[String]) -> Result<Vec<String>, String> {
+    let mut data = Vec::with_capacity(keys.len());
+    for part in keys.chunks(ROWS_PER_REQUEST) {
+        let res = turso.run(part.iter().map(|k| Stmt { sql: SELECT_ROW, args: vec![text(k)] }).collect()).await?;
+        for (key, rows) in part.iter().zip(res) {
+            data.push(rows.into_iter().next().and_then(|r| r.into_iter().next()).ok_or_else(|| format!("{key}: the row is gone"))?);
+        }
+    }
+    Ok(data)
+}
+
+/// Decrypt one item from its rows (same order as `group.keys`). A timeline is
+/// written to its file now; any other item is small and kept in `small` to be
+/// validated and written together.
+fn absorb(home: &Path, key: &SecretKey, group: &Group, rows: Vec<String>, small: &mut BTreeMap<String, Vec<u8>>, timelines: &mut usize) -> Result<(), String> {
+    let sealed = join_chunks(group.keys.iter().cloned().zip(rows).collect())?.remove(&group.item).ok_or_else(|| format!("{}: unexpected rows", group.item))?;
+    let plain = open(key, &group.item, &sealed).map_err(|e| format!("{}: {e}", group.item))?;
+    match group.item.strip_prefix("timeline/") {
+        Some(id) => *timelines += usize::from(write_timeline(home, id, &plain)?),
+        None => {
+            small.insert(group.item.clone(), plain);
+        }
+    }
+    Ok(())
+}
+
+/// Memory stays at about one item: rows are fetched a few at a time and each
+/// item is decrypted and, for a timeline, written before the next is read.
 async fn restore(home: &Path, ready: &Ready) -> Result<Option<Restored>, String> {
-    let (opened, _) = open_remote(ready).await?;
+    let (opened, remote) = open_remote(ready).await?;
     let Some((key, _)) = opened else { return Ok(None) };
-    let items = fetch_items(ready, &key).await?;
-    write_restored(home, &items).map(Some)
+    let groups = item_groups(&remote);
+    let (mut small, mut timelines) = (BTreeMap::new(), 0);
+    let mut start = 0;
+    while start < groups.len() {
+        let mut end = start + 1;
+        let mut rows = groups[start].keys.len();
+        while end < groups.len() && rows + groups[end].keys.len() <= ROWS_PER_REQUEST {
+            rows += groups[end].keys.len();
+            end += 1;
+        }
+        if let Some(g) = groups[start..end].iter().find(|g| g.keys.len() * CHUNK_BYTES > MAX_ITEM_BYTES + CHUNK_BYTES) {
+            return Err(format!("{}: too large to restore", g.item));
+        }
+        let keys: Vec<String> = groups[start..end].iter().flat_map(|g| g.keys.clone()).collect();
+        let mut data = fetch_rows(&ready.turso, &keys).await?.into_iter();
+        for group in &groups[start..end] {
+            absorb(home, &key, group, data.by_ref().take(group.keys.len()).collect(), &mut small, &mut timelines)?;
+        }
+        start = end;
+    }
+    let mut done = write_restored(home, &small)?;
+    done.timelines += timelines;
+    Ok(Some(done))
 }
 
 /// On a machine with no local state, pull the backup and write the files
@@ -1666,6 +1709,55 @@ mod tests {
         std::fs::write(home.join("agents.json"), r#"[{"id":"a"}]"#).unwrap();
         assert!(has_state_clearing_marker(&home));
         assert!(!marker.exists());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Run the streaming restore against rows held in memory instead of Turso.
+    fn stream(home: &Path, key: &SecretKey, store: &BTreeMap<String, String>, mut after_group: impl FnMut(&Group)) -> Result<Restored, String> {
+        let (mut small, mut timelines) = (BTreeMap::new(), 0);
+        for group in item_groups(&store.keys().cloned().collect()) {
+            let rows = group.keys.iter().map(|k| store[k].clone()).collect();
+            absorb(home, key, &group, rows, &mut small, &mut timelines)?;
+            after_group(&group);
+        }
+        let mut done = write_restored(home, &small)?;
+        done.timelines += timelines;
+        Ok(done)
+    }
+
+    fn rows_of(key: &SecretKey, item: &str, plain: &[u8]) -> Vec<(String, String)> {
+        split_chunks(item, seal(key, item, plain).unwrap())
+    }
+
+    #[test]
+    fn timelines_are_written_one_item_at_a_time_and_a_bad_state_item_leaves_no_state_files() {
+        let (meta, key) = make_meta("pw", &FAST).unwrap();
+        let big = vec![b'x'; 3 * CHUNK_BYTES];
+        let mut seed = 7u32;
+        let noise: Vec<u8> = big.iter().map(|_| { seed = seed.wrapping_mul(1664525).wrapping_add(1013904223); (seed >> 24) as u8 }).collect();
+        let mut store: BTreeMap<String, String> = BTreeMap::from([(META.to_string(), meta)]);
+        for (item, plain) in [("timeline/t1", noise.as_slice()), ("timeline/t2", b"two\n"), ("projects", br#"[{"rootPath":"/p"}]"#), ("agent/a1", br#"{"id":"someone-else"}"#)] {
+            store.extend(rows_of(&key, item, plain));
+        }
+        assert!(store.contains_key("timeline/t1#0"), "the big timeline is chunked");
+
+        let home = temp_home();
+        let mut written = Vec::new();
+        let err = stream(&home, &key, &store, |g| written.push((g.item.clone(), home.join("timelines/t1.jsonl").exists(), home.join("projects.json").exists()))).unwrap_err();
+        assert!(err.contains("not an agent record"), "{err}");
+        assert_eq!(std::fs::read(home.join("timelines/t1.jsonl")).unwrap(), noise, "written as soon as it was decrypted");
+        assert_eq!(std::fs::read(home.join("timelines/t2.jsonl")).unwrap(), b"two\n");
+        assert!(written.iter().all(|(_, _, projects_written)| !projects_written), "state files come last");
+        assert!(written.iter().any(|(item, t1, _)| item == "timeline/t1" && *t1), "t1 existed before the next group was read");
+        for state_file in ["agents.json", "projects.json", "workspaces.json"] {
+            assert!(!home.join(state_file).exists(), "{state_file}");
+        }
+        assert!(!has_local_state(&home), "a failed restore can run again");
+
+        store.extend(rows_of(&key, "agent/a1", br#"{"id":"a1"}"#));
+        let done = stream(&home, &key, &store, |_| {}).unwrap();
+        assert_eq!((done.agents, done.projects, done.timelines), (1, 1, 0), "timelines already on disk are kept");
+        assert!(has_local_state(&home));
         let _ = std::fs::remove_dir_all(&home);
     }
 }

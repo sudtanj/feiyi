@@ -791,6 +791,22 @@ async fn held_finished_notice_is_not_repeated() {
     assert_eq!(after["finishDeferred"], false, "{after}");
 }
 
+/// An archived agent is not worth a push: its held notice is dropped at startup.
+#[tokio::test]
+async fn archived_agent_is_not_notified_of_held_finish() {
+    let (dir, agents_file) = finished_agent_dir("held-arch").await;
+    edit_agent(&agents_file, |a| {
+        a["finishDeferred"] = json!(true);
+        a["attentionReason"] = Value::Null;
+        a["attentionAt"] = Value::Null;
+        a["archivedAt"] = json!("2026-01-01T00:00:00.000Z");
+    });
+    let _d = start_at(dir, None, "ok");
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let a = saved_agent(&agents_file);
+    assert!(a["attentionReason"].is_null(), "archived agent notified: {a}");
+}
+
 /// An unloaded timeline is read from disk off the manager task; fetching it
 /// and listing its prompts must still answer with the saved rows.
 #[tokio::test]

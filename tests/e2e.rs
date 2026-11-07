@@ -631,6 +631,51 @@ async fn interrupted_turn_resumes_after_hard_kill() {
     assert!(texts.iter().any(|t| t.contains("restarted")), "{texts:?}");
 }
 
+/// A turn whose "finished" notice was held for background work that died with
+/// the daemon gets the notice on the next start, once.
+#[tokio::test]
+async fn held_finished_notice_is_sent_after_restart() {
+    let dir = unique_dir("held-finish");
+    let cwd = dir.join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let mut first = start_at(dir.clone(), None, "ok");
+    let mut ws = connect(first.port).await;
+    hello(&mut ws, None).await;
+    send(
+        &mut ws,
+        session(json!({ "type": "create_agent_request", "requestId": "r1", "config": { "provider": "claude", "cwd": cwd.to_string_lossy(), "modeId": "bypassPermissions" }, "initialPrompt": "say hi" })),
+    )
+    .await;
+    recv_until(&mut ws, |v| (v["message"]["type"] == "agent_stream" && v["message"]["payload"]["event"]["type"] == "turn_completed").then_some(())).await;
+    let agents_file = dir.join("home").join("agents.json");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !std::fs::read_to_string(&agents_file).unwrap_or_default().contains("\"attentionReason\":\"finished\"") {
+        assert!(Instant::now() < deadline, "finished turn never saved");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    first.child.kill().unwrap();
+    let _ = first.child.wait();
+    std::mem::forget(first);
+
+    // As if the turn had ended with a background shell running: notice held, not sent.
+    let mut agents: Value = serde_json::from_slice(&std::fs::read(&agents_file).unwrap()).unwrap();
+    agents[0]["finishDeferred"] = json!(true);
+    agents[0]["attentionReason"] = Value::Null;
+    agents[0]["attentionAt"] = Value::Null;
+    std::fs::write(&agents_file, serde_json::to_vec(&agents).unwrap()).unwrap();
+
+    let _second = start_at(dir, None, "ok");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let saved: Value = serde_json::from_slice(&std::fs::read(&agents_file).unwrap()).unwrap();
+        if saved[0]["attentionReason"] == "finished" && saved[0]["finishDeferred"] == false {
+            break;
+        }
+        assert!(Instant::now() < deadline, "held notice not sent: {saved}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// An unloaded timeline is read from disk off the manager task; fetching it
 /// and listing its prompts must still answer with the saved rows.
 #[tokio::test]

@@ -271,6 +271,7 @@ impl Manager {
     }
 
     pub async fn run(mut self, mut cmds: mpsc::UnboundedReceiver<Cmd>, mut events: mpsc::UnboundedReceiver<ProviderEvent>, mut shutdown: oneshot::Receiver<()>) {
+        self.notify_lost_background_finishes();
         self.resume_interrupted();
         let mut tick = tokio::time::interval(Duration::from_secs(2));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -653,6 +654,7 @@ impl Manager {
             agent.rec.last_user_message_at = Some(now_iso());
             agent.rec.last_error = None;
             agent.rec.attention_reason = None;
+            agent.rec.finish_deferred = false;
             if agent.rec.title.is_none() {
                 let first = messages.first().map(|m| crate::uploads::bubble_text(&m.0)).unwrap_or_default();
                 let first_line = first.lines().next().unwrap_or("").trim();
@@ -938,6 +940,7 @@ impl Manager {
             };
             // The user's turn already raised its attention; the compaction after it doesn't.
             if !compacting {
+                agent.rec.finish_deferred = background;
                 agent.rec.attention_reason = reason.map(String::from);
                 agent.rec.attention_at = reason.map(|_| now_iso());
             }
@@ -1018,6 +1021,27 @@ impl Manager {
         a.rec.pending_turn = pending;
         a.rec.pending_queue = queue;
         self.save_agents_now();
+    }
+
+    /// Send the "finished" notice a turn held back for background work that
+    /// is gone now. Once: the flag is cleared.
+    fn send_deferred_finish(&mut self, agent_id: &str) {
+        let Some(a) = self.agents.get_mut(agent_id).filter(|a| std::mem::take(&mut a.rec.finish_deferred)) else { return };
+        a.rec.attention_reason = Some("finished".into());
+        a.rec.attention_at = Some(now_iso());
+        crate::log!("agent {agent_id}: background work ended without reporting back; sending the held finished notice");
+        self.save_agents_now();
+        self.publish_agent(agent_id);
+        self.notify_attention(agent_id, "finished");
+    }
+
+    /// After a restart the background work of an idle agent died with the old
+    /// daemon: nothing will report back, so its held notice goes out now.
+    fn notify_lost_background_finishes(&mut self) {
+        let ids: Vec<String> = self.agents.values().filter(|a| a.rec.finish_deferred && a.rec.pending_turn.is_none() && a.rec.pending_queue.is_empty()).map(|a| a.rec.id.clone()).collect();
+        for id in ids {
+            self.send_deferred_finish(&id);
+        }
     }
 
     /// After a restart: continue every turn that was interrupted and restore
@@ -1308,6 +1332,7 @@ impl Manager {
             // Only background sub-agents left: Stop ends them and frees the slot.
             if agent.rec.provider == "claude" {
                 if let Some(ready) = self.claude.stop_sub_agents(agent_id) {
+                    agent.rec.finish_deferred = false;
                     self.append_item(agent_id, json!({ "type": "notification", "level": "info", "message": "Stopped the background work" }));
                     self.send_ready(ready);
                     self.publish_agent(agent_id);
@@ -1440,6 +1465,8 @@ impl Manager {
                 self.send_ready(ready);
                 if failed {
                     self.finish_turn(&agent_id, Err("claude exited unexpectedly".into()));
+                } else if current && self.agents.get(&agent_id).is_some_and(|a| a.status != "running") {
+                    self.send_deferred_finish(&agent_id);
                 }
             }
         }

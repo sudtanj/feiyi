@@ -62,6 +62,10 @@ pub struct AgentRecord {
     /// Follow-up prompts queued behind the running turn.
     #[serde(default)]
     pub pending_queue: Vec<String>,
+    /// The turn ended while background work ran, so its "finished" notice was
+    /// held back. Still set when that work is lost: the notice is sent then.
+    #[serde(default)]
+    pub finish_deferred: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

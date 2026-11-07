@@ -54,6 +54,49 @@ describe("frame compression", () => {
     expect(received.at(-1)).toBe('{"n":6}');
   });
 
+  it("keeps the queue per client instance sharing a prototype", async () => {
+    class Client {
+      received: unknown[] = [];
+      handleTransportMessage(data: unknown) {
+        this.received.push(data);
+      }
+    }
+    installFrameCompression(Client.prototype);
+    const a = new Client();
+    const b = new Client();
+
+    a.handleTransportMessage(frame('{"from":"a"}'));
+    b.handleTransportMessage('{"from":"b"}');
+
+    expect(b.received).toEqual(['{"from":"b"}']);
+    expect(a.received).toEqual([]);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(a.received).toEqual(['{"from":"a"}']);
+  });
+
+  it("drops queued frames when the transport changed while they waited", async () => {
+    class Client {
+      transport: unknown = "old";
+      received: unknown[] = [];
+      handleTransportMessage(data: unknown) {
+        this.received.push(data);
+      }
+    }
+    installFrameCompression(Client.prototype);
+    const client = new Client();
+
+    client.handleTransportMessage(frame('{"n":1}'));
+    client.handleTransportMessage('{"n":2}');
+    client.transport = "new";
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(client.received).toEqual([]);
+
+    client.handleTransportMessage(frame('{"n":3}'));
+    client.handleTransportMessage('{"n":4}');
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(client.received).toEqual(['{"n":3}', '{"n":4}']);
+  });
+
   it("passes uncompressed messages through synchronously", () => {
     const received: unknown[] = [];
     const target = { handleTransportMessage: (data: unknown) => void received.push(data) };

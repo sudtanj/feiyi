@@ -1883,4 +1883,26 @@ mod tests {
         let shown = BackupConfig::from_sources(None, &vars).redacted().to_string();
         assert!(!shown.contains("tok-env") && !shown.contains("pass-env") && !shown.contains("env.turso"), "{shown}");
     }
+
+    #[test]
+    fn an_item_over_the_cap_is_skipped_and_the_other_items_still_upload() {
+        let home = temp_home();
+        let big = home.join("big.jsonl");
+        std::fs::File::create(&big).unwrap().set_len(MAX_ITEM_BYTES as u64 + 1).unwrap();
+        let at_cap = home.join("cap.jsonl");
+        std::fs::File::create(&at_cap).unwrap().set_len(MAX_ITEM_BYTES as u64).unwrap();
+        let (_, key) = make_meta("pw", &FAST).unwrap();
+        let state = State::new(BTreeMap::from([("timeline/big".to_string(), 1)]), BTreeSet::from([META.to_string(), "timeline/big#0".to_string()]));
+        let items = BTreeMap::from([
+            ("agent/a".to_string(), bytes_item("one")),
+            ("timeline/big".to_string(), Item::File(big)),
+            ("timeline/cap".to_string(), Item::File(at_cap)),
+            ("workspaces".to_string(), bytes_item("[]")),
+        ]);
+        let changes = state.plan(&key, &items).unwrap();
+        let planned: Vec<&str> = changes.iter().map(|c| c.item.as_str()).collect();
+        assert_eq!(planned, ["agent/a", "timeline/cap", "workspaces"], "the oversized item is skipped, one exactly at the cap is kept");
+        assert!(changes.iter().all(|c| c.delete.is_empty()), "skipping an item does not delete what the remote already holds");
+        let _ = std::fs::remove_dir_all(&home);
+    }
 }

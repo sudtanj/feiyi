@@ -1504,4 +1504,120 @@ mod tests {
         assert!(load_state_file(&home).remotes.is_empty(), "an older file without the new fields still loads");
         let _ = std::fs::remove_dir_all(&home);
     }
+
+    #[test]
+    fn a_failed_write_removes_the_files_that_mark_the_machine_as_having_state() {
+        let home = temp_home();
+        std::fs::create_dir(home.join("agents.json")).unwrap();
+        let items = BTreeMap::from([
+            ("workspaces".to_string(), br#"[{"id":"w1"}]"#.to_vec()),
+            ("projects".to_string(), br#"[{"rootPath":"/nowhere-p"}]"#.to_vec()),
+            ("agent/a1".to_string(), br#"{"id":"a1"}"#.to_vec()),
+        ]);
+        assert!(write_restored(&home, &items).unwrap_err().starts_with("agents.json"));
+        assert!(!home.join("workspaces.json").exists() && !home.join("projects.json").exists(), "a half restore must not count as local state");
+        std::fs::remove_dir(home.join("agents.json")).unwrap();
+        assert!(!has_local_state(&home));
+        assert!(write_restored(&home, &items).is_ok(), "the restore can run again");
+        assert!(has_local_state(&home));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn restored_remotes_are_stored_for_projects_whose_directory_exists_too() {
+        let home = temp_home();
+        let items = BTreeMap::from([("projects".to_string(), json!([{ "rootPath": home.to_string_lossy(), "remote": "git@h:o/r.git" }]).to_string().into_bytes())]);
+        let done = write_restored(&home, &items).unwrap();
+        assert!(done.clones.is_empty(), "nothing to clone when the directory exists");
+        assert_eq!(load_state_file(&home).remotes[home.to_string_lossy().as_ref()], "git@h:o/r.git");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn a_project_keeps_its_known_origin_while_its_directory_is_missing_or_not_a_repository() {
+        let home = temp_home();
+        let not_a_repo = temp_home();
+        let missing = home.join("not-cloned-yet");
+        let (m, n) = (missing.to_string_lossy().into_owned(), not_a_repo.to_string_lossy().into_owned());
+        std::fs::write(home.join("projects.json"), json!([{ "rootPath": m }, { "rootPath": n }, { "rootPath": "/unknown-dir-for-backup-test" }]).to_string()).unwrap();
+        let known = BTreeMap::from([(m.clone(), "https://h/o/a.git".to_string()), (n.clone(), "https://h/o/b.git".to_string())]);
+        let (items, remotes) = gather(&home, &known).await.unwrap();
+        assert_eq!(remotes, known, "a project with no known origin gets none");
+        let Some(Item::Bytes(projects)) = items.get("projects") else { panic!("projects item") };
+        let projects: Value = serde_json::from_slice(projects).unwrap();
+        assert_eq!((projects[0]["remote"].as_str(), projects[1]["remote"].as_str()), (Some("https://h/o/a.git"), Some("https://h/o/b.git")));
+        assert!(projects[2].get("remote").is_none());
+        let (_, forgotten) = gather(&home, &BTreeMap::new()).await.unwrap();
+        assert!(forgotten.is_empty());
+        for dir in [&home, &not_a_repo] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn a_failed_restore_leaves_the_remote_untouched_until_it_is_fixed() {
+        let source = temp_home();
+        std::fs::write(source.join("agents.json"), r#"[{"id":"a1","provider":"claude"}]"#).unwrap();
+        std::fs::create_dir_all(source.join("timelines")).unwrap();
+        std::fs::write(source.join("timelines/a1.jsonl"), "turn\n").unwrap();
+        let projects = [json!({ "rootPath": "/nowhere-p", "name": "p" })];
+        let (meta, key) = make_meta("pw", &FAST).unwrap();
+        let mut store = BTreeMap::from([(META.to_string(), meta)]);
+        let mut owner = State::new(BTreeMap::new(), BTreeSet::from([META.to_string()]));
+        assert!(cycle(&mut owner, &key, &mut store, &source, &projects) > 0);
+        let before = store.clone();
+
+        // The restore fails: a row sealed under the right key but not an agent record.
+        let broken = BTreeMap::from([("agent/a1".to_string(), b"[1]".to_vec())]);
+        let fresh = temp_home();
+        assert!(write_restored(&fresh, &broken).is_err());
+        assert!(!has_local_state(&fresh));
+        std::fs::write(fresh.join(RESTORE_PENDING), "").unwrap();
+
+        let remote_keys = |store: &BTreeMap<String, String>| store.keys().cloned().collect::<BTreeSet<_>>();
+        for owns in [false, true] {
+            let mut owns_remote = owns;
+            let paused = check_may_write(&fresh, &mut owns_remote, &remote_keys(&store));
+            assert!(paused.is_err(), "owns_remote={owns} must not matter while the marker exists");
+            assert_eq!(owns_remote, owns);
+        }
+        assert_eq!(store, before, "the paused loop wrote and deleted nothing");
+
+        // Marker gone (write failed, or deleted) but still no local state: still paused.
+        std::fs::remove_file(fresh.join(RESTORE_PENDING)).unwrap();
+        let mut owns_remote = false;
+        assert!(check_may_write(&fresh, &mut owns_remote, &remote_keys(&store)).is_err());
+
+        // The cause is fixed and the restore succeeds: the loop may run, and an unchanged machine writes nothing.
+        let opened: BTreeMap<String, Vec<u8>> = join_chunks(store.iter().filter(|(k, _)| k.as_str() != META).map(|(k, d)| (k.clone(), d.clone())).collect())
+            .unwrap()
+            .into_iter()
+            .map(|(item, sealed)| { let plain = open(&key, &item, &sealed).unwrap(); (item, plain) })
+            .collect();
+        write_restored(&fresh, &opened).unwrap();
+        assert!(check_may_write(&fresh, &mut owns_remote, &remote_keys(&store)).is_ok());
+        assert!(owns_remote);
+        let mut restored_state = State::new(BTreeMap::new(), remote_keys(&store));
+        let rows = cycle(&mut restored_state, &key, &mut store, &fresh, &projects);
+        assert!(rows <= 1, "only the projects row may differ, got {rows}");
+        assert!(store.keys().filter(|k| k.starts_with("agent/") || k.starts_with("timeline/")).eq(before.keys().filter(|k| k.starts_with("agent/") || k.starts_with("timeline/"))));
+        for dir in [&source, &fresh] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn the_first_backup_into_an_empty_remote_proceeds_from_an_empty_machine() {
+        let home = temp_home();
+        let (_, key) = make_meta("pw", &FAST).unwrap();
+        let mut store = BTreeMap::new();
+        let remote = BTreeSet::from([META.to_string()]);
+        let mut owns = false;
+        check_may_write(&home, &mut owns, &remote).unwrap();
+        assert!(owns);
+        let mut state = State::new(BTreeMap::new(), remote);
+        assert!(cycle(&mut state, &key, &mut store, &home, &[]) > 0);
+        assert!(store.contains_key("projects"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
 }

@@ -2602,8 +2602,11 @@ export class HostRuntimeStore {
   }
 
   private foregroundWatchdog: ReturnType<typeof setTimeout> | null = null;
+  private wasHidden = false;
 
   setAppVisible(visible: boolean): void {
+    const returningFromHidden = visible && this.wasHidden;
+    this.wasHidden = !visible;
     logConnection(visible ? "foreground" : "background", { statuses: this.connectionStatuses() });
     if (this.foregroundWatchdog) {
       clearTimeout(this.foregroundWatchdog);
@@ -2619,8 +2622,13 @@ export class HostRuntimeStore {
     this.ensureConnectedAll({ verify: true });
     // ensureConnected ignores a client that is already "connecting". An attempt started
     // while hidden can sit on an OS-suspended socket until its 15 s timeout, so start fresh.
-    for (const controller of this.controllers.values()) {
-      if (controller.getSnapshot().connectionStatus === "connecting") controller.reconnectWithNewClient();
+    // Not on cold start, where the attempt is new.
+    if (returningFromHidden) {
+      for (const controller of this.controllers.values()) {
+        if (controller.getSnapshot().connectionStatus === "connecting") {
+          controller.reconnectWithNewClient();
+        }
+      }
     }
     this.watchForegroundReconnect(0);
   }

@@ -491,7 +491,7 @@ fn redacted_config(cfg: &crate::config::Config) -> Value {
 }
 
 /// A URL without credentials, query or fragment.
-fn redact_url(url: &str) -> String {
+pub(crate) fn redact_url(url: &str) -> String {
     let url = url.split(|c: char| c == '?' || c == '#').next().unwrap_or("");
     let Some((scheme, rest)) = url.split_once("://") else { return url.to_string() };
     let (authority, path) = match rest.find('/') {

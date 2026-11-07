@@ -9,7 +9,8 @@
 //! (secrets removed), `projects` (with each git origin), `workspaces`,
 //! `agent/<id>`, `timeline/<id>`, and `meta` (KDF salt, parameters and a
 //! verifier, unencrypted). Every other row is deflate, then XSalsa20-Poly1305
-//! under an Argon2id key, as base64(nonce || ciphertext); a row over
+//! under an Argon2id key (the item key is sealed inside, so a row moved to
+//! another key is refused), as base64(nonce || ciphertext); a row over
 //! `CHUNK_BYTES` is split into `<key>#0`, `<key>#1`, ... The identity keypair
 //! is not backed up: after a restore the app is paired again.
 //!
@@ -28,8 +29,12 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 const CHUNK_BYTES: usize = 512 * 1024;
-/// Rows of one pipeline request stop growing once they pass this many bytes.
-const BATCH_BYTES: usize = 2 * 1024 * 1024;
+/// A pipeline request carries at most this many bytes of rows (about four chunks) and statements.
+const REQUEST_BYTES: usize = 2 * 1024 * 1024;
+const REQUEST_STATEMENTS: usize = 64;
+/// An item whose plaintext is larger is skipped, and so is refused when opening a row.
+const MAX_ITEM_BYTES: usize = 128 * 1024 * 1024;
+const RESTORE_TIMEOUT: Duration = Duration::from_secs(300);
 const PAGE_ROWS: usize = 10;
 const META: &str = "meta";
 const VERIFIER: &[u8] = b"feiyi-backup-v1";
@@ -37,11 +42,15 @@ const DEFAULT_INTERVAL_SECS: u64 = 900;
 const START_DELAY: Duration = Duration::from_secs(60);
 const MAX_BACKOFF: Duration = Duration::from_secs(3600);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
-const MAX_RESPONSE: u64 = 64 * 1024 * 1024;
+const MAX_RESPONSE: u64 = 16 * 1024 * 1024;
 const GIT_TIMEOUT: Duration = Duration::from_secs(10);
 const CLONE_TIMEOUT: Duration = Duration::from_secs(600);
-/// Field names (lowercase, substring match) dropped from the config row.
-const SECRET_WORDS: [&str; 6] = ["password", "passphrase", "secret", "token", "apikey", "api_key"];
+/// Config fields dropped from the config row: names (lowercase) containing one
+/// of these, or ending in `token` (`authToken`, but not `maxTokens`).
+const SECRET_WORDS: [&str; 7] = ["password", "passphrase", "secret", "apikey", "api_key", "privatekey", "private_key"];
+/// Left next to `agents.json` when a restore failed: the loop must not
+/// overwrite the remote backup with this machine's empty state.
+const RESTORE_PENDING: &str = "backup-restore-pending";
 
 const CREATE_TABLE: &str = "CREATE TABLE IF NOT EXISTS feiyi_backup(key TEXT PRIMARY KEY, updated_at INTEGER NOT NULL, data TEXT NOT NULL)";
 const UPSERT: &str = "INSERT INTO feiyi_backup(key, updated_at, data) VALUES(?, ?, ?) ON CONFLICT(key) DO UPDATE SET updated_at = excluded.updated_at, data = excluded.data";
@@ -54,12 +63,19 @@ const SELECT_PAGE: &str = "SELECT key, data FROM feiyi_backup WHERE key > ? AND 
 type SecretKey = [u8; 32];
 type Rows = Vec<Vec<String>>;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct BackupConfig {
     url: Option<String>,
     token: Option<String>,
     passphrase: Option<String>,
     interval: Duration,
+}
+
+/// Never prints the token or the passphrase (`Config` derives Debug).
+impl std::fmt::Debug for BackupConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "BackupConfig {{ url_set: {}, token_set: {}, passphrase_set: {}, interval: {:?} }}", self.url.is_some(), self.token.is_some(), self.passphrase.is_some(), self.interval)
+    }
 }
 
 /// A complete, valid backup configuration.
@@ -82,7 +98,10 @@ fn clean(v: Option<&str>) -> Option<String> {
 impl BackupConfig {
     pub fn load(home: &Path) -> BackupConfig {
         let file = std::fs::read(home.join("daemon-config.json")).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok());
-        BackupConfig::from_value(file.as_ref().and_then(|v| v.get("backup")), std::env::var("FEIYI_BACKUP_PASSPHRASE").ok().as_deref())
+        let env_passphrase = std::env::var("FEIYI_BACKUP_PASSPHRASE").ok();
+        // Agents and terminals inherit the daemon's environment.
+        std::env::remove_var("FEIYI_BACKUP_PASSPHRASE");
+        BackupConfig::from_value(file.as_ref().and_then(|v| v.get("backup")), env_passphrase.as_deref())
     }
 
     fn from_value(section: Option<&Value>, env_passphrase: Option<&str>) -> BackupConfig {
@@ -91,7 +110,7 @@ impl BackupConfig {
             url: text("tursoUrl"),
             token: text("tursoToken"),
             passphrase: text("passphrase").or_else(|| clean(env_passphrase)),
-            interval: Duration::from_secs(section.and_then(|s| s.get("intervalSecs")).and_then(Value::as_u64).unwrap_or(DEFAULT_INTERVAL_SECS).max(60)),
+            interval: Duration::from_secs(section.and_then(|s| s.get("intervalSecs")).and_then(Value::as_u64).unwrap_or(DEFAULT_INTERVAL_SECS).clamp(60, 86_400)),
         }
     }
 
@@ -154,8 +173,10 @@ struct Kdf {
 }
 
 const KDF: Kdf = Kdf { m: 19456, t: 2, p: 1 };
-/// Parameters read from the remote meta row are capped so a bad row cannot exhaust memory.
-const MAX_KDF_MEMORY_KIB: u32 = 256 * 1024;
+/// Parameters read from the remote meta row are capped so a bad row cannot exhaust the machine.
+const MAX_KDF_MEMORY_KIB: u32 = 64 * 1024;
+const MAX_KDF_PASSES: u32 = 6;
+const MAX_KDF_LANES: u32 = 4;
 
 #[derive(Serialize, Deserialize)]
 struct Meta {
@@ -179,6 +200,9 @@ fn derive_key(passphrase: &str, salt: &[u8], kdf: &Kdf) -> Result<SecretKey, Str
     if kdf.m > MAX_KDF_MEMORY_KIB {
         return Err("backup meta row asks for too much KDF memory".into());
     }
+    if kdf.t > MAX_KDF_PASSES || kdf.p > MAX_KDF_LANES {
+        return Err("backup meta row asks for too much KDF work".into());
+    }
     let params = argon2::Params::new(kdf.m, kdf.t, kdf.p, Some(32)).map_err(|e| e.to_string())?;
     let mut key = [0u8; 32];
     argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params).hash_password_into(passphrase.as_bytes(), salt, &mut key).map_err(|e| e.to_string())?;
@@ -190,7 +214,7 @@ fn make_meta(passphrase: &str, kdf: &Kdf) -> Result<(String, SecretKey), String>
     let mut salt = [0u8; 16];
     random_fill(&mut salt);
     let key = derive_key(passphrase, &salt, kdf)?;
-    let meta = Meta { v: 1, kdf: "argon2id".into(), salt: STANDARD.encode(salt), m: kdf.m, t: kdf.t, p: kdf.p, verifier: seal(&key, VERIFIER)? };
+    let meta = Meta { v: 1, kdf: "argon2id".into(), salt: STANDARD.encode(salt), m: kdf.m, t: kdf.t, p: kdf.p, verifier: seal(&key, META, VERIFIER)? };
     Ok((serde_json::to_string(&meta).map_err(|e| e.to_string())?, key))
 }
 
@@ -202,30 +226,40 @@ fn unlock(meta: &str, passphrase: &str) -> Result<SecretKey, String> {
     }
     let salt = STANDARD.decode(&meta.salt).map_err(|e| format!("bad salt in backup meta row: {e}"))?;
     let key = derive_key(passphrase, &salt, &Kdf { m: meta.m, t: meta.t, p: meta.p })?;
-    match open(&key, &meta.verifier) {
+    match open(&key, META, &meta.verifier) {
         Ok(v) if v == VERIFIER => Ok(key),
         _ => Err("wrong backup passphrase".into()),
     }
 }
 
-fn seal(key: &SecretKey, plain: &[u8]) -> Result<String, String> {
+/// Deflate and encrypt `plain`. The item key travels inside the ciphertext
+/// (length-prefixed before the data), so `open` rejects a row moved to another key.
+fn seal(key: &SecretKey, item: &str, plain: &[u8]) -> Result<String, String> {
     let mut nonce = [0u8; 24];
     random_fill(&mut nonce);
-    let packed = miniz_oxide::deflate::compress_to_vec(plain, 6);
+    let mut envelope = (item.len() as u16).to_be_bytes().to_vec();
+    envelope.extend_from_slice(item.as_bytes());
+    envelope.extend_from_slice(plain);
+    let packed = miniz_oxide::deflate::compress_to_vec(&envelope, 6);
     let sealed = XSalsa20Poly1305::new(Key::from_slice(key)).encrypt(Nonce::from_slice(&nonce), packed.as_slice()).map_err(|_| "encryption failed".to_string())?;
     let mut out = nonce.to_vec();
     out.extend_from_slice(&sealed);
     Ok(STANDARD.encode(out))
 }
 
-fn open(key: &SecretKey, data: &str) -> Result<Vec<u8>, String> {
+fn open(key: &SecretKey, item: &str, data: &str) -> Result<Vec<u8>, String> {
     let raw = STANDARD.decode(data).map_err(|e| format!("bad base64: {e}"))?;
     if raw.len() < 24 {
         return Err("row too short".into());
     }
     let (nonce, sealed) = raw.split_at(24);
     let packed = XSalsa20Poly1305::new(Key::from_slice(key)).decrypt(Nonce::from_slice(nonce), sealed).map_err(|_| "decryption failed".to_string())?;
-    miniz_oxide::inflate::decompress_to_vec(&packed).map_err(|e| format!("inflate failed: {e:?}"))
+    let envelope = miniz_oxide::inflate::decompress_to_vec_with_limit(&packed, MAX_ITEM_BYTES + 2 + item.len()).map_err(|e| format!("inflate failed: {e:?}"))?;
+    let named = envelope.get(..2).map(|n| u16::from_be_bytes([n[0], n[1]]) as usize).and_then(|n| envelope.get(2..2 + n));
+    if named != Some(item.as_bytes()) {
+        return Err("row belongs to another key".into());
+    }
+    Ok(envelope[2 + item.len()..].to_vec())
 }
 
 // --- rows and chunks --------------------------------------------------------
@@ -362,7 +396,7 @@ fn strip_secrets(v: &mut Value) {
         Value::Object(map) => {
             map.retain(|k, _| {
                 let k = k.to_ascii_lowercase();
-                !SECRET_WORDS.iter().any(|w| k.contains(w))
+                !k.ends_with("token") && !SECRET_WORDS.iter().any(|w| k.contains(w))
             });
             map.values_mut().for_each(strip_secrets);
         }
@@ -379,21 +413,31 @@ fn config_row(raw: &[u8]) -> Option<Vec<u8>> {
     serde_json::to_vec(&v).ok()
 }
 
+/// The git `origin` of `dir` without credentials (they would end up in the backup and the log).
 async fn origin_of(dir: &str) -> Option<String> {
     let out = crate::projects::run("git", &["remote", "get-url", "origin"], Some(Path::new(dir)), GIT_TIMEOUT).await.ok()?;
-    clean(Some(out.as_str()))
+    clean(Some(out.as_str())).map(|url| crate::mcp_server::redact_url(&url))
 }
 
-async fn gather(home: &Path) -> Result<BTreeMap<String, Item>, String> {
+/// The items to back up, and each project's remote. A project whose directory
+/// is gone (a clone still pending) keeps the remote known from before.
+async fn gather(home: &Path, known: &BTreeMap<String, String>) -> Result<(BTreeMap<String, Item>, BTreeMap<String, String>), String> {
     let mut projects = read_list(&home.join("projects.json"))?;
+    let mut remotes = BTreeMap::new();
     for p in projects.iter_mut() {
         let Some(root) = p.get("rootPath").and_then(Value::as_str).map(String::from) else { continue };
-        if let Some(remote) = origin_of(&root).await {
+        let remote = match origin_of(&root).await {
+            Some(remote) => Some(remote),
+            None => known.get(&root).cloned(),
+        };
+        if let Some(remote) = remote {
             p["remote"] = json!(remote);
+            remotes.insert(root, remote);
         }
     }
     let home = home.to_path_buf();
-    tokio::task::spawn_blocking(move || items(&home, &projects)).await.map_err(|e| e.to_string())?
+    let items = tokio::task::spawn_blocking(move || items(&home, &projects)).await.map_err(|e| e.to_string())??;
+    Ok((items, remotes))
 }
 
 fn items(home: &Path, projects: &[Value]) -> Result<BTreeMap<String, Item>, String> {
@@ -413,7 +457,7 @@ fn items(home: &Path, projects: &[Value]) -> Result<BTreeMap<String, Item>, Stri
         Ok(dir) => {
             for entry in dir.flatten() {
                 let name = entry.file_name().to_string_lossy().into_owned();
-                if let Some(id) = name.strip_suffix(".jsonl") {
+                if let Some(id) = name.strip_suffix(".jsonl").filter(|id| !id.is_empty()) {
                     out.insert(format!("timeline/{id}"), Item::File(entry.path()));
                 }
             }
@@ -473,23 +517,42 @@ impl State {
 
     fn plan(&self, key: &SecretKey, items: &BTreeMap<String, Item>) -> Result<Vec<Change>, String> {
         let mut changes = Vec::new();
+        self.plan_with(key, items, &mut |change| {
+            changes.push(change);
+            true
+        })?;
+        Ok(changes)
+    }
+
+    /// Hands each change to `sink` as soon as it is sealed, so only one item
+    /// is in memory at a time; the sink returns false to stop.
+    fn plan_with(&self, key: &SecretKey, items: &BTreeMap<String, Item>, sink: &mut dyn FnMut(Change) -> bool) -> Result<(), String> {
         let mut present = BTreeSet::new();
         for (item, source) in items {
             let Some(bytes) = source.bytes()? else { continue };
             present.insert(item.as_str());
+            if bytes.len() > MAX_ITEM_BYTES {
+                crate::warn!("backup: {item} is over {} MiB and is not backed up", MAX_ITEM_BYTES >> 20);
+                continue;
+            }
             let hash = fingerprint(&bytes);
             if self.hashes.get(item) == Some(&hash) {
                 continue;
             }
-            let put = split_chunks(item, seal(key, &bytes)?);
+            let put = split_chunks(item, seal(key, item, &bytes)?);
             let delete = self.remote.iter().filter(|k| belongs(k, item) && !put.iter().any(|(p, _)| p == *k)).cloned().collect();
-            changes.push(Change { item: item.clone(), hash: Some(hash), put, delete });
+            if !sink(Change { item: item.clone(), hash: Some(hash), put, delete }) {
+                return Ok(());
+            }
         }
         let gone: BTreeSet<&str> = self.remote.iter().map(|k| item_of(k)).filter(|i| *i != META && !present.contains(i)).collect();
         for item in gone {
-            changes.push(Change { item: item.to_string(), hash: None, put: Vec::new(), delete: self.remote.iter().filter(|k| belongs(k, item)).cloned().collect() });
+            let delete = self.remote.iter().filter(|k| belongs(k, item)).cloned().collect();
+            if !sink(Change { item: item.to_string(), hash: None, put: Vec::new(), delete }) {
+                break;
+            }
         }
-        Ok(changes)
+        Ok(())
     }
 
     fn commit(&mut self, change: &Change) {
@@ -506,51 +569,118 @@ impl State {
 
 // --- the backup loop -----------------------------------------------------------------------
 
+/// `backup-state.json`: what the last cycles left behind.
+#[derive(Serialize, Deserialize, Default)]
+struct StateFile {
+    /// Salt of the meta row the hashes belong to; they are dropped for another backup.
+    #[serde(default)]
+    salt: Option<String>,
+    #[serde(default)]
+    hashes: BTreeMap<String, u64>,
+    /// Each project's git origin as last known. Kept while a project's
+    /// directory is missing (a restore clone still pending), so it is never lost.
+    #[serde(default)]
+    remotes: BTreeMap<String, String>,
+}
+
+fn state_path(home: &Path) -> PathBuf {
+    home.join("backup-state.json")
+}
+
+fn load_state_file(home: &Path) -> StateFile {
+    std::fs::read(state_path(home)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+}
+
+fn save_state_file(home: &Path, file: &StateFile) -> Result<(), String> {
+    let bytes = serde_json::to_vec(file).map_err(|e| e.to_string())?;
+    crate::util::write_atomic(&state_path(home), &bytes, true).map_err(|e| format!("{}: {e}", state_path(home).display()))
+}
+
 struct Backup {
     home: PathBuf,
     ready: Ready,
     key: Option<SecretKey>,
+    salt: Option<String>,
     state: State,
+    remotes: BTreeMap<String, String>,
+    /// This machine has had local state, or the remote held no data when it
+    /// first uploaded: only then may an empty local state delete remote rows.
+    owns_remote: bool,
 }
 
 fn now_secs() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
-/// Create the table, read the meta row and the remote keys; the key is None when no backup was ever written.
-async fn open_remote(ready: &Ready) -> Result<(Option<SecretKey>, BTreeSet<String>), String> {
+fn salt_of(meta: &str) -> Option<String> {
+    serde_json::from_str::<Meta>(meta).ok().map(|m| m.salt)
+}
+
+/// Create the table, read the meta row and the remote keys; no key when no backup was ever written.
+async fn open_remote(ready: &Ready) -> Result<(Option<(SecretKey, String)>, BTreeSet<String>), String> {
     let mut res = ready.turso.run(vec![Stmt { sql: CREATE_TABLE, args: vec![] }, Stmt { sql: SELECT_META, args: vec![] }, Stmt { sql: SELECT_KEYS, args: vec![] }]).await?;
     let remote = res.remove(2).into_iter().filter_map(|r| r.into_iter().next()).collect();
     let meta = res.remove(1).into_iter().next().and_then(|r| r.into_iter().next());
-    let key = match meta {
-        Some(meta) => {
-            let pass = ready.passphrase.clone();
-            Some(tokio::task::spawn_blocking(move || unlock(&meta, &pass)).await.map_err(|e| e.to_string())??)
-        }
+    let opened = match meta {
+        Some(meta) => Some((unlock_blocking(&meta, &ready.passphrase).await?, meta)),
         None => None,
     };
-    Ok((key, remote))
+    Ok((opened, remote))
+}
+
+async fn unlock_blocking(meta: &str, passphrase: &str) -> Result<SecretKey, String> {
+    let (meta, passphrase) = (meta.to_string(), passphrase.to_string());
+    tokio::task::spawn_blocking(move || unlock(&meta, &passphrase)).await.map_err(|e| e.to_string())?
+}
+
+/// An empty local state must never replace a remote backup: not after a
+/// failed restore (marker file), and not on a machine that never had state
+/// while the remote holds data. Passing once makes this machine the owner,
+/// after which deleting everything locally is a real deletion.
+fn check_may_write(home: &Path, owns_remote: &mut bool, remote: &BTreeSet<String>) -> Result<(), String> {
+    let marker = home.join(RESTORE_PENDING);
+    if marker.exists() {
+        return Err(format!("a restore failed earlier; backup is paused so the remote copy is not overwritten (fix the cause and restart, or delete {} to back up this machine anyway)", marker.display()));
+    }
+    if !*owns_remote {
+        if !has_local_state(home) && remote.iter().any(|k| k != META) {
+            return Err("this machine has no agents or projects but the remote backup has data; backup is paused so it is not overwritten (restart the daemon to restore it)".into());
+        }
+        *owns_remote = true;
+    }
+    Ok(())
+}
+
+impl Stmt {
+    /// Bytes of data the statement carries.
+    fn size(&self) -> usize {
+        self.args.iter().filter_map(|a| a["value"].as_str()).map(str::len).sum()
+    }
 }
 
 impl Backup {
-    fn state_path(&self) -> PathBuf {
-        self.home.join("backup-state.json")
-    }
-
     async fn open(&mut self) -> Result<(), String> {
-        let (key, mut remote) = open_remote(&self.ready).await?;
-        let key = match key {
-            Some(key) => key,
+        let (opened, mut remote) = open_remote(&self.ready).await?;
+        let (key, meta) = match opened {
+            Some(opened) => opened,
             None => {
                 let pass = self.ready.passphrase.clone();
-                let (meta, key) = tokio::task::spawn_blocking(move || make_meta(&pass, &KDF)).await.map_err(|e| e.to_string())??;
-                self.ready.turso.run(vec![Stmt { sql: INSERT_META, args: vec![text(META), int(now_secs()), text(&meta)] }]).await?;
+                let (meta, _) = tokio::task::spawn_blocking(move || make_meta(&pass, &KDF)).await.map_err(|e| e.to_string())??;
+                // Another machine may have written its meta row first: use the stored one.
+                let mut res = self.ready.turso.run(vec![Stmt { sql: INSERT_META, args: vec![text(META), int(now_secs()), text(&meta)] }, Stmt { sql: SELECT_META, args: vec![] }]).await?;
+                let stored = res.remove(1).into_iter().next().and_then(|r| r.into_iter().next()).ok_or("the meta row is missing after writing it")?;
                 remote.insert(META.to_string());
-                key
+                (unlock_blocking(&stored, &self.ready.passphrase).await?, stored)
             }
         };
-        let hashes = std::fs::read(self.state_path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
-        self.state = State::new(hashes, remote);
+        let salt = salt_of(&meta);
+        let mut file = load_state_file(&self.home);
+        if file.salt != salt {
+            file.hashes.clear();
+        }
+        self.state = State::new(file.hashes, remote);
+        self.remotes = file.remotes;
+        self.salt = salt;
         self.key = Some(key);
         Ok(())
     }
@@ -561,37 +691,47 @@ impl Backup {
             self.open().await?;
         }
         let Some(key) = self.key else { return Ok(0) };
-        let items = gather(&self.home).await?;
+        check_may_write(&self.home, &mut self.owns_remote, &self.state.remote)?;
+        let (items, remotes) = gather(&self.home, &self.remotes).await?;
+        self.remotes = remotes;
         let state = self.state.clone();
-        let changes = tokio::task::spawn_blocking(move || state.plan(&key, &items)).await.map_err(|e| e.to_string())??;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Change>(1);
+        let planner = tokio::task::spawn_blocking(move || state.plan_with(&key, &items, &mut |change| tx.blocking_send(change).is_ok()));
         let (mut pushed, mut size, mut batch) = (0, 0, Vec::new());
-        for change in changes {
+        while let Some(change) = rx.recv().await {
             size += change.size();
             batch.push(change);
-            if size >= BATCH_BYTES {
+            if size >= REQUEST_BYTES {
                 pushed += self.send(std::mem::take(&mut batch)).await?;
                 size = 0;
             }
         }
+        planner.await.map_err(|e| e.to_string())??;
         Ok(pushed + self.send(batch).await?)
     }
 
+    /// Run the batch's statements in requests of bounded size, then remember them as written.
     async fn send(&mut self, batch: Vec<Change>) -> Result<usize, String> {
         if batch.is_empty() {
             return Ok(0);
         }
         let now = now_secs();
-        self.ready.turso.run(batch.iter().flat_map(|c| c.statements(now)).collect()).await?;
+        let mut stmts = batch.iter().flat_map(|c| c.statements(now)).collect::<Vec<_>>().into_iter().peekable();
+        while stmts.peek().is_some() {
+            let mut group = Vec::new();
+            let mut bytes = 0;
+            while let Some(next) = stmts.next_if(|s| group.is_empty() || (group.len() < REQUEST_STATEMENTS && bytes + s.size() <= REQUEST_BYTES)) {
+                bytes += next.size();
+                group.push(next);
+            }
+            self.ready.turso.run(group).await?;
+        }
         for change in &batch {
             self.state.commit(change);
         }
-        match serde_json::to_vec(&self.state.hashes) {
-            Ok(bytes) => {
-                if let Err(e) = crate::util::write_atomic(&self.state_path(), &bytes, true) {
-                    crate::warn!("backup: cannot save {}: {e}", self.state_path().display());
-                }
-            }
-            Err(e) => crate::warn!("backup: cannot encode backup state: {e}"),
+        let file = StateFile { salt: self.salt.clone(), hashes: self.state.hashes.clone(), remotes: self.remotes.clone() };
+        if let Err(e) = save_state_file(&self.home, &file) {
+            crate::warn!("backup: cannot save the backup state: {e}");
         }
         Ok(batch.iter().map(|c| c.put.len()).sum())
     }
@@ -606,7 +746,8 @@ pub fn spawn(cfg: &crate::config::Config) {
     };
     update_status(|s| s.enabled = true);
     crate::log!("remote backup on: every {}s to {}", cfg.backup.interval.as_secs(), ready.turso.host);
-    tokio::spawn(run(Backup { home: cfg.home.clone(), ready, key: None, state: State::default() }, cfg.backup.interval));
+    let backup = Backup { home: cfg.home.clone(), ready, key: None, salt: None, state: State::default(), remotes: BTreeMap::new(), owns_remote: false };
+    tokio::spawn(run(backup, cfg.backup.interval));
 }
 
 async fn run(mut backup: Backup, interval: Duration) {
@@ -631,7 +772,7 @@ async fn run(mut backup: Backup, interval: Duration) {
                 backup.key = None;
                 crate::warn!("backup failed: {e}");
                 update_status(|s| s.last_error = Some(e));
-                (interval * 2u32.pow(failures.min(4))).min(MAX_BACKOFF)
+                interval.saturating_mul(1 << failures.min(4)).min(MAX_BACKOFF.max(interval))
             }
         };
         tokio::time::sleep(wait).await;
@@ -660,47 +801,85 @@ struct Restored {
     clones: Vec<(String, String)>,
 }
 
+/// A JSON list of objects.
+fn object_list(bytes: &[u8], what: &str) -> Result<Vec<Value>, String> {
+    let list: Vec<Value> = serde_json::from_slice(bytes).map_err(|e| format!("{what}: {e}"))?;
+    if list.iter().all(Value::is_object) {
+        Ok(list)
+    } else {
+        Err(format!("{what}: entries must be objects"))
+    }
+}
+
 /// Write decrypted items under `home`. Called only when there is no local
 /// agent, project or workspace data; timelines already on disk and local
-/// config keys are kept.
+/// config keys are kept. Everything is validated before the first write, and
+/// the files that make the machine count as having state go last (removed
+/// again if one fails), so a failed restore can simply be run again.
 fn write_restored(home: &Path, items: &BTreeMap<String, Vec<u8>>) -> Result<Restored, String> {
-    let write = |name: &str, bytes: &[u8]| crate::util::write_atomic(&home.join(name), bytes, true).map_err(|e| format!("{name}: {e}"));
+    let config = items.get("config").map(|b| serde_json::from_slice::<serde_json::Map<String, Value>>(b).map_err(|e| format!("config row: {e}"))).transpose()?;
+    let workspaces = items.get("workspaces").map(|b| object_list(b, "workspaces row")).transpose()?;
+    let mut projects = items.get("projects").map(|b| object_list(b, "projects row")).transpose()?.unwrap_or_default();
+    let mut agents = Vec::new();
+    for (key, bytes) in items {
+        let Some(id) = key.strip_prefix("agent/") else { continue };
+        let mut agent: Value = serde_json::from_slice(bytes).map_err(|e| format!("{key}: {e}"))?;
+        let record = agent.as_object_mut().filter(|o| o.get("id").and_then(Value::as_str) == Some(id)).ok_or_else(|| format!("{key}: not an agent record"))?;
+        // An old prompt must not run again on the new machine.
+        record.remove("pendingTurn");
+        record.remove("pendingQueue");
+        agents.push(agent);
+    }
     let mut done = Restored::default();
+    let mut remotes = BTreeMap::new();
+    for p in projects.iter_mut() {
+        let path = p.get("rootPath").and_then(Value::as_str).filter(|s| !s.is_empty()).map(String::from).ok_or("projects row: a project has no rootPath")?;
+        let remote = p.as_object_mut().and_then(|o| o.remove("remote")).and_then(|r| r.as_str().map(crate::mcp_server::redact_url));
+        if let Some(remote) = remote.filter(|r| !r.is_empty()) {
+            if !Path::new(&path).exists() {
+                done.clones.push((path.clone(), remote.clone()));
+            }
+            remotes.insert(path, remote);
+        }
+    }
+    let list_bytes = |list: &Vec<Value>| serde_json::to_vec(list).map_err(|e| e.to_string());
+    let projects_bytes = items.contains_key("projects").then(|| list_bytes(&projects)).transpose()?;
+    let workspaces_bytes = workspaces.as_ref().map(list_bytes).transpose()?;
+    let agents_bytes = (!agents.is_empty()).then(|| list_bytes(&agents)).transpose()?;
+    let config_bytes = match config {
+        Some(mut config) => {
+            let local = std::fs::read(home.join("daemon-config.json")).ok().and_then(|b| serde_json::from_slice::<serde_json::Map<String, Value>>(&b).ok()).unwrap_or_default();
+            config.extend(local);
+            Some(serde_json::to_vec_pretty(&config).map_err(|e| e.to_string())?)
+        }
+        None => None,
+    };
+
+    let write = |name: &str, bytes: &[u8]| crate::util::write_atomic(&home.join(name), bytes, true).map_err(|e| format!("{name}: {e}"));
     for (key, bytes) in items {
         let Some(id) = key.strip_prefix("timeline/") else { continue };
         let safe: String = id.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').collect();
-        let path = home.join("timelines").join(format!("{safe}.jsonl"));
-        if safe == id && !path.exists() {
+        if !safe.is_empty() && safe == id && !home.join("timelines").join(format!("{safe}.jsonl")).exists() {
             write(&format!("timelines/{safe}.jsonl"), bytes)?;
             done.timelines += 1;
         }
     }
-    if let Some(bytes) = items.get("config") {
-        let mut config: serde_json::Map<String, Value> = serde_json::from_slice(bytes).map_err(|e| format!("config row: {e}"))?;
-        let local = std::fs::read(home.join("daemon-config.json")).ok().and_then(|b| serde_json::from_slice::<serde_json::Map<String, Value>>(&b).ok()).unwrap_or_default();
-        config.extend(local);
-        write("daemon-config.json", &serde_json::to_vec_pretty(&config).map_err(|e| e.to_string())?)?;
+    if let Some(bytes) = &config_bytes {
+        write("daemon-config.json", bytes)?;
     }
-    if let Some(bytes) = items.get("workspaces") {
-        write("workspaces.json", bytes)?;
+    if !remotes.is_empty() {
+        save_state_file(home, &StateFile { remotes, ..StateFile::default() })?;
     }
-    let agents: Vec<Value> = items.iter().filter(|(k, _)| k.starts_with("agent/")).filter_map(|(_, b)| serde_json::from_slice(b).ok()).collect();
-    if !agents.is_empty() {
-        write("agents.json", &serde_json::to_vec(&agents).map_err(|e| e.to_string())?)?;
+    let files = [("workspaces.json", workspaces_bytes), ("projects.json", projects_bytes), ("agents.json", agents_bytes)];
+    let written = files.iter().filter_map(|(name, bytes)| bytes.as_ref().map(|b| write(name, b))).collect::<Result<Vec<_>, _>>();
+    if let Err(e) = written {
+        for (name, _) in &files {
+            let _ = std::fs::remove_file(home.join(name));
+        }
+        return Err(e);
     }
     done.agents = agents.len();
-    if let Some(bytes) = items.get("projects") {
-        let mut projects: Vec<Value> = serde_json::from_slice(bytes).map_err(|e| format!("projects row: {e}"))?;
-        for p in projects.iter_mut() {
-            let remote = p.as_object_mut().and_then(|o| o.remove("remote")).and_then(|r| r.as_str().map(String::from));
-            let path = p.get("rootPath").and_then(Value::as_str).unwrap_or("");
-            if let Some(remote) = remote.filter(|_| !path.is_empty() && !Path::new(path).exists()) {
-                done.clones.push((path.to_string(), remote));
-            }
-        }
-        done.projects = projects.len();
-        write("projects.json", &serde_json::to_vec(&projects).map_err(|e| e.to_string())?)?;
-    }
+    done.projects = projects.len();
     Ok(done)
 }
 
@@ -721,22 +900,23 @@ async fn fetch_items(ready: &Ready, key: &SecretKey) -> Result<BTreeMap<String, 
     }
     let key = *key;
     tokio::task::spawn_blocking(move || {
-        join_chunks(rows)?.into_iter().map(|(item, sealed)| Ok::<_, String>((item.clone(), open(&key, &sealed).map_err(|e| format!("{item}: {e}"))?))).collect()
+        join_chunks(rows)?.into_iter().map(|(item, sealed)| Ok::<_, String>((item.clone(), open(&key, &item, &sealed).map_err(|e| format!("{item}: {e}"))?))).collect()
     })
     .await
     .map_err(|e| e.to_string())?
 }
 
 async fn restore(home: &Path, ready: &Ready) -> Result<Option<Restored>, String> {
-    let (key, _) = open_remote(ready).await?;
-    let Some(key) = key else { return Ok(None) };
+    let (opened, _) = open_remote(ready).await?;
+    let Some((key, _)) = opened else { return Ok(None) };
     let items = fetch_items(ready, &key).await?;
     write_restored(home, &items).map(Some)
 }
 
 /// On a machine with no local state, pull the backup and write the files
-/// before the daemon loads them. Never overwrites existing data; failures
-/// are logged and the daemon starts empty.
+/// before the daemon loads them. Never overwrites existing data. On failure
+/// the daemon starts empty and a marker file pauses the backup loop, which
+/// would otherwise replace the remote copy with this empty state.
 pub async fn restore_if_empty(cfg: &crate::config::Config) {
     let ready = match cfg.backup.ready() {
         Ok(Some(ready)) => ready,
@@ -746,15 +926,27 @@ pub async fn restore_if_empty(cfg: &crate::config::Config) {
     if has_local_state(&cfg.home) {
         return crate::log!("backup restore skipped: local state exists");
     }
-    match restore(&cfg.home, &ready).await {
-        Ok(Some(r)) => {
-            crate::log!("backup restored: {} agents, {} timelines, {} projects; the app must be paired again", r.agents, r.timelines, r.projects);
-            for (path, remote) in r.clones {
-                tokio::spawn(clone_project(path, remote));
+    let marker = cfg.home.join(RESTORE_PENDING);
+    let outcome = tokio::time::timeout(RESTORE_TIMEOUT, restore(&cfg.home, &ready)).await.unwrap_or_else(|_| Err("timed out".into()));
+    match outcome {
+        Ok(found) => {
+            let _ = std::fs::remove_file(&marker);
+            match found {
+                Some(r) => {
+                    crate::log!("backup restored: {} agents, {} timelines, {} projects; the app must be paired again", r.agents, r.timelines, r.projects);
+                    for (path, remote) in r.clones {
+                        tokio::spawn(clone_project(path, remote));
+                    }
+                }
+                None => crate::log!("backup restore: the remote database has no backup yet"),
             }
         }
-        Ok(None) => crate::log!("backup restore: the remote database has no backup yet"),
-        Err(e) => crate::warn!("backup restore failed, starting empty: {e}"),
+        Err(e) => {
+            crate::warn!("backup restore failed, starting empty and pausing the backup: {e}");
+            if let Err(we) = std::fs::write(&marker, "") {
+                crate::warn!("backup: cannot write {}: {we}", marker.display());
+            }
+        }
     }
 }
 
@@ -787,13 +979,13 @@ mod tests {
     #[test]
     fn encrypt_decrypt_round_trip() {
         let (_, key) = make_meta("pw", &FAST).unwrap();
-        let sealed = seal(&key, b"hello hello hello hello").unwrap();
+        let sealed = seal(&key, "x", b"hello hello hello hello").unwrap();
         assert!(!sealed.contains("hello"));
-        assert_eq!(open(&key, &sealed).unwrap(), b"hello hello hello hello");
-        assert_ne!(sealed, seal(&key, b"hello hello hello hello").unwrap(), "random nonce");
+        assert_eq!(open(&key, "x", &sealed).unwrap(), b"hello hello hello hello");
+        assert_ne!(sealed, seal(&key, "x", b"hello hello hello hello").unwrap(), "random nonce");
         let mut other = key;
         other[0] ^= 1;
-        assert!(open(&other, &sealed).is_err());
+        assert!(open(&other, "x", &sealed).is_err());
     }
 
     #[test]
@@ -820,8 +1012,8 @@ mod tests {
         assert_eq!(joined["agent/a"], "abc");
         all.remove("timeline/t#1");
         assert!(join_chunks(all).is_err());
-        let sealed = seal(&key, &vec![7u8; 10]).unwrap();
-        assert_eq!(open(&key, &join_chunks(split_chunks("x", sealed).into_iter().collect()).unwrap()["x"]).unwrap(), vec![7u8; 10]);
+        let sealed = seal(&key, "x", &vec![7u8; 10]).unwrap();
+        assert_eq!(open(&key, "x", &join_chunks(split_chunks("x", sealed).into_iter().collect()).unwrap()["x"]).unwrap(), vec![7u8; 10]);
     }
 
     #[test]
@@ -958,23 +1150,23 @@ mod tests {
     #[test]
     fn tampered_or_truncated_rows_are_rejected() {
         let (_, key) = make_meta("pw", &FAST).unwrap();
-        let sealed = seal(&key, b"payload payload payload").unwrap();
+        let sealed = seal(&key, "x", b"payload payload payload").unwrap();
         let raw = sealed_bytes(&sealed);
         for at in [0, 23, 24, raw.len() - 1] {
             let mut bad = raw.clone();
             bad[at] ^= 0x01;
-            assert!(open(&key, &STANDARD.encode(bad)).is_err(), "flip at byte {at}");
+            assert!(open(&key, "x", &STANDARD.encode(bad)).is_err(), "flip at byte {at}");
         }
-        assert_eq!(open(&key, &STANDARD.encode(&raw[..raw.len() - 1])).unwrap_err(), "decryption failed");
-        assert_eq!(open(&key, &STANDARD.encode(&raw[..23])).unwrap_err(), "row too short");
-        assert!(open(&key, "").is_err());
-        assert!(open(&key, "not base64!").is_err());
+        assert_eq!(open(&key, "x", &STANDARD.encode(&raw[..raw.len() - 1])).unwrap_err(), "decryption failed");
+        assert_eq!(open(&key, "x", &STANDARD.encode(&raw[..23])).unwrap_err(), "row too short");
+        assert!(open(&key, "x", "").is_err());
+        assert!(open(&key, "x", "not base64!").is_err());
     }
 
     #[test]
     fn nonces_differ_between_encryptions_of_the_same_data() {
         let (_, key) = make_meta("pw", &FAST).unwrap();
-        let nonces: BTreeSet<Vec<u8>> = (0..8).map(|_| sealed_bytes(&seal(&key, b"same").unwrap())[..24].to_vec()).collect();
+        let nonces: BTreeSet<Vec<u8>> = (0..8).map(|_| sealed_bytes(&seal(&key, "x", b"same").unwrap())[..24].to_vec()).collect();
         assert_eq!(nonces.len(), 8);
     }
 
@@ -1068,10 +1260,10 @@ mod tests {
     }
 
     #[test]
-    fn config_row_matches_secret_words_case_insensitively_as_substrings() {
-        let row = config_row(br#"{"tokensPerMin":5,"Password":"x","nested":{"PASSPHRASE":"y","ok":true}}"#).unwrap();
+    fn config_row_drops_secret_names_but_keeps_token_limits() {
+        let row = config_row(br#"{"maxTokens":5,"tokensPerMin":6,"authToken":"a","Password":"x","nested":{"PASSPHRASE":"y","ok":true,"private_key":"k"}}"#).unwrap();
         let kept: Value = serde_json::from_slice(&row).unwrap();
-        assert_eq!(kept, json!({ "nested": { "ok": true } }), "key matching is case-insensitive and substring based");
+        assert_eq!(kept, json!({ "maxTokens": 5, "tokensPerMin": 6, "nested": { "ok": true } }), "key matching is case-insensitive");
         assert!(config_row(b"[1]").is_none());
         assert!(config_row(b"{broken").is_none());
     }
@@ -1104,7 +1296,7 @@ mod tests {
 
     fn restore_from(store: &BTreeMap<String, String>, key: &SecretKey, home: &Path) -> Restored {
         let rows = store.iter().filter(|(k, _)| k.as_str() != META).map(|(k, d)| (k.clone(), d.clone())).collect();
-        let opened = join_chunks(rows).unwrap().into_iter().map(|(item, sealed)| (item, open(key, &sealed).unwrap())).collect();
+        let opened = join_chunks(rows).unwrap().into_iter().map(|(item, sealed)| (item, open(key, &item, &sealed).unwrap())).collect();
         write_restored(home, &opened).unwrap()
     }
 
@@ -1158,9 +1350,12 @@ mod tests {
         assert_eq!(read("workspaces.json"), json!([{ "id": "w1" }]));
         assert_eq!(read("daemon-config.json"), json!({ "appendSystemPrompt": "be brief", "providers": { "claude": { "enabled": false } } }));
         assert_eq!(read("projects.json"), json!([{ "rootPath": project_dir.to_string_lossy(), "name": "here" }, { "rootPath": gone.to_string_lossy() }]));
-        for secret_file in ["daemon-keypair.json", "server-id", "backup-state.json"] {
+        for secret_file in ["daemon-keypair.json", "server-id"] {
             assert!(!fresh.join(secret_file).exists(), "{secret_file} must not be restored");
         }
+        let restored_state = load_state_file(&fresh);
+        assert_eq!(restored_state.remotes, BTreeMap::from([(gone.to_string_lossy().into_owned(), "git@h:o/r.git".to_string())]), "the origin of a project still to clone is kept");
+        assert!(restored_state.hashes.is_empty() && restored_state.salt.is_none());
 
         std::fs::remove_file(home.join("timelines/a1.jsonl")).unwrap();
         let rows = cycle(&mut state, &key, &mut store, &home, &projects);
@@ -1213,5 +1408,100 @@ mod tests {
             assert!(host_of(bad).is_err(), "{bad}");
         }
         assert_eq!(host_of("libsql://h.turso.io/v2/pipeline").unwrap(), "h.turso.io");
+    }
+
+    #[test]
+    fn a_row_moved_to_another_key_is_rejected() {
+        let (_, key) = make_meta("pw", &FAST).unwrap();
+        let sealed = seal(&key, "agent/a", b"{}").unwrap();
+        assert_eq!(open(&key, "agent/a", &sealed).unwrap(), b"{}");
+        assert_eq!(open(&key, "agent/b", &sealed).unwrap_err(), "row belongs to another key");
+        assert!(open(&key, "", &sealed).is_err());
+        let big_name = "x".repeat(70_000);
+        assert!(open(&key, &big_name, &sealed).is_err());
+    }
+
+    #[test]
+    fn meta_kdf_cost_is_capped() {
+        let (meta, _) = make_meta("pw", &FAST).unwrap();
+        let edit = |field: &str, n: u32| {
+            let mut v: Value = serde_json::from_str(&meta).unwrap();
+            v[field] = json!(n);
+            v.to_string()
+        };
+        assert!(unlock(&edit("t", MAX_KDF_PASSES + 1), "pw").unwrap_err().contains("too much KDF work"));
+        assert!(unlock(&edit("p", MAX_KDF_LANES + 1), "pw").unwrap_err().contains("too much KDF work"));
+        assert!(unlock(&edit("m", 64 * 1024 + 1), "pw").unwrap_err().contains("too much KDF memory"));
+    }
+
+    #[test]
+    fn an_empty_machine_never_replaces_a_remote_backup() {
+        let home = temp_home();
+        let with_data = BTreeSet::from([META.to_string(), "agent/a".to_string()]);
+        let only_meta = BTreeSet::from([META.to_string()]);
+        let mut owns = false;
+        assert!(check_may_write(&home, &mut owns, &with_data).unwrap_err().contains("remote backup has data"));
+        assert!(!owns);
+        std::fs::write(home.join(RESTORE_PENDING), "").unwrap();
+        assert!(check_may_write(&home, &mut owns, &only_meta).unwrap_err().contains("restore failed earlier"));
+        std::fs::remove_file(home.join(RESTORE_PENDING)).unwrap();
+        assert!(check_may_write(&home, &mut owns, &only_meta).is_ok(), "nothing remote to lose");
+        assert!(owns);
+        assert!(check_may_write(&home, &mut owns, &with_data).is_ok(), "once owned, deleting everything locally is a deletion");
+
+        let mut owns = false;
+        std::fs::write(home.join("agents.json"), r#"[{"id":"a"}]"#).unwrap();
+        assert!(check_may_write(&home, &mut owns, &with_data).is_ok(), "a cycle that starts with local state may write");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn invalid_items_fail_before_anything_is_written() {
+        let home = temp_home();
+        let bad_agent = BTreeMap::from([("timeline/t1".to_string(), b"row\n".to_vec()), ("agent/a1".to_string(), br#"{"id":"other"}"#.to_vec())]);
+        assert!(write_restored(&home, &bad_agent).unwrap_err().contains("not an agent record"));
+        let bad_list = BTreeMap::from([("timeline/t1".to_string(), b"row\n".to_vec()), ("workspaces".to_string(), b"[1]".to_vec())]);
+        assert!(write_restored(&home, &bad_list).unwrap_err().contains("workspaces row"));
+        let no_root = BTreeMap::from([("projects".to_string(), br#"[{"name":"x"}]"#.to_vec())]);
+        assert!(write_restored(&home, &no_root).unwrap_err().contains("rootPath"));
+        assert!(!home.join("timelines").exists() || std::fs::read_dir(home.join("timelines")).unwrap().count() == 0);
+        assert!(!has_local_state(&home));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn restored_agents_lose_pending_prompts_and_remotes_lose_credentials() {
+        let home = temp_home();
+        let missing = home.join("not-cloned");
+        let items = BTreeMap::from([
+            ("agent/a1".to_string(), br#"{"id":"a1","pendingTurn":"rm -rf","pendingQueue":["x"],"model":"opus"}"#.to_vec()),
+            ("projects".to_string(), json!([{ "rootPath": missing.to_string_lossy(), "remote": "https://user:tok-123@github.com/o/r.git" }]).to_string().into_bytes()),
+        ]);
+        let done = write_restored(&home, &items).unwrap();
+        let agents: Value = serde_json::from_slice(&std::fs::read(home.join("agents.json")).unwrap()).unwrap();
+        assert_eq!(agents, json!([{ "id": "a1", "model": "opus" }]));
+        assert_eq!(done.clones, vec![(missing.to_string_lossy().into_owned(), "https://github.com/o/r.git".to_string())]);
+        assert!(!std::fs::read_to_string(state_path(&home)).unwrap().contains("tok-123"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn debug_output_of_the_config_hides_the_secrets() {
+        let section = json!({ "tursoUrl": "libsql://db-org.turso.io", "tursoToken": "TOKEN-9f3a", "passphrase": "PASS-7c1d" });
+        let shown = format!("{:?}", BackupConfig::from_value(Some(&section), None));
+        assert!(!shown.contains("TOKEN-9f3a") && !shown.contains("PASS-7c1d") && !shown.contains("db-org"), "{shown}");
+    }
+
+    #[test]
+    fn the_state_file_round_trips_and_defaults() {
+        let home = temp_home();
+        assert!(load_state_file(&home).hashes.is_empty());
+        let file = StateFile { salt: Some("s".into()), hashes: BTreeMap::from([("config".to_string(), 7)]), remotes: BTreeMap::from([("/p".to_string(), "u".to_string())]) };
+        save_state_file(&home, &file).unwrap();
+        let back = load_state_file(&home);
+        assert_eq!((back.salt.as_deref(), back.hashes["config"], back.remotes["/p"].as_str()), (Some("s"), 7, "u"));
+        std::fs::write(state_path(&home), r#"{"hashes":{"a":1}}"#).unwrap();
+        assert!(load_state_file(&home).remotes.is_empty(), "an older file without the new fields still loads");
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

@@ -1,5 +1,5 @@
 import { deflateRawSync } from "node:zlib";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { installFrameCompression } from "./frame-compression";
 
 function frame(text: string): ArrayBuffer {
@@ -20,7 +20,7 @@ describe("frame compression", () => {
     target.handleTransportMessage(frame('{"type":"big"}'));
     target.handleTransportMessage('{"type":"small"}');
     target.handleTransportMessage(terminal);
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    await vi.waitFor(() => expect(received).toHaveLength(3));
 
     expect(received).toEqual(['{"type":"big"}', '{"type":"small"}', terminal]);
   });

@@ -1811,4 +1811,21 @@ mod tests {
         assert!(cfg.ready().unwrap().is_none(), "blank values are unset");
         assert_eq!(cfg.interval, Duration::from_secs(DEFAULT_INTERVAL_SECS));
     }
+
+    #[test]
+    fn blank_file_values_fall_back_to_the_variables_and_the_interval_is_clamped() {
+        let vars = EnvSettings { url: Some("libsql://env.turso.io".into()), token: Some("tok-env".into()), passphrase: Some("pass-env".into()), interval_secs: Some(10) };
+        let section = json!({ "tursoUrl": "  ", "tursoToken": "", "passphrase": "bad\nvalue" });
+        let cfg = BackupConfig::from_sources(Some(&section), &vars);
+        let ready = cfg.ready().unwrap().unwrap();
+        assert_eq!((ready.turso.host.as_str(), ready.turso.token.as_str(), ready.passphrase.as_str()), ("env.turso.io", "tok-env", "pass-env"));
+        assert_eq!(cfg.interval, Duration::from_secs(60), "floor");
+        let slow = EnvSettings { interval_secs: Some(10_000_000), ..EnvSettings::default() };
+        assert_eq!(BackupConfig::from_sources(None, &slow).interval, Duration::from_secs(86_400), "ceiling");
+        let from_file = json!({ "intervalSecs": 600 });
+        assert_eq!(BackupConfig::from_sources(Some(&from_file), &vars).interval, Duration::from_secs(600));
+        assert!(BackupConfig::from_sources(None, &EnvSettings::default()).ready().unwrap().is_none());
+        let shown = BackupConfig::from_sources(None, &vars).redacted().to_string();
+        assert!(!shown.contains("tok-env") && !shown.contains("pass-env") && !shown.contains("env.turso"), "{shown}");
+    }
 }

@@ -328,6 +328,7 @@ impl Manager {
         let ready = self.claude.reap();
         self.send_ready(ready);
         self.codex.reap();
+        self.notify_lost_background_finishes();
         self.update_capacity();
         #[cfg(unix)]
         if self.last_trim.elapsed() >= Duration::from_secs(30) {
@@ -1026,7 +1027,7 @@ impl Manager {
     /// Send the "finished" notice a turn held back for background work that
     /// is gone now. Once: the flag is cleared.
     fn send_deferred_finish(&mut self, agent_id: &str) {
-        let Some(a) = self.agents.get_mut(agent_id).filter(|a| a.rec.finish_deferred) else { return };
+        let Some(a) = self.agents.get_mut(agent_id).filter(|a| a.rec.finish_deferred && a.rec.archived_at.is_none()) else { return };
         a.rec.finish_deferred = false;
         a.rec.attention_reason = Some("finished".into());
         a.rec.attention_at = Some(now_iso());
@@ -1036,10 +1037,16 @@ impl Manager {
         self.notify_attention(agent_id, "finished");
     }
 
-    /// After a restart the background work of an idle agent died with the old
-    /// daemon: nothing will report back, so its held notice goes out now.
+    /// An idle agent's background work is gone without reporting back (the
+    /// old daemon died, or its process was reaped, evicted or stopped
+    /// holding): nothing will report, so its held notice goes out now.
     fn notify_lost_background_finishes(&mut self) {
-        let ids: Vec<String> = self.agents.values().filter(|a| a.rec.finish_deferred && a.rec.pending_turn.is_none() && a.rec.pending_queue.is_empty()).map(|a| a.rec.id.clone()).collect();
+        let ids: Vec<String> = self
+            .agents
+            .values()
+            .filter(|a| a.rec.finish_deferred && a.status != "running" && a.rec.pending_turn.is_none() && a.rec.pending_queue.is_empty() && !self.claude.holding(&a.rec.id))
+            .map(|a| a.rec.id.clone())
+            .collect();
         for id in ids {
             self.send_deferred_finish(&id);
         }

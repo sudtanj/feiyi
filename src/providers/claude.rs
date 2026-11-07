@@ -522,6 +522,12 @@ impl ClaudePool {
         self.procs.get(agent_id).is_some_and(|p| p.holding() && p.sub_active.lock().unwrap().running)
     }
 
+    /// Its process stays up for background work, or for the grace window
+    /// after the last report while the CLI may open a turn on it.
+    pub fn holding(&self, agent_id: &str) -> bool {
+        self.procs.get(agent_id).is_some_and(|p| p.holding())
+    }
+
     /// Stop the agent's process when background sub-agents work in it (an
     /// interrupt would leave them running). Returns waiting prompts that may
     /// start in the freed slot, or None when there was nothing to stop.

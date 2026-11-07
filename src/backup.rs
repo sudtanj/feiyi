@@ -1296,7 +1296,7 @@ mod tests {
 
     fn restore_from(store: &BTreeMap<String, String>, key: &SecretKey, home: &Path) -> Restored {
         let rows = store.iter().filter(|(k, _)| k.as_str() != META).map(|(k, d)| (k.clone(), d.clone())).collect();
-        let opened = join_chunks(rows).unwrap().into_iter().map(|(item, sealed)| (item, open(key, &item, &sealed).unwrap())).collect();
+        let opened = join_chunks(rows).unwrap().into_iter().map(|(item, sealed)| { let plain = open(key, &item, &sealed).unwrap(); (item, plain) }).collect();
         write_restored(home, &opened).unwrap()
     }
 

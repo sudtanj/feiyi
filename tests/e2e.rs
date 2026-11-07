@@ -1895,3 +1895,104 @@ async fn schedule_create_rejects_an_interval_under_one_minute() {
     let ok = rpc(&mut ws, { let mut m = new_agent_schedule("s4", &cwd); m["cadence"]["everyMs"] = json!(60_000); m }, "schedule/create/response").await;
     assert!(ok["error"].is_null(), "{ok}");
 }
+
+/// A stand-in for `codex app-server`: starts a thread, saves every `turn/start`
+/// request to `codex-turns` and completes the turn.
+fn fake_codex(dir: &std::path::Path) -> PathBuf {
+    let path = dir.join("fake-codex.sh");
+    let script = format!(
+        concat!(
+            "#!/bin/sh\nwhile IFS= read -r line; do\n",
+            "  id=$(printf '%s' \"$line\" | sed -n 's/^{{\"id\":\\([0-9]*\\),.*/\\1/p')\n",
+            "  [ -n \"$id\" ] || continue\n  case \"$line\" in\n",
+            "    *'\"method\":\"thread/start\"'*) printf '{{\"id\":%s,\"result\":{{\"thread\":{{\"id\":\"fake-thread\"}}}}}}\\n' \"$id\" ;;\n",
+            "    *'\"method\":\"turn/start\"'*)\n      printf '%s\\n' \"$line\" >> '{log}'\n",
+            "      printf '{{\"id\":%s,\"result\":{{\"turn\":{{\"id\":\"t1\"}}}}}}\\n' \"$id\"\n",
+            "      printf '%s\\n' '{{\"method\":\"turn/completed\",\"params\":{{\"threadId\":\"fake-thread\",\"turn\":{{\"id\":\"t1\",\"status\":\"completed\"}}}}}}' ;;\n",
+            "    *) printf '{{\"id\":%s,\"result\":{{}}}}\\n' \"$id\" ;;\n  esac\ndone\n"
+        ),
+        log = dir.join("codex-turns").display()
+    );
+    std::fs::write(&path, script).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    path
+}
+
+async fn wait_for_saved_agent(agents_file: &std::path::Path, what: &str, ready: impl Fn(&Value) -> bool) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Some(saved) = std::fs::read(agents_file).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()).map(|a| a[0].clone()).filter(|a| ready(a)) {
+            return saved;
+        }
+        assert!(Instant::now() < deadline, "{what}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Picking the other provider's model on an idle agent restarts the chat on
+/// that tool: session dropped, and the first prompt (only) carries the earlier
+/// conversation.
+#[tokio::test]
+async fn switching_provider_starts_a_fresh_session_with_the_earlier_chat() {
+    let dir = unique_dir("switch");
+    let cwd = dir.join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let codex = fake_codex(&dir);
+    let d = start_with(dir.clone(), None, "ok", &[("PASEO_CODEX_BIN", codex.to_str().unwrap())]);
+    let mut ws = connect(d.port).await;
+    hello(&mut ws, None).await;
+    send(&mut ws, session(json!({ "type": "create_agent_request", "requestId": "r1", "config": { "provider": "claude", "cwd": cwd.to_string_lossy(), "modeId": "bypassPermissions" }, "initialPrompt": "first question" }))).await;
+    let agent_id = recv_until(&mut ws, |v| {
+        let p = &v["message"]["payload"];
+        (v["message"]["type"] == "status" && p["status"] == "agent_created").then(|| p["agentId"].as_str().unwrap().to_string())
+    })
+    .await;
+    recv_until(&mut ws, |v| (v["message"]["type"] == "agent_stream" && v["message"]["payload"]["event"]["type"] == "turn_completed").then_some(())).await;
+    let agents_file = dir.join("home").join("agents.json");
+    wait_for_saved_agent(&agents_file, "claude session never saved", |a| a["sessionId"] == "fake-session").await;
+
+    let switched = rpc(&mut ws, json!({ "type": "set_agent_model_request", "requestId": "s1", "agentId": agent_id, "modelId": "codex:gpt-test" }), "set_agent_model_response").await;
+    assert_eq!(switched["accepted"], true, "{switched}");
+    let saved = wait_for_saved_agent(&agents_file, "switch never saved", |a| a["provider"] == "codex").await;
+    assert_eq!(saved["model"], "gpt-test", "{saved}");
+    assert!(saved["sessionId"].is_null(), "{saved}");
+    assert_eq!(saved["handoffPending"], true, "{saved}");
+
+    let turns = dir.join("codex-turns");
+    for (i, text) in ["second question", "third question"].into_iter().enumerate() {
+        send(&mut ws, session(json!({ "type": "send_agent_message_request", "requestId": format!("m{i}"), "agentId": agent_id, "text": text }))).await;
+        recv_until(&mut ws, |v| (v["message"]["type"] == "agent_stream" && v["message"]["payload"]["event"]["type"] == "turn_completed").then_some(())).await;
+    }
+    let sent: Vec<String> = std::fs::read_to_string(&turns).unwrap().lines().map(String::from).collect();
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    for earlier in ["earlier session", "User: first question", "Assistant: hello from fake claude", "second question"] {
+        assert!(sent[0].contains(earlier), "{earlier}: {}", sent[0]);
+    }
+    assert!(sent[1].contains("third question") && !sent[1].contains("earlier session"), "{}", sent[1]);
+    let saved = saved_agent(&agents_file);
+    assert_eq!(saved["handoffPending"], false, "{saved}");
+}
+
+#[tokio::test]
+async fn switching_provider_is_refused_while_the_agent_runs() {
+    let d = start_at(unique_dir("switchbusy"), None, "hang");
+    let cwd = d.dir.join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let mut ws = connect(d.port).await;
+    hello(&mut ws, None).await;
+    send(&mut ws, session(json!({ "type": "create_agent_request", "requestId": "r1", "config": { "provider": "claude", "cwd": cwd.to_string_lossy(), "modeId": "bypassPermissions" }, "initialPrompt": "work" }))).await;
+    let agent_id = recv_until(&mut ws, |v| {
+        let p = &v["message"]["payload"];
+        (v["message"]["type"] == "status" && p["status"] == "agent_created").then(|| p["agentId"].as_str().unwrap().to_string())
+    })
+    .await;
+    let refused = rpc(&mut ws, json!({ "type": "set_agent_model_request", "requestId": "s1", "agentId": agent_id, "modelId": "codex:gpt-test" }), "set_agent_model_response").await;
+    assert_eq!(refused["accepted"], false, "{refused}");
+    assert!(refused["error"].as_str().unwrap().contains("running"), "{refused}");
+    let saved = wait_for_saved_agent(&d.dir.join("home").join("agents.json"), "agent never saved", |_| true).await;
+    assert_eq!(saved["provider"], "claude", "{saved}");
+}

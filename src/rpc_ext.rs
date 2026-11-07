@@ -174,6 +174,7 @@ impl Manager {
                     pending_turn: None,
                     pending_queue: Vec::new(),
                     finish_deferred: false,
+                    handoff_pending: false,
                 };
                 let id = rec.id.clone();
                 let mut agent = Agent::new(rec);

@@ -189,7 +189,19 @@ impl Manager {
                         a.rec.mode_id = Some(mode);
                     }
                 } else {
-                    let model = s(&msg, "modelId");
+                    let requested = s(&msg, "modelId");
+                    let current = self.agents[&id].rec.provider.clone();
+                    // The request has no provider field: a switch to the other
+                    // provider arrives as "<provider>:<modelId>".
+                    let (target, model) = match requested.as_deref().and_then(|m| m.split_once(':')) {
+                        Some((p @ ("claude" | "codex"), m)) => (p.to_string(), Some(m.to_string())),
+                        _ => (current.clone(), requested),
+                    };
+                    if target != current {
+                        if let Err(error) = self.switch_provider(&id, &target) {
+                            return reply(out, json!({ "type": response_type, "payload": { "requestId": rid, "agentId": id, "accepted": false, "error": error } }));
+                        }
+                    }
                     if let Some(a) = self.agents.get_mut(&id) {
                         if let Some(m) = model.as_deref().filter(|m| !m.is_empty()) {
                             self.daemon_config.remember_model(&a.rec.provider, m);
@@ -557,6 +569,7 @@ impl Manager {
             pending_turn: None,
             pending_queue: Vec::new(),
             finish_deferred: false,
+            handoff_pending: false,
         };
         let id = rec.id.clone();
         if let Some(model) = rec.model.clone() {

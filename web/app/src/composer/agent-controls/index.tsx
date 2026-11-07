@@ -1592,13 +1592,13 @@ export const AgentControls = memo(function AgentControls({
   );
   const agentModelSelectorProviders = useMemo(() => {
     if (snapshotSelectedEntry) {
-      return buildSelectableProviderSelectorProviders([snapshotSelectedEntry]);
+      return buildSelectableProviderSelectorProviders(snapshotEntries);
     }
     return buildProviderSelectorProviders({
       providerDefinitions: agentProviderDefinitions,
       modelsByProvider: agentProviderModels,
     });
-  }, [agentProviderDefinitions, agentProviderModels, snapshotSelectedEntry]);
+  }, [agentProviderDefinitions, agentProviderModels, snapshotEntries, snapshotSelectedEntry]);
 
   const modelSelection = resolveAgentModelSelection({
     models,
@@ -1622,17 +1622,22 @@ export const AgentControls = memo(function AgentControls({
   const agentProvider = agent?.provider;
   const activeModelId = modelSelection.activeModelId;
 
-  const handleSelectModel = useCallback(
-    async (modelId: string) => {
+  const handleSelectProviderAndModel = useCallback(
+    async (provider: AgentProvider, modelId: string) => {
       if (!client || !agentProvider) {
         return;
       }
       try {
-        await client.setAgentModel(agentId, modelId);
+        // The set-model request has no provider field, so a switch to the
+        // other provider travels as "<provider>:<modelId>".
+        await client.setAgentModel(
+          agentId,
+          provider === agentProvider ? modelId : `${provider}:${modelId}`,
+        );
         await updatePreferences((current) =>
           mergeProviderPreferences({
             preferences: current,
-            provider: agentProvider,
+            provider,
             updates: { model: modelId },
           }),
         );
@@ -1643,9 +1648,13 @@ export const AgentControls = memo(function AgentControls({
     },
     [agentId, agentProvider, client, toast, updatePreferences],
   );
-  const handleSelectCommandCenterModel = useCallback(
-    (_provider: AgentProvider, modelId: string) => handleSelectModel(modelId),
-    [handleSelectModel],
+  const handleSelectModel = useCallback(
+    (modelId: string) => {
+      if (agentProvider) {
+        void handleSelectProviderAndModel(agentProvider, modelId);
+      }
+    },
+    [agentProvider, handleSelectProviderAndModel],
   );
 
   // A running agent is one provider's process, so only that provider's profiles
@@ -1736,7 +1745,7 @@ export const AgentControls = memo(function AgentControls({
         providers: agentModelSelectorProviders,
         selectedProvider: agentProvider,
         selectedModelId: activeModelId,
-        select: handleSelectCommandCenterModel,
+        select: handleSelectProviderAndModel,
       },
       thinking: {
         options: modelSelection.thinkingOptions,
@@ -1756,7 +1765,7 @@ export const AgentControls = memo(function AgentControls({
       agentModelSelectorProviders,
       agentProvider,
       commandCenterModes,
-      handleSelectCommandCenterModel,
+      handleSelectProviderAndModel,
       handleSelectThinkingOption,
       handleSetFeature,
       modeProviderDefinitions,
@@ -1799,6 +1808,7 @@ export const AgentControls = memo(function AgentControls({
         modelOptions={modelOptions}
         selectedModelId={modelSelection.activeModelId ?? undefined}
         onSelectModel={handleSelectModel}
+        onSelectProviderAndModel={handleSelectProviderAndModel}
         agentProfiles={agentProfiles}
         onApplyAgentProfile={agentProfiles?.applyProfile}
         onEditAgentProfiles={handleEditAgentProfiles}

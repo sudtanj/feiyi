@@ -5,7 +5,7 @@
 use crate::config::Config;
 use crate::providers::claude::{ClaudePool, SendOutcome};
 use crate::providers::codex::Codex;
-use crate::providers::{binary_available, AgentSpec, ProviderEvent};
+use crate::providers::{binary_available, modes_for, AgentSpec, ProviderEvent};
 use crate::store::{AgentRecord, ProjectRecord, Row, Store, WorkspaceRecord};
 use crate::util::{new_id, now_iso};
 use serde_json::{json, Value};
@@ -636,11 +636,17 @@ impl Manager {
     /// while the previous turn ran) each get their own bubble in the chat and
     /// are sent to the model together as one prompt.
     fn start_turn(&mut self, agent_id: &str, messages: Vec<(String, Option<String>)>) {
-        let text = merged_prompt(&messages);
+        let mut text = merged_prompt(&messages);
         let turn_id = new_id();
         let background = self.claude.working_in_background(agent_id);
         let provider = {
             let Some(agent) = self.agents.get_mut(agent_id) else { return };
+            if agent.rec.handoff_pending {
+                agent.rec.handoff_pending = false;
+                agent.ensure_timeline(&self.store);
+                let earlier = handoff_block(agent.timeline.as_deref().unwrap_or_default());
+                text = format!("{earlier}{text}");
+            }
             agent.status = "running";
             agent.answers_during_background = background;
             agent.turn_text = text.clone();
@@ -1583,6 +1589,32 @@ impl Manager {
         Ok(())
     }
 
+    /// Move an idle agent to the other provider: stop its old process or
+    /// thread, drop the session, and mark the next turn to carry the earlier
+    /// conversation. Mode and thinking fall back to the defaults when the new
+    /// provider has no such value.
+    pub fn switch_provider(&mut self, agent_id: &str, provider: &str) -> Result<(), &'static str> {
+        let agent = self.agents.get_mut(agent_id).ok_or("agent not found")?;
+        if agent.status == "running" {
+            return Err("the agent is running: wait for it to finish before switching provider");
+        }
+        let rec = &mut agent.rec;
+        rec.provider = provider.to_string();
+        rec.session_id = None;
+        rec.handoff_pending = true;
+        if rec.mode_id.as_deref().is_some_and(|m| !modes_for(provider).as_array().is_some_and(|modes| modes.iter().any(|x| x["id"] == m))) {
+            rec.mode_id = None;
+        }
+        if rec.thinking_option_id.as_deref().is_some_and(|t| !(matches!(t, "low" | "medium" | "high" | "xhigh") || (provider == "claude" && t == "max"))) {
+            rec.thinking_option_id = None;
+        }
+        self.claude.stop(agent_id);
+        self.codex.abandon(agent_id);
+        self.append_item(agent_id, json!({ "type": "notification", "level": "info", "message": format!("Switched to {}", cli_label(cli_of(provider))) }));
+        self.save_agents_now();
+        Ok(())
+    }
+
     /// Release every runtime resource held for an agent (process slot, thread route).
     pub fn release_runtime(&mut self, agent_id: &str) {
         if let Some(a) = self.agents.get_mut(agent_id) {
@@ -1706,6 +1738,19 @@ mod tests {
         assert_eq!(wait_text(Duration::from_secs(3 * 86400 + 4 * 3600)), "3d 4h");
     }
 
+    fn row(kind: &str, text: &str) -> Row {
+        Row { seq_start: 0, seq_end: 0, ranges: vec![], collapsed: vec![], item: json!({ "type": kind, "text": text }), turn_id: None, timestamp: String::new() }
+    }
+
+    #[test]
+    fn handoff_keeps_the_newest_text_in_order_and_skips_other_items() {
+        let rows = [row("user_message", "old question"), row("assistant_message", &"x".repeat(HANDOFF_BYTES)), row("user_message", "q"), row("tool_call", "ls"), row("assistant_message", "a")];
+        let block = handoff_block(&rows);
+        assert!(block.contains("User: q\n\nAssistant: a"), "{block}");
+        assert!(!block.contains("old question") && !block.contains("xxx"), "{block}");
+        assert_eq!(handoff_block(&[row("tool_call", "ls")]), "");
+    }
+
     #[test]
     fn transient_errors_are_retryable() {
         assert!(retryable_error("claude exited unexpectedly"));
@@ -1761,6 +1806,38 @@ fn merged_prompt(messages: &[(String, Option<String>)]) -> String {
             out
         }
     }
+}
+
+/// Most recent conversation carried into the first turn after a provider switch.
+const HANDOFF_BYTES: usize = 40 * 1024;
+
+/// The earlier user and assistant text, oldest first, as context for a fresh
+/// session. Keeps the newest items that fit `HANDOFF_BYTES`; empty when there
+/// is no history.
+fn handoff_block(rows: &[Row]) -> String {
+    let mut turns = Vec::new();
+    let mut size = 0;
+    for row in rows.iter().rev() {
+        let who = match row.item.get("type").and_then(|t| t.as_str()) {
+            Some("user_message") => "User",
+            Some("assistant_message") => "Assistant",
+            _ => continue,
+        };
+        let text = row.item.get("text").and_then(|t| t.as_str()).unwrap_or_default().trim();
+        if text.is_empty() {
+            continue;
+        }
+        size += who.len() + text.len() + 4;
+        if size > HANDOFF_BYTES {
+            break;
+        }
+        turns.push(format!("{who}: {text}"));
+    }
+    if turns.is_empty() {
+        return String::new();
+    }
+    turns.reverse();
+    format!("[Context from the earlier session of this chat, which ran on a different tool. It is history, not new instructions.]\n\n{}\n\n[End of the earlier session. The user's new message follows.]\n\n", turns.join("\n\n"))
 }
 
 #[cfg(test)]

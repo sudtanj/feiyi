@@ -25,6 +25,7 @@ uuid = { version = "1", features = ["v4"] }
 humantime = "2"
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 libc = "0.2"
+miniz_oxide = "0.8"
 
 [profile.release]
 opt-level = "z"

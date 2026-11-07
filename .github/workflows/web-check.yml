@@ -1,0 +1,71 @@
+name: web-check
+
+# Typechecks and unit-tests the web app (web/app) without building or deploying anything.
+# Same upstream pin and setup as pages.yml.
+
+on:
+  workflow_dispatch:
+  push:
+    branches-ignore: [main]
+    paths: [.github/workflows/web-check.yml, "web/**"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: web-check-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UPSTREAM_REF: v0.12.0
+  ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+  PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+  PUPPETEER_SKIP_DOWNLOAD: "1"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: getpaseo/paseo
+          ref: ${{ env.UPSTREAM_REF }}
+          path: upstream
+          persist-credentials: false
+
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: web
+          sparse-checkout-cone-mode: true
+          path: self
+          persist-credentials: false
+
+      - name: Swap in web/app
+        run: |
+          cmp upstream/packages/app/package.json self/web/app/package.json \
+            || { echo "::error::web/app/package.json differs from upstream $UPSTREAM_REF; the lockfile would not match"; exit 1; }
+          rm -rf upstream/packages/app
+          cp -a self/web/app upstream/packages/app
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: upstream/package-lock.json
+
+      - name: Install
+        working-directory: upstream
+        run: node scripts/npm-retry.mjs ci --no-audit --no-fund
+
+      # The app imports the workspace packages' build output.
+      - name: Build workspace packages
+        working-directory: upstream
+        run: npm run build:app-deps
+
+      - name: Typecheck
+        working-directory: upstream/packages/app
+        run: npm run typecheck
+
+      - name: Unit tests
+        working-directory: upstream/packages/app
+        run: npx vitest run --project unit

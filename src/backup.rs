@@ -214,7 +214,7 @@ fn category(error: &str) -> String {
         ("wrong backup passphrase", "wrong passphrase"),
         ("unsupported backup format", "bad backup meta"),
         ("backup meta row", "bad backup meta"),
-        ("local I/O: ", X
+        ("local I/O: ", "local file error"),
         ("a restore failed earlier", "paused (restore failed earlier)"),
         ("this machine has no agents", "paused (remote has data, local empty)"),
     ];

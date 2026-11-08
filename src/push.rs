@@ -153,11 +153,16 @@ pub async fn get(host: &str, path: &str, max: u64, timeout: Duration) -> Result<
 
 /// `headers`: extra request header lines, each ending in `\r\n`.
 pub(crate) async fn request(method: &str, host: &str, path: &str, body: Option<&str>, headers: &str, max: u64, timeout: Duration) -> Result<(u16, String), String> {
+    request_via(443, crate::relay::tls_config(), method, host, path, body, headers, max, timeout).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn request_via(port: u16, tls_config: std::sync::Arc<rustls::ClientConfig>, method: &str, host: &str, path: &str, body: Option<&str>, headers: &str, max: u64, timeout: Duration) -> Result<(u16, String), String> {
     let work = async {
-        let tcp = tokio::net::TcpStream::connect((host, 443)).await.map_err(|e| e.to_string())?;
+        let tcp = tokio::net::TcpStream::connect((host, port)).await.map_err(|e| e.to_string())?;
         let _ = tcp.set_nodelay(true);
         let name = rustls::pki_types::ServerName::try_from(host.to_string()).map_err(|e| e.to_string())?;
-        let mut tls = tokio_rustls::TlsConnector::from(crate::relay::tls_config()).connect(name, tcp).await.map_err(|e| e.to_string())?;
+        let mut tls = tokio_rustls::TlsConnector::from(tls_config).connect(name, tcp).await.map_err(|e| e.to_string())?;
         let agent = format!("feiyi/{}", env!("CARGO_PKG_VERSION"));
         let request = match body {
             Some(body) => format!(
@@ -167,6 +172,9 @@ pub(crate) async fn request(method: &str, host: &str, path: &str, body: Option<&
             None => format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {agent}\r\n{headers}Connection: close\r\n\r\n"),
         };
         tls.write_all(request.as_bytes()).await.map_err(|e| e.to_string())?;
+        // Large bodies leave TLS records buffered once the socket fills; without a flush
+        // the server waits for the rest of the body while we wait for its reply.
+        tls.flush().await.map_err(|e| e.to_string())?;
         let mut raw = Vec::new();
         // Servers may skip TLS close_notify on Connection: close; keep what arrived.
         let _ = (&mut tls).take(max).read_to_end(&mut raw).await;
@@ -281,5 +289,54 @@ mod tests {
         let cut = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n9\r\nshort";
         assert_eq!(parse_response(cut).unwrap(), (200, "abc".to_string()));
         assert_eq!(dechunk("2\r\n\u{e9}\r\n0\r\n\r\n"), "\u{e9}");
+    }
+
+    #[tokio::test]
+    async fn request_flushes_a_multi_megabyte_body() {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let key = rustls::pki_types::PrivateKeyDer::try_from(cert.key_pair.serialize_der()).unwrap();
+        let server_config = rustls::ServerConfig::builder().with_no_client_auth().with_single_cert(vec![cert.cert.der().clone()], key).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.cert.der().clone()).unwrap();
+        let client_config = std::sync::Arc::new(rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth());
+
+        // A tiny receive buffer and a late reader keep the client's socket full during its final write.
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.set_recv_buffer_size(4096).unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let listener = socket.listen(1).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(server_config));
+        // Replies only after the whole Content-Length body arrived, so a missing flush stalls the client.
+        let server = tokio::spawn(tokio::time::timeout(Duration::from_secs(30), async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut tls = acceptor.accept(tcp).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let mut raw = Vec::new();
+            let mut chunk = [0u8; 64 * 1024];
+            let (head_len, body_len) = loop {
+                let n = tls.read(&mut chunk).await.unwrap();
+                assert!(n > 0, "client closed before sending the full request");
+                raw.extend_from_slice(&chunk[..n]);
+                if let Some(end) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&raw[..end]).to_ascii_lowercase();
+                    let len = head.lines().find_map(|l| l.strip_prefix("content-length:")).unwrap().trim().parse::<usize>().unwrap();
+                    break (end + 4, len);
+                }
+            };
+            while raw.len() < head_len + body_len {
+                let n = tls.read(&mut chunk).await.unwrap();
+                assert!(n > 0, "client closed before sending the full body");
+                raw.extend_from_slice(&chunk[..n]);
+            }
+            tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").await.unwrap();
+            tls.shutdown().await.unwrap();
+            raw.len() - head_len
+        }));
+
+        let body = "x".repeat(16 * 1024 * 1024);
+        let reply = request_via(port, client_config, "POST", "localhost", "/", Some(&body), "", 1024, Duration::from_secs(20)).await;
+        assert_eq!(reply, Ok((200, "ok".to_string())));
+        assert_eq!(server.await.unwrap().expect("server timed out"), body.len());
     }
 }

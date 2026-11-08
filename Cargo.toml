@@ -29,6 +29,9 @@ miniz_oxide = "0.8"
 argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
 crypto_secretbox = "0.1"
 
+[dev-dependencies]
+rcgen = { version = "0.13", default-features = false, features = ["ring"] }
+
 [profile.release]
 opt-level = "z"
 lto = true

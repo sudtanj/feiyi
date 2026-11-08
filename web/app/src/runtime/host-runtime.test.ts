@@ -1801,9 +1801,9 @@ describe("HostRuntimeStore", () => {
     useHostRuntimeClock();
     store.setAppVisible(true);
     expect(connectRequests).toBe(1);
-    // Retries every 2 s rather than waiting out the client's backoff.
+    // Retries after 0.5 s, then every 2 s, rather than waiting out the client's backoff.
     await vi.advanceTimersByTimeAsync(2_000);
-    expect(connectRequests).toBe(2);
+    expect(connectRequests).toBe(3);
     await vi.advanceTimersByTimeAsync(17_000);
     expect(freshClient.connectCalls).toBe(0);
     await vi.advanceTimersByTimeAsync(1_000);
@@ -1928,6 +1928,100 @@ describe("HostRuntimeStore", () => {
       store.syncHosts([]);
     });
 
+    it("retries 500 ms after a foreground attempt fails, not after the 2 s tick", async () => {
+      const { store, stuckClient, requests } = await createStuckHost();
+      stuckClient.setConnectionState({ status: "disconnected", reason: "backgrounded" });
+
+      useHostRuntimeClock();
+      store.setAppVisible(true);
+      expect(requests.count).toBe(1);
+      await vi.advanceTimersByTimeAsync(499);
+      expect(requests.count).toBe(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(requests.count).toBe(2);
+
+      store.syncHosts([]);
+    });
+
+    it("retries at 0.5 s, 2 s, then every 2 s", async () => {
+      const { store, stuckClient, requests } = await createStuckHost();
+      stuckClient.setConnectionState({ status: "disconnected", reason: "backgrounded" });
+
+      useHostRuntimeClock();
+      store.setAppVisible(true);
+      // [ms to advance, expected attempts]: ticks land at 0.5, 2, 4 and 6 s.
+      const steps: Array<[number, number]> = [
+        [499, 1], [1, 2], [1_499, 2], [1, 3], [1_999, 3], [1, 4], [1_999, 4], [1, 5],
+      ];
+      for (const [ms, count] of steps) {
+        await vi.advanceTimersByTimeAsync(ms);
+        expect(requests.count).toBe(count);
+      }
+
+      store.syncHosts([]);
+    });
+
+    it("restarts the 500 ms timer when backgrounded and foregrounded before it fires", async () => {
+      const { store, stuckClient, freshClient, requests } = await createStuckHost();
+      stuckClient.setConnectionState({ status: "disconnected", reason: "backgrounded" });
+
+      useHostRuntimeClock();
+      store.setAppVisible(true);
+      expect(requests.count).toBe(1);
+      await vi.advanceTimersByTimeAsync(300);
+      store.setAppVisible(false);
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(requests.count).toBe(1);
+
+      store.setAppVisible(true);
+      expect(requests.count).toBe(2);
+      await vi.advanceTimersByTimeAsync(499);
+      expect(requests.count).toBe(2);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(requests.count).toBe(3);
+      expect(freshClient.connectCalls).toBe(0);
+
+      store.syncHosts([]);
+    });
+
+    it("stops the retries when backgrounded before the first 500 ms retry fires", async () => {
+      const { store, stuckClient, requests } = await createStuckHost();
+      stuckClient.setConnectionState({ status: "disconnected", reason: "backgrounded" });
+
+      useHostRuntimeClock();
+      store.setAppVisible(true);
+      await vi.advanceTimersByTimeAsync(499);
+      store.setAppVisible(false);
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(requests.count).toBe(1);
+
+      store.syncHosts([]);
+    });
+
+    it("does not stack timers across repeated foreground toggles", async () => {
+      const { store, stuckClient, requests } = await createStuckHost();
+      stuckClient.setConnectionState({ status: "disconnected", reason: "backgrounded" });
+
+      useHostRuntimeClock();
+      let foregrounds = 0;
+      for (let i = 0; i < 5; i++) {
+        store.setAppVisible(true);
+        foregrounds++;
+        store.setAppVisible(true);
+        foregrounds++;
+        store.setAppVisible(false);
+      }
+      store.setAppVisible(true);
+      foregrounds++;
+      expect(requests.count).toBe(foregrounds);
+
+      // Ticks at 0.5, 2, 4, 6, 8 and 10 s: one watchdog, not one per toggle.
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(requests.count).toBe(foregrounds + 6);
+
+      store.syncHosts([]);
+    });
+
     it("stops retrying once the host is online again", async () => {
       const { store, stuckClient, freshClient, requests } = await createStuckHost();
       stuckClient.setConnectionState({ status: "disconnected", reason: "backgrounded" });
@@ -1935,11 +2029,11 @@ describe("HostRuntimeStore", () => {
       useHostRuntimeClock();
       store.setAppVisible(true);
       await vi.advanceTimersByTimeAsync(2_000);
-      expect(requests.count).toBe(2);
+      expect(requests.count).toBe(3);
 
       stuckClient.setConnectionState({ status: "connected" });
       await vi.advanceTimersByTimeAsync(60_000);
-      expect(requests.count).toBe(2);
+      expect(requests.count).toBe(3);
       expect(freshClient.connectCalls).toBe(0);
       expect(stuckClient.isDisposed()).toBe(false);
 
@@ -1953,11 +2047,11 @@ describe("HostRuntimeStore", () => {
       useHostRuntimeClock();
       store.setAppVisible(true);
       await vi.advanceTimersByTimeAsync(2_000);
-      expect(requests.count).toBe(2);
+      expect(requests.count).toBe(3);
 
       store.setAppVisible(false);
       await vi.advanceTimersByTimeAsync(60_000);
-      expect(requests.count).toBe(2);
+      expect(requests.count).toBe(3);
       expect(freshClient.connectCalls).toBe(0);
       expect(stuckClient.isDisposed()).toBe(false);
 

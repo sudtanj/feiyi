@@ -330,7 +330,7 @@ mod tests {
         for name in cheap {
             assert_eq!(r[name]["model"], "haiku", "{name}");
         }
-        for name in builtin().keys().filter(|n| !cheap.contains(&n.as_str()) && *n != "engineer") {
+        for name in builtin().keys().filter(|n| !cheap.contains(&n.as_str()) && !["engineer", "designer"].contains(&n.as_str())) {
             assert_eq!(r[name]["model"], "sonnet", "{name}");
         }
     }

@@ -1,3 +1,4 @@
+import React from "react";
 import { Text, View } from "react-native";
 import { StyleSheet } from "react-native-unistyles";
 import { SettingsSection } from "@/components/settings/headings/settings-section";

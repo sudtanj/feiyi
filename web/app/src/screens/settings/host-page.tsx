@@ -364,6 +364,7 @@ export function HostSettingsPage({
 }) {
   const host = useHostProfile(serverId);
   const isLocalDaemon = useIsLocalDaemon(serverId);
+  const isConnected = useHostRuntimeIsConnected(serverId);
 
   if (!host) {
     return <HostNotFound />;

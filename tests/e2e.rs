@@ -2261,3 +2261,122 @@ async fn repeated_directory_workspace_create_returns_the_same_workspace() {
     let n = list["entries"].as_array().map(|e| e.len()).unwrap_or(0);
     assert_eq!(n, 1, "{list}");
 }
+
+async fn create_dir_workspace(ws: &mut Ws, request_id: &str, path: &str) -> Value {
+    rpc(ws, json!({ "type": "workspace.create.request", "requestId": request_id, "source": { "kind": "directory", "path": path } }), "workspace.create.response").await
+}
+
+#[tokio::test]
+async fn directory_workspace_create_is_per_directory_and_normalizes_the_path() {
+    let d = start("wsdirs", None);
+    let a = d.dir.join("a");
+    let b = d.dir.join("b");
+    std::fs::create_dir_all(&a).unwrap();
+    std::fs::create_dir_all(&b).unwrap();
+    let mut ws = connect(d.port).await;
+    hello(&mut ws, None).await;
+
+    let a1 = create_dir_workspace(&mut ws, "a1", &a.to_string_lossy()).await;
+    let b1 = create_dir_workspace(&mut ws, "b1", &b.to_string_lossy()).await;
+    assert!(a1["error"].is_null() && b1["error"].is_null(), "{a1} {b1}");
+    assert_ne!(a1["workspace"]["id"], b1["workspace"]["id"]);
+
+    // normalize_dir canonicalizes, so these spellings all name the same directory.
+    let slash = create_dir_workspace(&mut ws, "a2", &format!("{}/", a.to_string_lossy())).await;
+    assert_eq!(slash["workspace"]["id"], a1["workspace"]["id"], "trailing slash: {slash}");
+    let dotted = create_dir_workspace(&mut ws, "a3", &format!("{}/../a/.", a.to_string_lossy())).await;
+    assert_eq!(dotted["workspace"]["id"], a1["workspace"]["id"], "dot segments: {dotted}");
+    let spaced = create_dir_workspace(&mut ws, "a4", &format!("  {}  ", a.to_string_lossy())).await;
+    assert_eq!(spaced["workspace"]["id"], a1["workspace"]["id"], "padded: {spaced}");
+
+    let list = rpc(&mut ws, json!({ "type": "fetch_workspaces_request", "requestId": "l1" }), "fetch_workspaces_response").await;
+    assert_eq!(list["entries"].as_array().unwrap().len(), 2, "{list}");
+}
+
+#[tokio::test]
+async fn directory_workspace_create_after_archive_makes_a_new_workspace() {
+    let d = start("wsarch", None);
+    let dir = d.dir.join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let cwd = dir.to_string_lossy().into_owned();
+    let mut ws = connect(d.port).await;
+    hello(&mut ws, None).await;
+
+    let first = create_dir_workspace(&mut ws, "c1", &cwd).await;
+    let id = first["workspace"]["id"].clone();
+    let r = rpc(&mut ws, json!({ "type": "archive_workspace_request", "requestId": "c2", "workspaceId": id }), "archive_workspace_response").await;
+    assert!(r["error"].is_null(), "{r}");
+
+    let again = create_dir_workspace(&mut ws, "c3", &cwd).await;
+    assert!(again["error"].is_null(), "{again}");
+    assert_ne!(again["workspace"]["id"], id, "an archived workspace must not be handed back: {again}");
+    assert!(again["workspace"]["archivedAt"].is_null(), "{again}");
+    let repeat = create_dir_workspace(&mut ws, "c4", &cwd).await;
+    assert_eq!(repeat["workspace"]["id"], again["workspace"]["id"], "{repeat}");
+}
+
+#[tokio::test]
+async fn directory_workspace_create_for_a_missing_directory_still_fails() {
+    let d = start("wsmissing", None);
+    let gone = d.dir.join("nope").to_string_lossy().into_owned();
+    let mut ws = connect(d.port).await;
+    hello(&mut ws, None).await;
+    let r = create_dir_workspace(&mut ws, "m1", &gone).await;
+    assert_eq!(r["errorCode"], "directory_not_found", "{r}");
+    assert!(r["workspace"].is_null(), "{r}");
+}
+
+#[tokio::test]
+async fn worktree_creates_stay_distinct_and_are_not_deduplicated() {
+    let d = start("wtdup", None);
+    let repo = d.dir.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    git(&repo, &["config", "user.name", "Test"]);
+    std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-q", "-m", "initial"]);
+    let cwd = repo.to_string_lossy().into_owned();
+    let mut ws = connect(d.port).await;
+    hello(&mut ws, None).await;
+
+    let root = create_dir_workspace(&mut ws, "r1", &cwd).await;
+    let w1 = rpc(&mut ws, json!({ "type": "workspace.create.request", "requestId": "t1", "source": { "kind": "worktree", "cwd": cwd, "worktreeSlug": "one-fox" } }), "workspace.create.response").await;
+    let w2 = rpc(&mut ws, json!({ "type": "workspace.create.request", "requestId": "t2", "source": { "kind": "worktree", "cwd": cwd, "worktreeSlug": "two-fox" } }), "workspace.create.response").await;
+    assert!(w1["error"].is_null() && w2["error"].is_null(), "{w1} {w2}");
+    let ids = [&root["workspace"]["id"], &w1["workspace"]["id"], &w2["workspace"]["id"]];
+    assert!(ids[0] != ids[1] && ids[1] != ids[2] && ids[0] != ids[2], "{ids:?}");
+    assert_eq!(w1["workspace"]["workspaceKind"], "worktree");
+    assert_eq!(w2["workspace"]["worktreeSlug"], "two-fox");
+}
+
+/// Simulates a double tap / reconnect retry: both requests are on the wire before either reply is read.
+#[tokio::test]
+async fn rapid_double_directory_create_yields_one_workspace() {
+    let d = start("wsrapid", None);
+    let dir = d.dir.join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let cwd = dir.to_string_lossy().into_owned();
+    let mut ws = connect(d.port).await;
+    hello(&mut ws, None).await;
+
+    for rid in ["x1", "x2", "x3"] {
+        send(&mut ws, session(json!({ "type": "workspace.create.request", "requestId": rid, "source": { "kind": "directory", "path": cwd } }))).await;
+    }
+    let mut ids = Vec::new();
+    while ids.len() < 3 {
+        let r = recv_until(&mut ws, |v| (v["message"]["type"] == "workspace.create.response").then(|| v["message"]["payload"].clone())).await;
+        assert!(r["error"].is_null(), "{r}");
+        ids.push(r["workspace"]["id"].clone());
+    }
+    assert!(ids.iter().all(|i| *i == ids[0]), "{ids:?}");
+
+    // A second socket (the reconnected client) asking again sees the same one.
+    let mut ws2 = connect(d.port).await;
+    hello(&mut ws2, None).await;
+    let again = create_dir_workspace(&mut ws2, "x4", &cwd).await;
+    assert_eq!(again["workspace"]["id"], ids[0], "{again}");
+    let list = rpc(&mut ws2, json!({ "type": "fetch_workspaces_request", "requestId": "l1" }), "fetch_workspaces_response").await;
+    assert_eq!(list["entries"].as_array().unwrap().len(), 1, "{list}");
+}

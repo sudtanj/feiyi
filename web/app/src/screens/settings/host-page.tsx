@@ -64,6 +64,7 @@ import { formatLatency } from "@/utils/latency";
 import { ICON_SIZE } from "@/styles/theme";
 import type { Theme } from "@/styles/theme";
 import { useProviderIcon } from "@/components/provider-icons";
+import { BackupSection } from "./backup-section";
 import { BrowserToolsOptInCard } from "./browser-tools-card";
 import { restartDaemonFromSettings, updateDaemonFromSettings } from "./daemon-lifecycle";
 
@@ -363,6 +364,7 @@ export function HostSettingsPage({
 }) {
   const host = useHostProfile(serverId);
   const isLocalDaemon = useIsLocalDaemon(serverId);
+  const isConnected = useHostRuntimeIsConnected(serverId);
 
   if (!host) {
     return <HostNotFound />;
@@ -372,6 +374,8 @@ export function HostSettingsPage({
     <View>
       <HostStatusBadges serverId={serverId} />
       <HostConnectionError serverId={serverId} />
+
+      {isConnected ? <BackupSection serverId={serverId} /> : null}
 
       <HostAppearanceSection host={host} />
 

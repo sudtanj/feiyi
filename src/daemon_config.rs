@@ -147,6 +147,7 @@ impl DaemonConfig {
         out.insert("app".into(), json!({ "baseUrl": cfg.app_base_url }));
         out.insert("relay".into(), json!({ "enabled": cfg.relay_enabled }));
         out.remove("backup");
+        out.insert("backupStatus".into(), crate::backup::app_status(&cfg.backup));
         out.entry("providers").or_insert_with(|| json!({}));
         out.entry("appendSystemPrompt").or_insert_with(|| json!(""));
         Value::Object(out)
@@ -186,8 +187,8 @@ impl DaemonConfig {
                         }
                     }
                 }
-                // Environment-controlled in feiyi (backup: edited by hand, it holds secrets); not stored.
-                "mcp" | "hostnames" | "app" | "relay" | "backup" => {}
+                // Environment-controlled in feiyi (backup: edited by hand, it holds secrets; backupStatus: read-only); not stored.
+                "mcp" | "hostnames" | "app" | "relay" | "backup" | "backupStatus" => {}
                 _ => {
                     self.stored.insert(key.clone(), value.clone());
                 }
@@ -287,6 +288,26 @@ mod tests {
         let saved: Value = serde_json::from_slice(&std::fs::read(dir.join("daemon-config.json")).unwrap()).unwrap();
         assert_eq!(saved["backup"]["tursoToken"], "tok-keep");
         assert_eq!(saved["appendSystemPrompt"], "x");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn backup_status_is_read_only_and_to_json_holds_no_backup_secrets() {
+        let dir = std::env::temp_dir().join(format!("feiyi-cfg-{}", crate::util::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("daemon-config.json"), r#"{"backup":{"tursoUrl":"libsql://db-org.turso.io","tursoToken":"tok-9f3a","passphrase":"pw-7c1d"}}"#).unwrap();
+        let mut c = DaemonConfig::load(&dir);
+        c.apply_patch(&json!({ "backupStatus": { "enabled": true, "lastError": "forged" }, "appendSystemPrompt": "x" }));
+        assert!(c.stored.get("backupStatus").is_none());
+        let saved = std::fs::read_to_string(dir.join("daemon-config.json")).unwrap();
+        assert!(!saved.contains("backupStatus") && !saved.contains("forged"), "never persisted: {saved}");
+        let out = c.to_json(&crate::config::Config::load(&[]));
+        assert!(out["backupStatus"].get("enabled").is_some() && out["backupStatus"].get("rowsPushed").is_some());
+        assert!(out.get("backup").is_none());
+        let text = out.to_string();
+        for secret in ["tok-9f3a", "pw-7c1d", "db-org", "libsql"] {
+            assert!(!text.contains(secret), "{secret} in {text}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

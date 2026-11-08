@@ -2195,3 +2195,38 @@ async fn slash_command_after_a_switch_keeps_the_handoff_for_the_next_message() {
     assert!(sent[0].contains("\"text\":\"/init\"") && !sent[0].contains("earlier session"), "{}", sent[0]);
     assert!(sent[1].contains("User: first question") && sent[1].contains("real question"), "{}", sent[1]);
 }
+
+async fn daemon_config(d: &Daemon) -> Value {
+    let mut ws = connect(d.port).await;
+    hello(&mut ws, None).await;
+    send(&mut ws, session(json!({ "type": "get_daemon_config_request", "requestId": "b1" }))).await;
+    recv_until(&mut ws, |v| (v["message"]["type"] == "get_daemon_config_response").then(|| v["message"]["payload"]["config"].clone())).await
+}
+
+#[tokio::test]
+async fn daemon_config_reports_backup_off_without_any_secret_fields() {
+    let off = [("FEIYI_BACKUP_TURSO_URL", ""), ("FEIYI_BACKUP_TURSO_TOKEN", ""), ("FEIYI_BACKUP_PASSPHRASE", "")];
+    let d = start_with(unique_dir("backup-off"), None, "ok", &off);
+    let cfg = daemon_config(&d).await;
+    assert_eq!(cfg["backupStatus"]["enabled"], false);
+    assert!(cfg["backupStatus"]["lastError"].is_null() && cfg["backupStatus"]["lastAttemptAt"].is_null());
+    assert_eq!(cfg["backupStatus"]["rowsPushed"], 0);
+    assert!(cfg.get("backup").is_none());
+    let text = cfg["backupStatus"].to_string();
+    for word in ["url", "Url", "oken", "assphrase", "turso"] {
+        assert!(!text.contains(word), "{word} in {text}");
+    }
+}
+
+#[tokio::test]
+async fn daemon_config_reports_backup_on_with_the_interval_and_no_secrets() {
+    let on = [("FEIYI_BACKUP_TURSO_URL", "libsql://backup.invalid"), ("FEIYI_BACKUP_TURSO_TOKEN", "tok-9f3a"), ("FEIYI_BACKUP_PASSPHRASE", "pw-7c1d"), ("FEIYI_BACKUP_INTERVAL_SECS", "120")];
+    let d = start_with(unique_dir("backup-on"), None, "ok", &on);
+    let cfg = daemon_config(&d).await;
+    assert_eq!(cfg["backupStatus"]["enabled"], true);
+    assert_eq!(cfg["backupStatus"]["intervalSecs"], 120);
+    let text = cfg.to_string();
+    for secret in ["tok-9f3a", "pw-7c1d", "backup.invalid", "libsql"] {
+        assert!(!text.contains(secret), "{secret} in the config");
+    }
+}

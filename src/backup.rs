@@ -30,6 +30,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
+use crate::manager::{Cmd, Manager};
+
 const CHUNK_BYTES: usize = 512 * 1024;
 /// A pipeline request carries at most this many bytes of rows (about four chunks) and statements.
 const REQUEST_BYTES: usize = 2 * 1024 * 1024;
@@ -178,12 +180,13 @@ fn host_of(url: &str) -> Result<String, String> {
 
 struct Status {
     enabled: bool,
+    last_attempt: Option<String>,
     last_success: Option<String>,
     last_error: Option<String>,
     rows_pushed: u64,
 }
 
-static STATUS: Mutex<Status> = Mutex::new(Status { enabled: false, last_success: None, last_error: None, rows_pushed: 0 });
+static STATUS: Mutex<Status> = Mutex::new(Status { enabled: false, last_attempt: None, last_success: None, last_error: None, rows_pushed: 0 });
 
 fn update_status(f: impl FnOnce(&mut Status)) {
     if let Ok(mut s) = STATUS.lock() {
@@ -193,7 +196,44 @@ fn update_status(f: impl FnOnce(&mut Status)) {
 
 pub fn status() -> Value {
     let Ok(s) = STATUS.lock() else { return Value::Null };
-    json!({ "enabled": s.enabled, "lastSuccessAt": s.last_success, "lastError": s.last_error, "rowsPushed": s.rows_pushed })
+    json!({ "enabled": s.enabled, "lastAttemptAt": s.last_attempt, "lastSuccessAt": s.last_success, "lastError": s.last_error, "rowsPushed": s.rows_pushed })
+}
+
+/// The fixed text the app may see for a failure: no host, path or remote text.
+/// Unrecognised errors get a generic label, so a new error cannot leak by default.
+fn category(error: &str) -> String {
+    if let Some(code) = error.strip_prefix("turso returned HTTP ").and_then(|rest| rest.split(':').next()).and_then(|code| code.parse::<u16>().ok()) {
+        return format!("http {code}");
+    }
+    let known = [
+        ("timed out", "timed out"),
+        ("network: ", "network or TLS"),
+        ("statement ", "statement failed"),
+        ("unreadable pipeline response", "bad response"),
+        ("pipeline ", "bad response"),
+        ("wrong backup passphrase", "wrong passphrase"),
+        ("unsupported backup format", "bad backup meta"),
+        ("backup meta row", "bad backup meta"),
+        ("local I/O: ", "local file error"),
+        ("a restore failed earlier", "paused (restore failed earlier)"),
+        ("this machine has no agents", "paused (remote has data, local empty)"),
+    ];
+    known.iter().find(|(prefix, _)| error.starts_with(prefix)).map_or("backup failed", |(_, label)| label).to_string()
+}
+
+/// Tell connected apps the status changed: they only refetch the config on this push.
+fn notify_apps(cmds: &tokio::sync::mpsc::UnboundedSender<Cmd>) {
+    let _ = cmds.send(Cmd::Run(Box::new(|m: &mut Manager| {
+        let config = m.daemon_config.to_json(&m.cfg);
+        m.broadcast(json!({ "type": "status", "payload": { "status": "daemon_config_changed", "config": config } }));
+    })));
+}
+
+/// Read-only status for the app: `status()` plus the interval, no secrets.
+pub fn app_status(cfg: &BackupConfig) -> Value {
+    let mut out = status();
+    out["intervalSecs"] = json!(cfg.interval.as_secs());
+    out
 }
 
 // --- encryption -------------------------------------------------------------
@@ -386,7 +426,9 @@ fn parse_pipeline(body: &str, statements: usize) -> Result<Vec<Rows>, String> {
 impl Turso {
     async fn run(&self, stmts: Vec<Stmt>) -> Result<Vec<Rows>, String> {
         let auth = format!("Authorization: Bearer {}\r\n", self.token);
-        let (status, body) = crate::push::request("POST", &self.host, "/v2/pipeline", Some(&pipeline_body(&stmts)), &auth, MAX_RESPONSE, REQUEST_TIMEOUT).await?;
+        let (status, body) = crate::push::request("POST", &self.host, "/v2/pipeline", Some(&pipeline_body(&stmts)), &auth, MAX_RESPONSE, REQUEST_TIMEOUT)
+            .await
+            .map_err(|e| if e == "timed out" { e } else { format!("network: {e}") })?;
         if status != 200 {
             return Err(format!("turso returned HTTP {status}: {}", crate::util::truncate(&body, 200)));
         }
@@ -409,7 +451,7 @@ impl Item {
             Item::File(path) => match std::fs::read(path) {
                 Ok(b) => Ok(Some(b)),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                Err(e) => Err(format!("{}: {e}", path.display())),
+                Err(e) => Err(format!("local I/O: {}: {e}", path.display())),
             },
         }
     }
@@ -417,9 +459,9 @@ impl Item {
 
 fn read_list(path: &Path) -> Result<Vec<Value>, String> {
     match std::fs::read(path) {
-        Ok(b) => serde_json::from_slice(&b).map_err(|e| format!("{}: {e}", path.display())),
+        Ok(b) => serde_json::from_slice(&b).map_err(|e| format!("local I/O: {}: {e}", path.display())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(e) => Err(format!("{}: {e}", path.display())),
+        Err(e) => Err(format!("local I/O: {}: {e}", path.display())),
     }
 }
 
@@ -495,7 +537,7 @@ fn items(home: &Path, projects: &[Value]) -> Result<BTreeMap<String, Item>, Stri
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(format!("timelines: {e}")),
+        Err(e) => return Err(format!("local I/O: timelines: {e}")),
     }
     Ok(out)
 }
@@ -779,30 +821,33 @@ impl Backup {
 }
 
 /// Start the periodic backup when it is configured.
-pub fn spawn(cfg: &crate::config::Config) {
+pub fn spawn(cfg: &crate::config::Config, cmds: tokio::sync::mpsc::UnboundedSender<Cmd>) {
     let ready = match cfg.backup.ready() {
         Ok(Some(ready)) => ready,
         Ok(None) => return crate::log!("remote backup is off (it needs backup.tursoUrl, backup.tursoToken and a passphrase)"),
         Err(e) => return crate::warn!("remote backup is off: {e}"),
     };
     update_status(|s| s.enabled = true);
-    crate::log!("remote backup on: every {}s to {}", cfg.backup.interval.as_secs(), ready.turso.host);
+    crate::log!("remote backup on: every {}s", cfg.backup.interval.as_secs());
     let backup = Backup { home: cfg.home.clone(), ready, key: None, salt: None, state: State::default(), remotes: BTreeMap::new(), owns_remote: false };
-    tokio::spawn(run(backup, cfg.backup.interval));
+    tokio::spawn(run(backup, cfg.backup.interval, cmds));
 }
 
-async fn run(mut backup: Backup, interval: Duration) {
+async fn run(mut backup: Backup, interval: Duration, cmds: tokio::sync::mpsc::UnboundedSender<Cmd>) {
     tokio::time::sleep(START_DELAY).await;
     let mut failures = 0u32;
     loop {
         let wait = match backup.cycle().await {
             Ok(rows) => {
                 failures = 0;
+                let now = crate::util::now_iso();
                 update_status(|s| {
-                    s.last_success = Some(crate::util::now_iso());
+                    s.last_attempt = Some(now.clone());
+                    s.last_success = Some(now);
                     s.last_error = None;
                     s.rows_pushed += rows as u64;
                 });
+                notify_apps(&cmds);
                 if rows > 0 {
                     crate::log!("backup: pushed {rows} rows");
                 }
@@ -812,7 +857,11 @@ async fn run(mut backup: Backup, interval: Duration) {
                 failures += 1;
                 backup.key = None;
                 crate::warn!("backup failed: {e}");
-                update_status(|s| s.last_error = Some(e));
+                update_status(|s| {
+                    s.last_attempt = Some(crate::util::now_iso());
+                    s.last_error = Some(category(&e));
+                });
+                notify_apps(&cmds);
                 interval.saturating_mul(1 << failures.min(4)).min(MAX_BACKOFF.max(interval))
             }
         };
@@ -1372,6 +1421,58 @@ mod tests {
         let bad_url = BackupConfig::from_value(Some(&json!({ "tursoUrl": "http://x", "tursoToken": "t", "passphrase": "p" })), None);
         assert_eq!(bad_url.redacted()["enabled"], false);
         assert!(bad_url.ready().is_err());
+    }
+
+    #[test]
+    fn failure_categories_hold_no_host_path_or_remote_text() {
+        let errors = [
+            "network: invalid certificate: certificate not valid for name \"db-org.turso.io\"",
+            "network: failed to lookup address information: db-org.turso.io",
+            "timed out",
+            "turso returned HTTP 502: <html>db-org.turso.io /home/u/.feiyi</html>",
+            "statement 2 failed: no such table at /var/lib/db-org.turso.io",
+            "unreadable pipeline response: expected value at line 1 column 1",
+            "wrong backup passphrase",
+            "local I/O: /home/user/.feiyi/agents.json: permission denied",
+            "a restore failed earlier; backup is paused (delete /home/user/.feiyi/restore-pending to back up this machine anyway)",
+            "this machine has no agents or projects but the remote backup has data; backup is paused",
+            "something new from db-org.turso.io at /tmp/x",
+        ];
+        for e in errors {
+            let shown = category(e);
+            for leak in ["turso", "db-org", "/", "\\", ".json", ".feiyi", "<html>"] {
+                assert!(!shown.contains(leak), "{leak} in {shown:?} for {e:?}");
+            }
+        }
+        assert_eq!(category("turso returned HTTP 502: x"), "http 502");
+        assert_eq!(category("network: x"), "network or TLS");
+        assert_eq!(category("local I/O: /a: b"), "local file error");
+        assert_eq!(category("this machine has no agents or projects but x"), "paused (remote has data, local empty)");
+        assert_eq!(category("something new"), "backup failed");
+    }
+
+    #[test]
+    fn category_http_code_edge_cases() {
+        assert_eq!(category("turso returned HTTP 401: unauthorized"), "http 401");
+        assert_eq!(category("turso returned HTTP 503"), "http 503");
+        assert_eq!(category("turso returned HTTP abc: x"), "backup failed");
+        assert_eq!(category("turso returned HTTP 99999: x"), "backup failed");
+        assert_eq!(category(""), "backup failed");
+        assert_eq!(category("timed out"), "timed out");
+        assert_eq!(category("wrong backup passphrase"), "wrong passphrase");
+    }
+
+    #[test]
+    fn app_status_holds_no_url_token_or_passphrase() {
+        let section = json!({ "tursoUrl": "libsql://db-org.turso.io", "tursoToken": "TOKEN-9f3a", "passphrase": "PASS-7c1d", "intervalSecs": 120 });
+        let shown = app_status(&BackupConfig::from_value(Some(&section), None));
+        for secret in ["TOKEN-9f3a", "PASS-7c1d", "libsql", "db-org"] {
+            assert!(!shown.to_string().contains(secret), "{secret} in {shown}");
+        }
+        assert_eq!(shown["intervalSecs"], 120);
+        for key in ["enabled", "lastAttemptAt", "lastSuccessAt", "lastError", "rowsPushed"] {
+            assert!(shown.get(key).is_some(), "{key} missing");
+        }
     }
 
     #[test]

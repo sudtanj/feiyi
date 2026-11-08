@@ -291,4 +291,52 @@ describe("resolveAgentModelSelection", () => {
     expect(selection.displayModel).toBe("gpt-6.1-sol");
     expect(selection.displayThinking).toBe("Max");
   });
+
+  it("shows Medium for a Claude model that defaults to medium when nothing is picked", () => {
+    const selection = resolveAgentModelSelection({
+      models: [
+        {
+          id: "claude-sonnet-5-5",
+          provider: "claude",
+          label: "Sonnet 5.5",
+          thinkingOptions: [
+            { id: "low", label: "Low" },
+            { id: "medium", label: "Medium" },
+            { id: "high", label: "High" },
+          ],
+          defaultThinkingOptionId: "medium",
+        },
+      ],
+      runtimeModelId: "claude-sonnet-5-5",
+      configuredModelId: null,
+      runtimeThinkingOptionId: null,
+      explicitThinkingOptionId: null,
+    });
+
+    expect(selection.selectedThinkingId).toBe("medium");
+    expect(selection.displayThinking).toBe("Medium");
+  });
+
+  it("treats the literal default option as nothing picked and shows Medium", () => {
+    const selection = resolveAgentModelSelection({
+      models: [
+        {
+          id: "m",
+          provider: "claude",
+          label: "M",
+          thinkingOptions: [
+            { id: "low", label: "Low" },
+            { id: "medium", label: "Medium" },
+          ],
+          defaultThinkingOptionId: "medium",
+        },
+      ],
+      runtimeModelId: "m",
+      configuredModelId: null,
+      runtimeThinkingOptionId: null,
+      explicitThinkingOptionId: "default",
+    });
+
+    expect(selection.displayThinking).toBe("Medium");
+  });
 });

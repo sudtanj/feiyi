@@ -123,6 +123,7 @@ pub fn claude_models() -> Value {
                 // Haiku models are offered without effort levels.
                 if !id.contains("haiku") {
                     m["thinkingOptions"] = thinking.clone();
+                    m["defaultThinkingOptionId"] = serde_json::json!("medium");
                 }
                 m
             })
@@ -276,6 +277,24 @@ mod tests {
         let models = claude_models();
         let haiku = models.as_array().unwrap().iter().find(|m| m["id"] == "claude-haiku-4-5").unwrap();
         assert!(haiku.get("thinkingOptions").is_none());
+    }
+
+    #[test]
+    fn non_haiku_models_default_to_medium_effort() {
+        let models = claude_models();
+        let models = models.as_array().unwrap();
+        for m in models {
+            let id = m["id"].as_str().unwrap();
+            if id.contains("haiku") {
+                assert!(m.get("defaultThinkingOptionId").is_none(), "{id}");
+            } else {
+                assert_eq!(m["defaultThinkingOptionId"], "medium", "{id}");
+                assert!(m["thinkingOptions"].as_array().unwrap().iter().any(|o| o["id"] == "medium"), "{id}: default must be a listed option");
+            }
+        }
+        for family in ["opus", "sonnet", "haiku"] {
+            assert!(models.iter().any(|m| m["id"].as_str().unwrap().contains(family)), "{family} present");
+        }
     }
 
     #[test]

@@ -112,8 +112,10 @@ fn builtin() -> Map<String, Value> {
         &format!("You are legal: a first-pass drafter and reviewer, not a lawyer, and this is not legal advice. Infer and state the document type, the parties, which side we are on, the jurisdiction and the purpose. Write in plain language, riskiest items first. Cover every key term (payment, term, termination, liability, indemnity, IP, governing law, privacy); err toward flagging; treat missing standard clauses as gaps; say whether each clause is standard or unusual and where enforceability varies by place. Cite exact sections or rules and state uncertainty instead of guessing. End with prioritized actions and what needs a real lawyer. {never_send}"),
         Some(drafter),
     ));
-    for name in ["writer", "marketer", "sales", "support"] {
-        m[name]["model"] = json!("haiku");
+    // Pinned so a role never inherits the lead's model (Opus burns Pro quota fastest).
+    for (name, role) in m.iter_mut() {
+        let cheap = matches!(name.as_str(), "writer" | "marketer" | "sales" | "support");
+        role["model"] = json!(if cheap { "haiku" } else { "sonnet" });
     }
     m
 }
@@ -309,8 +311,28 @@ mod tests {
             assert!(role["maxTurns"].as_u64().unwrap() <= 50, "{name}");
         }
         assert_eq!(r["writer"]["model"], "haiku");
-        assert!(r["engineer"].get("model").is_none());
+        assert_eq!(r["engineer"]["model"], "sonnet");
+        assert!(builtin().values().all(|role| role["model"] == "haiku" || role["model"] == "sonnet"));
         assert!(roles(json!({ "company": false }).as_object().unwrap(), &h).is_none());
+    }
+
+    #[test]
+    fn user_model_choice_is_not_forced() {
+        let h = home();
+        let stored = json!({ "roles": {
+            "engineer": { "description": "E", "prompt": "p", "model": "opus" },
+            "designer": { "description": "D", "prompt": "p" }
+        } });
+        let r = roles(stored.as_object().unwrap(), &h).unwrap();
+        assert_eq!(r["engineer"]["model"], "opus");
+        assert!(r["designer"].get("model").is_none());
+        let cheap = ["writer", "marketer", "sales", "support"];
+        for name in cheap {
+            assert_eq!(r[name]["model"], "haiku", "{name}");
+        }
+        for name in builtin().keys().filter(|n| !cheap.contains(&n.as_str()) && !["engineer", "designer"].contains(&n.as_str())) {
+            assert_eq!(r[name]["model"], "sonnet", "{name}");
+        }
     }
 
     #[test]

@@ -364,6 +364,14 @@ async fn daemon_config_custom_models_round_trip() {
     send(&mut ws, session(json!({ "type": "list_provider_models_request", "requestId": "c2", "provider": "claude" }))).await;
     let models = recv_until(&mut ws, |v| (v["message"]["type"] == "list_provider_models_response").then(|| v["message"]["payload"]["models"].clone())).await;
     assert!(models.as_array().unwrap().iter().any(|m| m["id"] == "my-custom-model" && m["label"] == "Mine"));
+    for m in models.as_array().unwrap() {
+        let id = m["id"].as_str().unwrap();
+        if id.contains("opus") || id.contains("sonnet") {
+            assert_eq!(m["defaultThinkingOptionId"], "medium", "{id}");
+        } else if id.contains("haiku") {
+            assert!(m.get("defaultThinkingOptionId").is_none(), "{id}");
+        }
+    }
 
     // Persisted: a second connection sees it in get_daemon_config.
     let mut ws2 = connect(d.port).await;
@@ -1217,6 +1225,10 @@ async fn company_roles_reach_claude_with_memory_and_switch_off() {
     assert!(agents["engineer"]["prompt"].as_str().unwrap().contains("- acme: tabs not spaces"), "memory injected");
     assert!(agents["tester"]["prompt"].as_str().unwrap().starts_with("You test."), "custom role added");
     assert!(agents.get("legal").is_none(), "null removes a built-in role");
+    assert_eq!(agents["writer"]["model"], "haiku");
+    assert_eq!(agents["engineer"]["model"], "sonnet");
+    assert_eq!(agents["qa"]["model"], "sonnet");
+    assert!(agents["tester"].get("model").is_none(), "custom role without a model is not forced");
     assert!(agents["qa"]["tools"].as_array().unwrap().contains(&json!("mcp__feiyi__remember")));
     assert!(args.contains("You lead a one-person company") && args.contains("tester"), "lead prompt names the team");
 

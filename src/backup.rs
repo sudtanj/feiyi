@@ -1452,6 +1452,17 @@ mod tests {
     }
 
     #[test]
+    fn category_http_code_edge_cases() {
+        assert_eq!(category("turso returned HTTP 401: unauthorized"), "http 401");
+        assert_eq!(category("turso returned HTTP 503"), "http 503");
+        assert_eq!(category("turso returned HTTP abc: x"), "backup failed");
+        assert_eq!(category("turso returned HTTP 99999: x"), "backup failed");
+        assert_eq!(category(""), "backup failed");
+        assert_eq!(category("timed out"), "timed out");
+        assert_eq!(category("wrong backup passphrase"), "wrong passphrase");
+    }
+
+    #[test]
     fn app_status_holds_no_url_token_or_passphrase() {
         let section = json!({ "tursoUrl": "libsql://db-org.turso.io", "tursoToken": "TOKEN-9f3a", "passphrase": "PASS-7c1d", "intervalSecs": 120 });
         let shown = app_status(&BackupConfig::from_value(Some(&section), None));

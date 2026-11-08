@@ -81,6 +81,63 @@ describe("BackupSection", () => {
     expect(text).toContain("Failing");
     expect(text).toContain("turso returned 401");
   });
+
+  it("shows the category and the last attempt when failing", () => {
+    const text = render({
+      backupStatus: { ...base, lastError: "http 401", lastAttemptAt: "2026-11-08T10:05:00.000Z" },
+    });
+    expect(text).toContain("Failing");
+    expect(text).toContain("http 401");
+    expect(text).toContain("Last attempt 5m ago");
+    expect(text).not.toContain("Last success");
+  });
+
+  it("omits the last attempt line when the daemon sent no attempt time", () => {
+    expect(render({ backupStatus: { ...base, lastError: "timed out" } })).not.toContain(
+      "Last attempt",
+    );
+  });
+
+  it("shows Waiting before the first backup finishes", () => {
+    const text = render({ backupStatus: base });
+    expect(text).toContain("Waiting for the first backup");
+    expect(text).not.toContain("Failing");
+    expect(text).not.toContain("Last success");
+  });
+
+  it("shows the last success next to the error when a later cycle failed", () => {
+    const text = render({
+      backupStatus: {
+        ...base,
+        lastError: "network or TLS",
+        lastSuccessAt: "2026-11-08T09:00:00.000Z",
+        lastAttemptAt: "2026-11-08T10:00:00.000Z",
+      },
+    });
+    expect(text).toContain("network or TLS");
+    expect(text).toContain("Last success 5m ago");
+    expect(text).toContain("Last attempt 5m ago");
+  });
+
+  it("re-renders with the new status when a config push replaces the config", () => {
+    const container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    configState.isLoading = false;
+    configState.config = { backupStatus: base };
+    act(() => root?.render(<BackupSection serverId="s" />));
+    expect(container.textContent).toContain("Waiting for the first backup");
+    configState.config = { backupStatus: { ...base, lastError: "http 502" } };
+    act(() => root?.render(<BackupSection serverId="s" />));
+    expect(container.textContent).toContain("Failing");
+    expect(container.textContent).toContain("http 502");
+    configState.config = {
+      backupStatus: { ...base, lastSuccessAt: "2026-11-08T10:00:00.000Z", rowsPushed: 7 },
+    };
+    act(() => root?.render(<BackupSection serverId="s" />));
+    expect(container.textContent).toContain("OK");
+    expect(container.textContent).not.toContain("http 502");
+  });
 });
 
 describe("parseBackupStatus", () => {

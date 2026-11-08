@@ -300,13 +300,18 @@ mod tests {
         roots.add(cert.cert.der().clone()).unwrap();
         let client_config = std::sync::Arc::new(rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth());
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        // A tiny receive buffer and a late reader keep the client's socket full during its final write.
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.set_recv_buffer_size(4096).unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let listener = socket.listen(1).unwrap();
         let port = listener.local_addr().unwrap().port();
         let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(server_config));
         // Replies only after the whole Content-Length body arrived, so a missing flush stalls the client.
-        let server = tokio::spawn(async move {
+        let server = tokio::spawn(tokio::time::timeout(Duration::from_secs(30), async move {
             let (tcp, _) = listener.accept().await.unwrap();
             let mut tls = acceptor.accept(tcp).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(300)).await;
             let mut raw = Vec::new();
             let mut chunk = [0u8; 64 * 1024];
             let (head_len, body_len) = loop {
@@ -327,11 +332,11 @@ mod tests {
             tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").await.unwrap();
             tls.shutdown().await.unwrap();
             raw.len() - head_len
-        });
+        }));
 
-        let body = "x".repeat(4 * 1024 * 1024);
+        let body = "x".repeat(16 * 1024 * 1024);
         let reply = request_via(port, client_config, "POST", "localhost", "/", Some(&body), "", 1024, Duration::from_secs(20)).await;
         assert_eq!(reply, Ok((200, "ok".to_string())));
-        assert_eq!(server.await.unwrap(), body.len());
+        assert_eq!(server.await.unwrap().expect("server timed out"), body.len());
     }
 }

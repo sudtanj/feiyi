@@ -147,6 +147,7 @@ impl DaemonConfig {
         out.insert("app".into(), json!({ "baseUrl": cfg.app_base_url }));
         out.insert("relay".into(), json!({ "enabled": cfg.relay_enabled }));
         out.remove("backup");
+        out.insert("backupStatus".into(), crate::backup::app_status(&cfg.backup));
         out.entry("providers").or_insert_with(|| json!({}));
         out.entry("appendSystemPrompt").or_insert_with(|| json!(""));
         Value::Object(out)
@@ -186,8 +187,8 @@ impl DaemonConfig {
                         }
                     }
                 }
-                // Environment-controlled in feiyi (backup: edited by hand, it holds secrets); not stored.
-                "mcp" | "hostnames" | "app" | "relay" | "backup" => {}
+                // Environment-controlled in feiyi (backup: edited by hand, it holds secrets; backupStatus: read-only); not stored.
+                "mcp" | "hostnames" | "app" | "relay" | "backup" | "backupStatus" => {}
                 _ => {
                     self.stored.insert(key.clone(), value.clone());
                 }

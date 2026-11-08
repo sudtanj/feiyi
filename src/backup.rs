@@ -178,12 +178,13 @@ fn host_of(url: &str) -> Result<String, String> {
 
 struct Status {
     enabled: bool,
+    last_attempt: Option<String>,
     last_success: Option<String>,
     last_error: Option<String>,
     rows_pushed: u64,
 }
 
-static STATUS: Mutex<Status> = Mutex::new(Status { enabled: false, last_success: None, last_error: None, rows_pushed: 0 });
+static STATUS: Mutex<Status> = Mutex::new(Status { enabled: false, last_attempt: None, last_success: None, last_error: None, rows_pushed: 0 });
 
 fn update_status(f: impl FnOnce(&mut Status)) {
     if let Ok(mut s) = STATUS.lock() {
@@ -193,7 +194,14 @@ fn update_status(f: impl FnOnce(&mut Status)) {
 
 pub fn status() -> Value {
     let Ok(s) = STATUS.lock() else { return Value::Null };
-    json!({ "enabled": s.enabled, "lastSuccessAt": s.last_success, "lastError": s.last_error, "rowsPushed": s.rows_pushed })
+    json!({ "enabled": s.enabled, "lastAttemptAt": s.last_attempt, "lastSuccessAt": s.last_success, "lastError": s.last_error, "rowsPushed": s.rows_pushed })
+}
+
+/// Read-only status for the app: `status()` plus the interval, no secrets.
+pub fn app_status(cfg: &BackupConfig) -> Value {
+    let mut out = status();
+    out["intervalSecs"] = json!(cfg.interval.as_secs());
+    out
 }
 
 // --- encryption -------------------------------------------------------------
@@ -799,7 +807,8 @@ async fn run(mut backup: Backup, interval: Duration) {
             Ok(rows) => {
                 failures = 0;
                 update_status(|s| {
-                    s.last_success = Some(crate::util::now_iso());
+                    s.last_attempt = Some(crate::util::now_iso());
+                    s.last_success =Some(crate::util::now_iso());
                     s.last_error = None;
                     s.rows_pushed += rows as u64;
                 });
@@ -812,7 +821,10 @@ async fn run(mut backup: Backup, interval: Duration) {
                 failures += 1;
                 backup.key = None;
                 crate::warn!("backup failed: {e}");
-                update_status(|s| s.last_error = Some(e));
+                update_status(|s| {
+                    s.last_attempt = Some(crate::util::now_iso());
+                    s.last_error = Some(e);
+                });
                 interval.saturating_mul(1 << failures.min(4)).min(MAX_BACKOFF.max(interval))
             }
         };
@@ -1372,6 +1384,19 @@ mod tests {
         let bad_url = BackupConfig::from_value(Some(&json!({ "tursoUrl": "http://x", "tursoToken": "t", "passphrase": "p" })), None);
         assert_eq!(bad_url.redacted()["enabled"], false);
         assert!(bad_url.ready().is_err());
+    }
+
+    #[test]
+    fn app_status_holds_no_url_token_or_passphrase() {
+        let section = json!({ "tursoUrl": "libsql://db-org.turso.io", "tursoToken": "TOKEN-9f3a", "passphrase": "PASS-7c1d", "intervalSecs": 120 });
+        let shown = app_status(&BackupConfig::from_value(Some(&section), None));
+        for secret in ["TOKEN-9f3a", "PASS-7c1d", "libsql", "db-org"] {
+            assert!(!shown.to_string().contains(secret), "{secret} in {shown}");
+        }
+        assert_eq!(shown["intervalSecs"], 120);
+        for key in ["enabled", "lastAttemptAt", "lastSuccessAt", "lastError", "rowsPushed"] {
+            assert!(shown.get(key).is_some(), "{key} missing");
+        }
     }
 
     #[test]

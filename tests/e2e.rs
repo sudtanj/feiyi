@@ -2242,3 +2242,22 @@ async fn daemon_config_reports_backup_on_with_the_interval_and_no_secrets() {
         assert!(!text.contains(secret), "{secret} in the config");
     }
 }
+
+#[tokio::test]
+async fn repeated_directory_workspace_create_returns_the_same_workspace() {
+    let d = start("wsdup", None);
+    let dir = d.dir.join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let cwd = dir.to_string_lossy().into_owned();
+    let mut ws = connect(d.port).await;
+    hello(&mut ws, None).await;
+
+    let first = rpc(&mut ws, json!({ "type": "workspace.create.request", "requestId": "d1", "source": { "kind": "directory", "path": cwd } }), "workspace.create.response").await;
+    assert!(first["error"].is_null(), "{first}");
+    let second = rpc(&mut ws, json!({ "type": "workspace.create.request", "requestId": "d2", "source": { "kind": "directory", "path": cwd } }), "workspace.create.response").await;
+    assert_eq!(second["workspace"]["id"], first["workspace"]["id"], "{second}");
+
+    let list = rpc(&mut ws, json!({ "type": "fetch_workspaces_request", "requestId": "l1" }), "fetch_workspaces_response").await;
+    let n = list["entries"].as_array().map(|e| e.len()).unwrap_or(0);
+    assert_eq!(n, 1, "{list}");
+}

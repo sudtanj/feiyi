@@ -296,9 +296,16 @@ impl Manager {
                 if !self.projects.iter().any(|r| r.root_path == root) {
                     self.register_project(&root, false);
                 }
-                let id = self.create_workspace(&root, &dir);
-                self.publish_workspace(&id);
-                crate::log!("workspace {id} created in {dir}");
+                // A retried request (flaky reconnect, double tap) must not add a second workspace for the directory.
+                let id = match self.workspaces.iter().find(|w| w.archived_at.is_none() && w.directory == dir) {
+                    Some(existing) => existing.id.clone(),
+                    None => {
+                        let id = self.create_workspace(&root, &dir);
+                        self.publish_workspace(&id);
+                        crate::log!("workspace {id} created in {dir}");
+                        id
+                    }
+                };
                 reply(out, json!({ "type": "workspace.create.response", "payload": { "requestId": rid, "workspace": self.workspace_json(&id), "setupTerminalId": null, "error": null } }));
             }
             "archive_workspace_request" => self.archive_workspace_request(&msg, &rid, out),

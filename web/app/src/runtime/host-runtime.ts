@@ -237,6 +237,8 @@ const CONFIGURED_OVERRIDE_BOOTSTRAP_RETRY_MS = 1_000;
 // On resume the first attempt often fails at once (the phone's network is still waking), and
 // the client's next retry then waits out the backoff built up in the background. Retry sooner.
 const FOREGROUND_RETRY_MS = 2_000;
+// The first retry comes sooner: a fast failure usually means the network is a moment from ready.
+const FOREGROUND_FIRST_RETRY_MS = 500;
 // After the client's own 15 s connect timeout, so a slow but live reconnect is never cut short.
 const FOREGROUND_NEW_CLIENT_AFTER_MS = 20_000;
 const FOREGROUND_RELOAD_AFTER_MS = 20_000;
@@ -2630,7 +2632,7 @@ export class HostRuntimeStore {
         }
       }
     }
-    this.watchForegroundReconnect(0);
+    this.watchForegroundReconnect(0, FOREGROUND_FIRST_RETRY_MS);
   }
 
   // An Android PWA can resume with a client that never reconnects; only killing the
@@ -2639,7 +2641,7 @@ export class HostRuntimeStore {
     return [...this.controllers.values()].map((controller) => controller.getSnapshot().connectionStatus);
   }
 
-  private watchForegroundReconnect(elapsedMs: number): void {
+  private watchForegroundReconnect(elapsedMs: number, delayMs: number): void {
     this.foregroundWatchdog = setTimeout(() => {
       this.foregroundWatchdog = null;
       const stuck = [...this.controllers.values()].filter((controller) => {
@@ -2651,7 +2653,7 @@ export class HostRuntimeStore {
         );
       });
       if (stuck.length === 0) return;
-      const elapsed = elapsedMs + FOREGROUND_RETRY_MS;
+      const elapsed = elapsedMs + delayMs;
       if (elapsed >= FOREGROUND_NEW_CLIENT_AFTER_MS + FOREGROUND_RELOAD_AFTER_MS) {
         logConnection("watchdog reload", { statuses: this.connectionStatuses() });
         reloadStuckPage();
@@ -2664,8 +2666,8 @@ export class HostRuntimeStore {
         // A no-op while an attempt is in flight; otherwise connects now instead of after backoff.
         for (const controller of stuck) controller.ensureConnected();
       }
-      this.watchForegroundReconnect(elapsed);
-    }, FOREGROUND_RETRY_MS);
+      this.watchForegroundReconnect(elapsed, FOREGROUND_RETRY_MS - (elapsed % FOREGROUND_RETRY_MS));
+    }, delayMs);
   }
 
   runProbeCycleNow(serverId?: string): Promise<void> {

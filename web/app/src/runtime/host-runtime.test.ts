@@ -1801,9 +1801,9 @@ describe("HostRuntimeStore", () => {
     useHostRuntimeClock();
     store.setAppVisible(true);
     expect(connectRequests).toBe(1);
-    // Retries every 2 s rather than waiting out the client's backoff.
+    // Retries after 0.5 s, then every 2 s, rather than waiting out the client's backoff.
     await vi.advanceTimersByTimeAsync(2_000);
-    expect(connectRequests).toBe(2);
+    expect(connectRequests).toBe(3);
     await vi.advanceTimersByTimeAsync(17_000);
     expect(freshClient.connectCalls).toBe(0);
     await vi.advanceTimersByTimeAsync(1_000);
@@ -1928,6 +1928,21 @@ describe("HostRuntimeStore", () => {
       store.syncHosts([]);
     });
 
+    it("retries 500 ms after a foreground attempt fails, not after the 2 s tick", async () => {
+      const { store, stuckClient, requests } = await createStuckHost();
+      stuckClient.setConnectionState({ status: "disconnected", reason: "backgrounded" });
+
+      useHostRuntimeClock();
+      store.setAppVisible(true);
+      expect(requests.count).toBe(1);
+      await vi.advanceTimersByTimeAsync(499);
+      expect(requests.count).toBe(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(requests.count).toBe(2);
+
+      store.syncHosts([]);
+    });
+
     it("stops retrying once the host is online again", async () => {
       const { store, stuckClient, freshClient, requests } = await createStuckHost();
       stuckClient.setConnectionState({ status: "disconnected", reason: "backgrounded" });
@@ -1935,11 +1950,11 @@ describe("HostRuntimeStore", () => {
       useHostRuntimeClock();
       store.setAppVisible(true);
       await vi.advanceTimersByTimeAsync(2_000);
-      expect(requests.count).toBe(2);
+      expect(requests.count).toBe(3);
 
       stuckClient.setConnectionState({ status: "connected" });
       await vi.advanceTimersByTimeAsync(60_000);
-      expect(requests.count).toBe(2);
+      expect(requests.count).toBe(3);
       expect(freshClient.connectCalls).toBe(0);
       expect(stuckClient.isDisposed()).toBe(false);
 
@@ -1953,11 +1968,11 @@ describe("HostRuntimeStore", () => {
       useHostRuntimeClock();
       store.setAppVisible(true);
       await vi.advanceTimersByTimeAsync(2_000);
-      expect(requests.count).toBe(2);
+      expect(requests.count).toBe(3);
 
       store.setAppVisible(false);
       await vi.advanceTimersByTimeAsync(60_000);
-      expect(requests.count).toBe(2);
+      expect(requests.count).toBe(3);
       expect(freshClient.connectCalls).toBe(0);
       expect(stuckClient.isDisposed()).toBe(false);
 

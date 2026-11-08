@@ -10,6 +10,7 @@ import { settingsStyles } from "@/styles/settings";
 export interface BackupStatus {
   enabled: boolean;
   intervalSecs: number;
+  lastAttemptAt: string | null;
   lastSuccessAt: string | null;
   lastError: string | null;
   rowsPushed: number;
@@ -22,6 +23,7 @@ export function parseBackupStatus(config: unknown): BackupStatus | null {
   return {
     enabled: raw.enabled,
     intervalSecs: typeof raw.intervalSecs === "number" ? raw.intervalSecs : 0,
+    lastAttemptAt: typeof raw.lastAttemptAt === "string" ? raw.lastAttemptAt : null,
     lastSuccessAt: typeof raw.lastSuccessAt === "string" ? raw.lastSuccessAt : null,
     lastError: typeof raw.lastError === "string" ? raw.lastError : null,
     rowsPushed: typeof raw.rowsPushed === "number" ? raw.rowsPushed : 0,
@@ -63,6 +65,11 @@ function BackupBody({ status }: { status: BackupStatus }) {
             {failing ? "Failing" : status.lastSuccessAt ? "OK" : "Waiting for the first backup"}
           </Text>
           {failing ? <Text style={settingsStyles.rowError}>{status.lastError}</Text> : null}
+          {failing && status.lastAttemptAt ? (
+            <Text style={settingsStyles.rowHint}>
+              Last attempt <SinceSuccess iso={status.lastAttemptAt} />
+            </Text>
+          ) : null}
           {status.lastSuccessAt ? (
             <Text style={settingsStyles.rowHint}>
               Last success <SinceSuccess iso={status.lastSuccessAt} />

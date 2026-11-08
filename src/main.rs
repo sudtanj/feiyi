@@ -142,7 +142,7 @@ async fn run(cfg: Config, identity: Arc<e2ee::DaemonIdentity>) {
     crate::log!("feiyi {} serverId={} home={}", env!("CARGO_PKG_VERSION"), identity.server_id, cfg.home.display());
     mcp::write_claude_config(&cfg);
     token_saver::write_claude_settings(&cfg);
-    backup::spawn(&cfg);
+    backup::spawn(&cfg, ctx.cmds.clone());
     uploads::prune(&cfg.home);
     usage::load_prices(&cfg.home);
     tokio::spawn(usage::refresh_prices(cfg.home.clone()));

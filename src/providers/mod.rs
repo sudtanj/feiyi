@@ -123,6 +123,7 @@ pub fn claude_models() -> Value {
                 // Haiku models are offered without effort levels.
                 if !id.contains("haiku") {
                     m["thinkingOptions"] = thinking.clone();
+                    m["defaultThinkingOptionId"] = serde_json::json!("medium");
                 }
                 m
             })

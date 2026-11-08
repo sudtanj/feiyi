@@ -214,7 +214,7 @@ fn category(error: &str) -> String {
         ("wrong backup passphrase", "wrong passphrase"),
         ("unsupported backup format", "bad backup meta"),
         ("backup meta row", "bad backup meta"),
-        ("local I/O: ", "local I/O"),
+        ("local I/O: ", X
         ("a restore failed earlier", "paused (restore failed earlier)"),
         ("this machine has no agents", "paused (remote has data, local empty)"),
     ];
@@ -1446,7 +1446,7 @@ mod tests {
         }
         assert_eq!(category("turso returned HTTP 502: x"), "http 502");
         assert_eq!(category("network: x"), "network or TLS");
-        assert_eq!(category("local I/O: /a: b"), "local I/O");
+        assert_eq!(category("local I/O: /a: b"), "local file error");
         assert_eq!(category("this machine has no agents or projects but x"), "paused (remote has data, local empty)");
         assert_eq!(category("something new"), "backup failed");
     }

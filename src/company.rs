@@ -317,6 +317,25 @@ mod tests {
     }
 
     #[test]
+    fn user_model_choice_is_not_forced() {
+        let h = home();
+        let stored = json!({ "roles": {
+            "engineer": { "description": "E", "prompt": "p", "model": "opus" },
+            "designer": { "description": "D", "prompt": "p" }
+        } });
+        let r = roles(stored.as_object().unwrap(), &h).unwrap();
+        assert_eq!(r["engineer"]["model"], "opus");
+        assert!(r["designer"].get("model").is_none());
+        let cheap = ["writer", "marketer", "sales", "support"];
+        for name in cheap {
+            assert_eq!(r[name]["model"], "haiku", "{name}");
+        }
+        for name in builtin().keys().filter(|n| !cheap.contains(&n.as_str()) && *n != "engineer") {
+            assert_eq!(r[name]["model"], "sonnet", "{name}");
+        }
+    }
+
+    #[test]
     fn memory_is_saved_capped_and_injected() {
         let h = home();
         assert!(remember(&h, "../etc", "x").is_err());

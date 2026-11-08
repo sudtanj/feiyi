@@ -280,6 +280,24 @@ mod tests {
     }
 
     #[test]
+    fn non_haiku_models_default_to_medium_effort() {
+        let models = claude_models();
+        let models = models.as_array().unwrap();
+        for m in models {
+            let id = m["id"].as_str().unwrap();
+            if id.contains("haiku") {
+                assert!(m.get("defaultThinkingOptionId").is_none(), "{id}");
+            } else {
+                assert_eq!(m["defaultThinkingOptionId"], "medium", "{id}");
+                assert!(m["thinkingOptions"].as_array().unwrap().iter().any(|o| o["id"] == "medium"), "{id}: default must be a listed option");
+            }
+        }
+        for family in ["opus", "sonnet", "haiku"] {
+            assert!(models.iter().any(|m| m["id"].as_str().unwrap().contains(family)), "{family} present");
+        }
+    }
+
+    #[test]
     fn missing_binary_is_unavailable() {
         assert!(!binary_available("definitely-not-a-real-binary-xyz"));
         assert!(binary_available("/bin/sh") || cfg!(windows));

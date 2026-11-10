@@ -401,7 +401,7 @@ mod tests {
     fn script_imports_classes_and_new() {
         let src = "import { a } from './lib/a.js';\nimport React from 'react';\nconst b = require('../b');\n\nexport class Store {\n  load(id) {\n    return new Item(id).save();\n  }\n}\n\nexport function boot() {\n  Store.open();\n}\n";
         let p = run("s.ts", src);
-        assert_eq!(names(&p), ["class Store", "method Store.load", "fn boot"]);
+        assert_eq!(names(&p), ["const b", "class Store", "method Store.load", "fn boot"]);
         assert_eq!(p.imports, vec![vec!["lib/a".to_string()], vec!["b".to_string()]]);
         assert!(called(&p, "load").contains(&"Item".to_string()));
         assert!(called(&p, "boot").contains(&"Store".to_string()));

@@ -14,6 +14,7 @@
 mod parse;
 
 use crate::backup::{fingerprint, int, text, Stmt, Turso};
+use crate::manager::{Cmd, Manager};
 use parse::Parsed;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -28,6 +29,13 @@ const IMPACT_DEPTH: usize = 8;
 const PATH_DEPTH: usize = 6;
 const MAX_FILES: usize = 4000;
 const MAX_FILE_BYTES: u64 = 200 * 1024;
+// The Turso free tier is the budget: a few projects, rows capped per project and in total, and nothing written on a scan that finds no change.
+const MAX_PROJECTS: usize = 12;
+const MAX_ROWS_PROJECT: usize = 80_000;
+const MAX_ROWS_TOTAL: usize = 400_000;
+const SWEEP_EVERY: Duration = Duration::from_secs(24 * 3600);
+const SWEEP_DELAY: Duration = Duration::from_secs(600);
+const IDLE_SECS: i64 = 14 * 24 * 3600;
 const CHUNK_FILES: usize = 50;
 const BATCH: usize = 200;
 const FRESH: Duration = Duration::from_secs(30);
@@ -35,7 +43,8 @@ const GIT_TIMEOUT: Duration = Duration::from_secs(30);
 const SKIP_DIRS: [&str; 5] = ["node_modules", "target", "dist", "build", "vendor"];
 const NO_DB: &str = "code graph needs backup.tursoUrl and backup.tursoToken";
 
-const CREATE: [&str; 6] = [
+const CREATE: [&str; 7] = [
+    "CREATE TABLE IF NOT EXISTS feiyi_graph_projects(project TEXT PRIMARY KEY, root TEXT NOT NULL, updated_at INTEGER NOT NULL, used_at INTEGER NOT NULL)",
     "CREATE TABLE IF NOT EXISTS feiyi_graph_files(project TEXT NOT NULL, path TEXT NOT NULL, hash TEXT NOT NULL, PRIMARY KEY(project, path))",
     "CREATE TABLE IF NOT EXISTS feiyi_graph_nodes(project TEXT NOT NULL, id TEXT NOT NULL, kind TEXT NOT NULL, name TEXT NOT NULL, path TEXT NOT NULL, start INTEGER NOT NULL, \"end\" INTEGER NOT NULL, PRIMARY KEY(project, id))",
     "CREATE TABLE IF NOT EXISTS feiyi_graph_edges(project TEXT NOT NULL, src TEXT NOT NULL, dst TEXT NOT NULL, kind TEXT NOT NULL, PRIMARY KEY(project, src, dst, kind))",
@@ -51,6 +60,17 @@ const DELETE_FILE: &str = "DELETE FROM feiyi_graph_files WHERE project = ? AND p
 const INSERT_NODE: &str = "INSERT OR REPLACE INTO feiyi_graph_nodes(project, id, kind, name, path, start, \"end\") VALUES(?, ?, ?, ?, ?, ?, ?)";
 const INSERT_EDGE: &str = "INSERT OR IGNORE INTO feiyi_graph_edges(project, src, dst, kind) VALUES(?, ?, ?, ?)";
 const INSERT_FILE: &str = "INSERT OR REPLACE INTO feiyi_graph_files(project, path, hash) VALUES(?, ?, ?)";
+const SELECT_PROJECTS: &str = "SELECT project, root, used_at FROM feiyi_graph_projects";
+const UPSERT_PROJECT: &str = "INSERT INTO feiyi_graph_projects(project, root, updated_at, used_at) VALUES(?, ?, ?, ?) ON CONFLICT(project) DO UPDATE SET updated_at = excluded.updated_at";
+const TOUCH_PROJECT: &str = "UPDATE feiyi_graph_projects SET used_at = ? WHERE project = ?";
+const FORGET: [&str; 4] = [
+    "DELETE FROM feiyi_graph_edges WHERE project = ?",
+    "DELETE FROM feiyi_graph_nodes WHERE project = ?",
+    "DELETE FROM feiyi_graph_files WHERE project = ?",
+    "DELETE FROM feiyi_graph_projects WHERE project = ?",
+];
+const ROWS_PER_PROJECT: [&str; 2] = ["SELECT project, COUNT(*) FROM feiyi_graph_nodes GROUP BY project", "SELECT project, COUNT(*) FROM feiyi_graph_edges GROUP BY project"];
+const COUNT_ALL: [&str; 3] = ["SELECT COUNT(*) FROM feiyi_graph_projects", "SELECT COUNT(*) FROM feiyi_graph_nodes", "SELECT COUNT(*) FROM feiyi_graph_edges"];
 
 /// Every node within `depth` edges (either direction) of the nodes whose name or path matches.
 macro_rules! reach {
@@ -84,6 +104,8 @@ static DB: OnceLock<Turso> = OnceLock::new();
 static PROJECTS: Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<Project>>>> = Mutex::new(BTreeMap::new());
 static INFOS: Mutex<BTreeMap<String, Info>> = Mutex::new(BTreeMap::new());
 
+static TOTALS: Mutex<Option<(usize, usize)>> = Mutex::new(None);
+
 /// What the last stored row of a file says: the stat it was hashed at and
 /// `hash` = 16 hex of the content, 16 hex of the resolved edges.
 #[derive(Clone)]
@@ -95,6 +117,8 @@ struct Known {
 #[derive(Default)]
 struct Project {
     loaded: bool,
+    /// Listed in `feiyi_graph_projects` (so counted against `MAX_PROJECTS`) by this process.
+    registered: bool,
     files: BTreeMap<String, Known>,
     scanned: Option<Instant>,
 }
@@ -109,26 +133,29 @@ struct Info {
     truncated: bool,
 }
 
-/// Use the backup's Turso database for the graph, when it is configured.
-pub fn configure(cfg: &crate::config::Config) {
+/// Use the backup's Turso database for the graph, when it is configured, and sweep it daily.
+pub fn configure(cfg: &crate::config::Config, cmds: tokio::sync::mpsc::UnboundedSender<crate::manager::Cmd>) {
     match cfg.backup.turso() {
         Ok(Some(turso)) => {
             let _ = DB.set(turso);
             crate::log!("code graph on: graph rows go to the backup Turso database");
+            tokio::spawn(sweep_loop(cmds));
         }
         Ok(None) => crate::log!("code graph is off (it needs backup.tursoUrl and backup.tursoToken)"),
         Err(e) => crate::warn!("code graph is off: {e}"),
     }
 }
 
-/// For `daemon_status`: per project the last scan, no secrets.
+/// For `daemon_status`: per project the last scan, and how full the database is
+/// (`rows` as last counted by a sweep or a report, else what this process wrote), no secrets.
 pub fn status() -> Value {
     let infos = INFOS.lock().map(|i| i.clone()).unwrap_or_default();
     let projects: Vec<Value> = infos
         .iter()
         .map(|(dir, i)| json!({ "dir": dir, "files": i.files, "symbols": i.symbols, "edges": i.edges, "builtAt": humantime::format_rfc3339_seconds(i.at).to_string(), "buildMs": i.millis, "truncated": i.truncated }))
         .collect();
-    json!({ "enabled": DB.get().is_some(), "projects": projects })
+    let rows = TOTALS.lock().ok().and_then(|t| *t).map(|(_, rows)| rows).unwrap_or_else(|| infos.values().map(|i| i.files + i.symbols.unwrap_or(0) + i.edges.unwrap_or(0)).sum());
+    json!({ "enabled": DB.get().is_some(), "projects": projects, "rows": rows, "cap": MAX_ROWS_TOTAL, "maxProjects": MAX_PROJECTS })
 }
 
 // --- parsing and resolving -----------------------------------------------------------
@@ -265,6 +292,20 @@ fn resolve(files: &[(String, Parsed)]) -> Vec<FileGraph> {
             FileGraph { path: path.clone(), nodes, edges, edge_hash: fingerprint(joined.as_bytes()) }
         })
         .collect()
+}
+
+/// `resolve`, then drop the files past `cap` rows (and the edges into them); true when it cut.
+fn resolve_capped(mut files: Vec<(String, Parsed)>, cap: usize) -> (Vec<FileGraph>, bool) {
+    let graphs = resolve(&files);
+    let mut total = 0;
+    let Some(cut) = graphs.iter().position(|g| {
+        total += g.nodes.len() + g.edges.len();
+        total > cap
+    }) else {
+        return (graphs, false);
+    };
+    files.truncate(cut);
+    (resolve(&files), true)
 }
 
 // --- the files ---------------------------------------------------------------------------
@@ -467,7 +508,11 @@ async fn build(turso: &Turso, key: &str, st: &mut Project, force: bool) -> Resul
             files.push((s.path, parsed));
         }
     }
-    let graphs = tokio::task::spawn_blocking(move || resolve(&files)).await.map_err(|e| format!("resolve failed: {e}"))?;
+    let (graphs, capped) = tokio::task::spawn_blocking(move || resolve_capped(files, MAX_ROWS_PROJECT)).await.map_err(|e| format!("resolve failed: {e}"))?;
+    let truncated = truncated || capped;
+    if !st.registered {
+        register(turso, key, st).await?;
+    }
 
     let mut next: BTreeMap<String, Known> = BTreeMap::new();
     let mut batcher = Batcher::default();
@@ -485,6 +530,11 @@ async fn build(turso: &Turso, key: &str, st: &mut Project, force: bool) -> Resul
     }
     for path in st.files.keys().filter(|p| !next.contains_key(*p)) {
         for batch in batcher.add(gone_statements(key, path)) {
+            turso.run(batch).await?;
+        }
+    }
+    if rewritten > 0 {
+        for batch in batcher.add(vec![upsert_project(key)]) {
             turso.run(batch).await?;
         }
     }
@@ -520,6 +570,183 @@ async fn ensure(dir: &str, force: bool) -> Result<(Turso, String), String> {
         build(&turso, &key, &mut st, force).await?;
     }
     Ok((turso, key))
+}
+
+// --- capacity and cleanup ---------------------------------------------------------------------
+
+fn now_secs() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
+}
+
+fn touch(key: &str) -> Stmt {
+    Stmt { sql: TOUCH_PROJECT, args: vec![int(now_secs()), text(key)] }
+}
+
+fn upsert_project(key: &str) -> Stmt {
+    let now = now_secs();
+    Stmt { sql: UPSERT_PROJECT, args: vec![text(key), text(key), int(now), int(now)] }
+}
+
+/// The project key of a directory: its canonical path, or as given when it is gone.
+fn key_of(dir: &str) -> String {
+    std::fs::canonicalize(dir).map_or_else(|_| dir.to_string(), |p| p.to_string_lossy().into_owned())
+}
+
+/// Every row of one project, the `feiyi_graph_projects` row last so an interrupted forget is retried by the sweep.
+fn forget_statements(key: &str) -> Vec<Stmt> {
+    FORGET.iter().map(|sql| Stmt { sql, args: vec![text(key)] }).collect()
+}
+
+async fn run_all(turso: &Turso, mut stmts: Vec<Stmt>) -> Result<(), String> {
+    while !stmts.is_empty() {
+        let rest = if stmts.len() > BATCH { stmts.split_off(BATCH) } else { Vec::new() };
+        turso.run(std::mem::replace(&mut stmts, rest)).await?;
+    }
+    Ok(())
+}
+
+/// Drop what this process knows of a project; the returned lock is held by a running build.
+fn forget_memory(key: &str) -> Option<Arc<tokio::sync::Mutex<Project>>> {
+    if let Ok(mut infos) = INFOS.lock() {
+        infos.remove(key);
+    }
+    PROJECTS.lock().ok().and_then(|mut p| p.remove(key))
+}
+
+/// The projects to drop, least recently used first, so `project` fits under `max` projects.
+fn evict_for(listed: &[(String, i64)], project: &str, max: usize) -> Vec<String> {
+    if listed.iter().any(|(p, _)| p == project) {
+        return Vec::new();
+    }
+    let mut by_use: Vec<&(String, i64)> = listed.iter().collect();
+    by_use.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    let excess = (listed.len() + 1).saturating_sub(max);
+    by_use.into_iter().take(excess).map(|(p, _)| p.clone()).collect()
+}
+
+/// Add the project to `feiyi_graph_projects`, first evicting the least recently used ones when it would be one too many.
+async fn register(turso: &Turso, key: &str, st: &mut Project) -> Result<(), String> {
+    let rows = turso.run(vec![Stmt { sql: SELECT_PROJECTS, args: vec![] }]).await?.pop().unwrap_or_default();
+    let listed: Vec<(String, i64)> = rows.iter().filter_map(|r| Some((r.first()?.clone(), r.get(2)?.parse().ok()?))).collect();
+    let mut stmts = Vec::new();
+    for victim in evict_for(&listed, key, MAX_PROJECTS) {
+        crate::log!("code graph: evicting {victim}, the least recently used of {MAX_PROJECTS} projects");
+        forget_memory(&victim);
+        stmts.extend(forget_statements(&victim));
+    }
+    stmts.push(upsert_project(key));
+    run_all(turso, stmts).await?;
+    st.registered = true;
+    Ok(())
+}
+
+/// Whether archiving a workspace on `dir` leaves nobody else on the same directory.
+pub fn should_forget(dir: &str, active_dirs: &[String]) -> bool {
+    let key = key_of(dir);
+    !active_dirs.iter().any(|a| key_of(a) == key)
+}
+
+/// Delete a project's rows in the background; never blocks or fails the caller. Does nothing without a database.
+pub fn forget(dir: &str) {
+    let Some(turso) = DB.get().cloned() else { return };
+    let key = key_of(dir);
+    let running = forget_memory(&key);
+    tokio::spawn(async move {
+        if let Some(project) = running {
+            drop(project.lock().await);
+        }
+        match run_all(&turso, forget_statements(&key)).await {
+            Ok(()) => crate::log!("code graph: forgot {key}"),
+            Err(e) if e.contains("no such table") => {}
+            Err(e) => crate::warn!("code graph: cannot forget {key}: {e}"),
+        }
+    });
+}
+
+struct Stored {
+    project: String,
+    root: String,
+    used_at: i64,
+    rows: usize,
+}
+
+/// Projects the daily sweep deletes: root gone from disk, or idle for `IDLE_SECS` with no active
+/// workspace; then the least recently used until the total fits `MAX_ROWS_TOTAL` and `MAX_PROJECTS`.
+fn sweep_victims(stored: &[Stored], now: i64, active: &HashSet<String>, exists: impl Fn(&str) -> bool) -> Vec<String> {
+    let mut gone = Vec::new();
+    let mut kept: Vec<&Stored> = Vec::new();
+    for s in stored {
+        if !exists(&s.root) || (now - s.used_at > IDLE_SECS && !active.contains(&s.project)) {
+            gone.push(s.project.clone());
+        } else {
+            kept.push(s);
+        }
+    }
+    kept.sort_by(|a, b| a.used_at.cmp(&b.used_at).then_with(|| a.project.cmp(&b.project)));
+    let mut rows: usize = kept.iter().map(|s| s.rows).sum();
+    let mut count = kept.len();
+    for s in kept {
+        if rows <= MAX_ROWS_TOTAL && count <= MAX_PROJECTS {
+            break;
+        }
+        rows -= s.rows;
+        count -= 1;
+        gone.push(s.project.clone());
+    }
+    gone
+}
+
+async fn sweep(cmds: &tokio::sync::mpsc::UnboundedSender<Cmd>) -> Result<String, String> {
+    let turso = DB.get().ok_or(NO_DB)?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    cmds.send(Cmd::Run(Box::new(move |m: &mut Manager| {
+        let _ = tx.send(m.active_directories());
+    })))
+    .map_err(|_| "the daemon is shutting down")?;
+    let dirs = tokio::time::timeout(Duration::from_secs(30), rx).await.map_err(|_| "the manager did not answer")?.map_err(|_| "the manager dropped the request")?;
+    let active: HashSet<String> = dirs.iter().map(|d| key_of(d)).collect();
+
+    let mut stmts: Vec<Stmt> = CREATE.iter().map(|sql| Stmt { sql, args: vec![] }).collect();
+    stmts.extend([SELECT_PROJECTS, ROWS_PER_PROJECT[0], ROWS_PER_PROJECT[1]].map(|sql| Stmt { sql, args: vec![] }));
+    let mut rows = turso.run(stmts).await?;
+    let (edge_rows, node_rows, listed) = (rows.pop().unwrap_or_default(), rows.pop().unwrap_or_default(), rows.pop().unwrap_or_default());
+    let mut stored: BTreeMap<String, Stored> = BTreeMap::new();
+    for r in &listed {
+        if let [project, root, used_at] = r.as_slice() {
+            stored.insert(project.clone(), Stored { project: project.clone(), root: root.clone(), used_at: used_at.parse().unwrap_or(0), rows: 0 });
+        }
+    }
+    for r in node_rows.iter().chain(&edge_rows) {
+        if let [project, count] = r.as_slice() {
+            // Rows of a project nobody registered are orphans: no root, so they go.
+            stored.entry(project.clone()).or_insert_with(|| Stored { project: project.clone(), root: String::new(), used_at: 0, rows: 0 }).rows += count.parse().unwrap_or(0);
+        }
+    }
+    let stored: Vec<Stored> = stored.into_values().collect();
+    let victims = sweep_victims(&stored, now_secs(), &active, |root| Path::new(root).exists());
+    let mut delete = Vec::new();
+    for v in &victims {
+        forget_memory(v);
+        delete.extend(forget_statements(v));
+    }
+    run_all(turso, delete).await?;
+    let kept: Vec<&Stored> = stored.iter().filter(|s| !victims.contains(&s.project)).collect();
+    let total: usize = kept.iter().map(|s| s.rows).sum();
+    if let Ok(mut totals) = TOTALS.lock() {
+        *totals = Some((kept.len(), total));
+    }
+    Ok(format!("{} projects, {total} rows, {} deleted", kept.len(), victims.len()))
+}
+
+async fn sweep_loop(cmds: tokio::sync::mpsc::UnboundedSender<Cmd>) {
+    tokio::time::sleep(SWEEP_DELAY).await;
+    loop {
+        match sweep(&cmds).await {
+            Ok(summary) => crate::log!("code graph sweep: {summary}"),
+            Err(e) => crate::warn!("code graph sweep failed: {e}"),
+        }
+        tokio::time::sleep(SWEEP_EVERY).await;
+    }
 }
 
 // --- queries -------------------------------------------------------------------------------
@@ -563,7 +790,7 @@ pub async fn query(dir: &str, q: &str, depth: usize, budget: usize) -> Result<St
     let (turso, key) = ensure(dir, false).await?;
     let (pattern, depth) = (format!("%{}%", like_escape(q)), depth.clamp(1, MAX_DEPTH) as i64);
     let reach = || vec![text(&key), text(&pattern), text(&pattern), text(&key), int(depth), text(&key), int(depth), text(&key)];
-    let mut rows = turso.run(vec![Stmt { sql: QUERY_NODES, args: reach() }, Stmt { sql: QUERY_EDGES, args: reach() }]).await?;
+    let mut rows = turso.run(vec![touch(&key), Stmt { sql: QUERY_NODES, args: reach() }, Stmt { sql: QUERY_EDGES, args: reach() }]).await?;
     let edges = rows.pop().unwrap_or_default();
     let nodes = rows.pop().unwrap_or_default();
     if nodes.is_empty() {
@@ -586,7 +813,7 @@ pub async fn impact(dir: &str, symbol: &str, budget: usize) -> Result<String, St
     }
     let (turso, key) = ensure(dir, false).await?;
     let args = vec![text(&key), text(symbol), text(symbol), text(&key), int(IMPACT_DEPTH as i64), text(&key)];
-    let rows = turso.run(vec![Stmt { sql: IMPACT, args }]).await?.pop().unwrap_or_default();
+    let rows = turso.run(vec![touch(&key), Stmt { sql: IMPACT, args }]).await?.pop().unwrap_or_default();
     let (targets, callers): (Vec<_>, Vec<_>) = rows.iter().partition(|r| r[5] == "0");
     if targets.is_empty() {
         return Ok(format!("no symbol named {symbol} in {key}\n"));
@@ -648,7 +875,7 @@ pub async fn path(dir: &str, from: &str, to: &str) -> Result<String, String> {
     }
     let (turso, key) = ensure(dir, false).await?;
     let find = |name: &str| Stmt { sql: FIND_NODE, args: vec![text(&key), text(name), text(name), text(name)] };
-    let mut found = turso.run(vec![find(from), find(to)]).await?;
+    let mut found = turso.run(vec![touch(&key), find(from), find(to)]).await?;
     let ends: HashSet<String> = found.pop().unwrap_or_default().into_iter().flatten().collect();
     let starts: Vec<String> = found.pop().unwrap_or_default().into_iter().flatten().collect();
     if starts.is_empty() || ends.is_empty() {
@@ -674,12 +901,17 @@ pub async fn path(dir: &str, from: &str, to: &str) -> Result<String, String> {
 pub async fn report(dir: &str) -> Result<String, String> {
     let (turso, key) = ensure(dir, false).await?;
     let one = |sql| Stmt { sql, args: vec![text(&key)] };
-    let mut rows = turso.run(vec![one(COUNT_FILES), one(COUNT_SYMBOLS), one(COUNT_EDGES), one("SELECT path FROM feiyi_graph_files WHERE project = ?"), Stmt { sql: GOD_NODES, args: vec![text(&key), text(&key)] }]).await?;
+    let mut rows = turso.run(vec![touch(&key), one(COUNT_ALL[0]), one(COUNT_ALL[1]), one(COUNT_ALL[2]), one(COUNT_FILES), one(COUNT_SYMBOLS), one(COUNT_EDGES), one("SELECT path FROM feiyi_graph_files WHERE project = ?"), Stmt { sql: GOD_NODES, args: vec![text(&key), text(&key)] }]).await?;
     let gods = rows.pop().unwrap_or_default();
     let paths = rows.pop().unwrap_or_default();
     let edge_kinds = rows.pop().unwrap_or_default();
     let symbols = rows.pop().unwrap_or_default();
     let files = rows.pop().and_then(|r| r.into_iter().next()).and_then(|c| c.into_iter().next()).unwrap_or_default();
+    let total = |i: usize| rows.get(i).and_then(|r| r.first()).and_then(|c| c.first()).and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+    let (projects, db_rows) = (total(1), total(2) + total(3));
+    if let Ok(mut totals) = TOTALS.lock() {
+        *totals = Some((projects, db_rows));
+    }
 
     let mut communities: BTreeMap<String, (usize, usize)> = BTreeMap::new();
     for p in &paths {
@@ -695,6 +927,7 @@ pub async fn report(dir: &str) -> Result<String, String> {
     let edge_total: usize = edge_kinds.iter().map(|e| e[1].parse::<usize>().unwrap_or(0)).sum();
     let kinds: Vec<String> = edge_kinds.iter().map(|e| format!("{} {}", e[1], e[0])).collect();
     let mut out = format!("{key}\n{files} files, {symbol_total} symbols, {edge_total} edges ({})\n", kinds.join(", "));
+    out.push_str(&format!("database: {projects} of {MAX_PROJECTS} projects, {db_rows} of {MAX_ROWS_TOTAL} rows\n"));
     match INFOS.lock().ok().and_then(|i| i.get(&key).cloned()) {
         Some(i) => out.push_str(&format!("last scan {} ({} ms){}\n", humantime::format_rfc3339_seconds(i.at), i.millis, if i.truncated { format!(", truncated to the first {MAX_FILES} files") } else { String::new() })),
         None => out.push_str("no scan since the daemon started\n"),
@@ -843,5 +1076,81 @@ mod tests {
         assert_eq!(query("/tmp", "x", 2, 100).await.unwrap_err(), NO_DB);
         assert_eq!(rebuild("/tmp").await.unwrap_err(), NO_DB);
         assert_eq!(status()["enabled"], false);
+    }
+
+    fn listed(items: &[(&str, i64)]) -> Vec<(String, i64)> {
+        items.iter().map(|(p, t)| (p.to_string(), *t)).collect()
+    }
+
+    #[test]
+    fn a_new_project_evicts_the_least_recently_used_ones() {
+        let all = listed(&[("/c", 30), ("/a", 10), ("/b", 20)]);
+        assert_eq!(evict_for(&all, "/new", 3), ["/a"]);
+        assert_eq!(evict_for(&all, "/new", 2), ["/a", "/b"]);
+        assert!(evict_for(&all, "/new", 4).is_empty());
+        assert!(evict_for(&all, "/b", 1).is_empty(), "already listed");
+    }
+
+    #[test]
+    fn forget_touches_only_the_matching_project_and_ends_with_its_registry_row() {
+        let stmts = forget_statements("/p");
+        assert_eq!(stmts.len(), 4);
+        for s in &stmts {
+            assert!(s.sql.starts_with("DELETE FROM feiyi_graph_") && s.sql.ends_with("WHERE project = ?"), "{}", s.sql);
+            assert_eq!(s.args.len(), 1);
+            assert_eq!(s.args[0]["value"], "/p");
+        }
+        assert!(stmts[3].sql.contains("feiyi_graph_projects"));
+        assert_eq!(touch("/p").args[1]["value"], "/p");
+        assert_eq!(touch("/p").sql.matches('?').count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_last_workspace_on_a_directory_forgets_it_and_another_one_keeps_it() {
+        let base = std::env::temp_dir().join(format!("graph-forget-{}", std::process::id()));
+        let real = base.join("repo");
+        std::fs::create_dir_all(&real).unwrap();
+        let alias = base.join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let (real, alias) = (real.to_string_lossy().into_owned(), alias.to_string_lossy().into_owned());
+        assert!(should_forget(&real, &[]));
+        assert!(should_forget(&real, &["/somewhere/else".to_string()]));
+        assert!(!should_forget(&real, &[alias]), "the same canonical directory is still in use");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn the_sweep_drops_missing_idle_and_over_cap_projects_oldest_first() {
+        let day = 24 * 3600;
+        let now = 100 * day;
+        let s = |p: &str, used: i64, rows: usize| Stored { project: p.into(), root: p.into(), used_at: used, rows };
+        let stored = vec![s("/gone", now, 10), s("/idle", now - 15 * day, 10), s("/idle-but-open", now - 15 * day, 10), s("/big-old", now - 3 * day, 300_000), s("/big-new", now - day, 300_000), s("/ok", now, 10)];
+        let active = HashSet::from(["/idle-but-open".to_string()]);
+        let victims = sweep_victims(&stored, now, &active, |root| root != "/gone");
+        assert_eq!(victims, ["/gone", "/idle", "/idle-but-open", "/big-old"].iter().filter(|v| **v != "/idle-but-open").map(|v| v.to_string()).collect::<Vec<_>>());
+        let crowded: Vec<Stored> = (0..14).map(|i| s(&format!("/p{i}"), now - i, 1)).collect();
+        let victims = sweep_victims(&crowded, now, &HashSet::new(), |_| true);
+        assert_eq!(victims, ["/p13", "/p12"]);
+    }
+
+    #[test]
+    fn a_project_over_the_row_cap_keeps_whole_files_and_no_dangling_edges() {
+        let files = vec![
+            parsed("a.rs", "fn a() {\n    b();\n}\n"),
+            parsed("b.rs", "fn b() {\n    c();\n}\n"),
+            parsed("c.rs", "fn c() {}\n"),
+        ];
+        let (all, cut) = resolve_capped(files, 100);
+        assert!(!cut && all.len() == 3);
+        let files = vec![
+            parsed("a.rs", "fn a() {\n    b();\n}\n"),
+            parsed("b.rs", "fn b() {\n    c();\n}\n"),
+            parsed("c.rs", "fn c() {}\n"),
+        ];
+        let (kept, cut) = resolve_capped(files, 3);
+        assert!(cut);
+        assert_eq!(kept.iter().map(|g| g.path.as_str()).collect::<Vec<_>>(), ["a.rs"]);
+        assert!(kept[0].edges.is_empty(), "b.rs is out, so is the edge into it");
     }
 }

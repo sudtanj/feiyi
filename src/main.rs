@@ -144,7 +144,7 @@ async fn run(cfg: Config, identity: Arc<e2ee::DaemonIdentity>) {
     mcp::write_claude_config(&cfg);
     token_saver::write_claude_settings(&cfg);
     backup::spawn(&cfg, ctx.cmds.clone());
-    graph::configure(&cfg);
+    graph::configure(&cfg, ctx.cmds.clone());
     uploads::prune(&cfg.home);
     usage::load_prices(&cfg.home);
     tokio::spawn(usage::refresh_prices(cfg.home.clone()));

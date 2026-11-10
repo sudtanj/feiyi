@@ -617,7 +617,6 @@ async fn ensure(dir: &str, force: bool) -> Result<(Turso, String), String> {
     }
     Ok((turso, key))
 }
-}
 
 // --- capacity and cleanup ---------------------------------------------------------------------
 

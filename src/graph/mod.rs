@@ -46,7 +46,7 @@ const BATCH: usize = 200;
 const FRESH: Duration = Duration::from_secs(30);
 const GIT_TIMEOUT: Duration = Duration::from_secs(30);
 const SKIP_DIRS: [&str; 5] = ["node_modules", "target", "dist", "build", "vendor"];
-const NO_DB: &str = "code graph needs backup.tursoUrl and backup.tursoToken";
+const NO_DB: &str = "code graph is off: set backup.codeGraph=true with backup.tursoUrl and backup.tursoToken";
 
 /// `Turso::run` with the failure reduced to a category: a response body never reaches a log or an agent.
 async fn db(turso: &Turso, stmts: Vec<Stmt>) -> Result<Vec<Vec<Vec<String>>>, String> {
@@ -370,7 +370,8 @@ fn walk(root: &Path) -> Vec<String> {
 
 /// Source files only, sorted by path (so the cut is the same every time), at most `MAX_FILES`; true when more existed.
 fn limit_files(mut paths: Vec<String>) -> (Vec<String>, bool) {
-    paths.retain(|p| !skipped(p) && crate::outline::lang(Path::new(p)).is_some());
+    // A control character in a name could forge lines in what agents read back.
+    paths.retain(|p| !skipped(p) && !p.contains(char::is_control) && crate::outline::lang(Path::new(p)).is_some());
     paths.sort();
     paths.dedup();
     let truncated = paths.len() > MAX_FILES;
@@ -604,18 +605,37 @@ async fn ensure(dir: &str, force: bool) -> Result<(Turso, String), String> {
         return Err(format!("{dir} is not a directory"));
     }
     let key = root.to_string_lossy().into_owned();
-    let project = PROJECTS.lock().map_err(|_| "code graph state is poisoned")?.entry(key.clone()).or_default().clone();
-    let stale = |st: &Project| force || st.scanned.map_or(true, |t| t.elapsed() > FRESH);
-    if stale(&*project.lock().await) {
-        // One build at a time in the process; waiting for the permit before the project lock keeps `register`
-        // (which waits for a victim's lock while holding the permit) from deadlocking with a build.
-        let _permit = BUILD.acquire().await.map_err(|_| "code graph builds are stopped")?;
-        let mut st = project.lock().await;
-        if stale(&st) {
-            build(&turso, &key, &mut st, force).await?;
+    // The build runs detached: the hook gives up after 3 s and axum then drops this future, which must not
+    // abort a build halfway through its writes (it would restart on the next call and never finish).
+    loop {
+        let project = PROJECTS.lock().map_err(|_| "code graph state is poisoned")?.entry(key.clone()).or_default().clone();
+        if !stale(&*project.lock().await, force) {
+            return Ok((turso, key));
+        }
+        let (store, name) = (turso.clone(), key.clone());
+        let built = tokio::spawn(async move {
+            // One build at a time in the process; waiting for the permit before the project lock keeps `register`
+            // (which waits for a victim's lock while holding the permit) from deadlocking with a build.
+            let _permit = BUILD.acquire().await.map_err(|_| "code graph builds are stopped")?;
+            let mut st = project.lock().await;
+            // An eviction while we waited left us holding an orphaned project: start over with the current one.
+            let current = PROJECTS.lock().ok().and_then(|p| p.get(&name).cloned());
+            if !current.is_some_and(|c| Arc::ptr_eq(&c, &project)) {
+                return Ok::<_, String>(false);
+            }
+            if stale(&st, force) {
+                build(&store, &name, &mut st, force).await?;
+            }
+            Ok(true)
+        });
+        if built.await.map_err(|e| format!("code graph build failed: {e}"))?? {
+            return Ok((turso, key));
         }
     }
-    Ok((turso, key))
+}
+
+fn stale(st: &Project, force: bool) -> bool {
+    force || st.scanned.map_or(true, |t| t.elapsed() > FRESH)
 }
 
 // --- capacity and cleanup ---------------------------------------------------------------------
@@ -1173,6 +1193,7 @@ mod tests {
         let mut paths: Vec<String> = (0..MAX_FILES + 5).rev().map(|i| format!("src/f{i:05}.rs")).collect();
         paths.push("notes.txt".into());
         paths.push("node_modules/x/a.js".into());
+        paths.push("src/evil\nname.rs".into());
         let (kept, cut) = limit_files(paths);
         assert!(cut && kept.len() == MAX_FILES);
         assert_eq!(kept[0], "src/f00000.rs");

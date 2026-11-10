@@ -317,18 +317,29 @@ pub fn parse(path: &Path, text: &str) -> Option<Parsed> {
         out.symbols.push(Symbol { kind, name, start: d.line + 1, end: d.end, parent });
     }
 
-    let mut open: Vec<(usize, Option<usize>)> = Vec::new();
+    // Open declarations: where each ends, its symbol and its indent.
+    let mut open: Vec<(usize, Option<usize>, usize)> = Vec::new();
     let mut next = 0;
     let mut go_block = false;
     let mut seen = BTreeSet::new();
     let mut names = Vec::new();
     for (i, line) in lines.iter().enumerate() {
-        while open.last().is_some_and(|(end, _)| *end <= i) {
+        while open.last().is_some_and(|(end, _, _)| *end <= i) {
             open.pop();
+        }
+        // The ranges run to the next declaration, so a body is over where code returns to its
+        // indent (not on a signature's `{`, `)`, `where` line), else a call after a nested fn would be its own.
+        let t = line.trim_start();
+        let continues = starts_any(t, &["{", ")", "]", "where"]);
+        if !t.is_empty() && !is_comment(t) && !continues {
+            let indent = line.len() - t.len();
+            while open.last().is_some_and(|(_, _, d)| *d >= indent) {
+                open.pop();
+            }
         }
         let mut skip = None;
         if decls.get(next).is_some_and(|d| d.line == i) {
-            open.push((decls[next].end, slots[next].0));
+            open.push((decls[next].end, slots[next].0, decls[next].indent));
             skip = slots[next].1.as_deref();
             next += 1;
         }
@@ -337,11 +348,10 @@ pub fn parse(path: &Path, text: &str) -> Option<Parsed> {
         if out.imports.len() > imported {
             continue;
         }
-        let t = line.trim_start();
         if t.is_empty() || is_comment(t) {
             continue;
         }
-        let owner = open.iter().rev().find_map(|(_, s)| *s);
+        let owner = open.iter().rev().find_map(|(_, s, _)| *s);
         names.clear();
         refs(line, skip, &mut names);
         for name in names.drain(..) {
@@ -462,7 +472,7 @@ mod tests {
         bytes.extend_from_slice(&[0, 0x80, 0xff]);
         let p = run("a.rs", &String::from_utf8_lossy(&bytes));
         assert_eq!(names(&p), ["fn before", "fn after"]);
-        assert!(called(&p, "after").is_empty(), "the call is inside a string");
+        assert_eq!(called(&p, "after"), ["call_me"], "the call is recorded, its string argument is not");
     }
 
     #[test]

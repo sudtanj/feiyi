@@ -71,7 +71,7 @@ fn claude_settings_json(exe: &Path, rtk: bool, guard: bool, graph: bool) -> Opti
     if graph {
         hooks.push(hook("Grep|Read", crate::graph::HOOK_CMD));
     }
-    Some(json!({ "hooks": { "PreToolUse": hooks } }))
+    (!hooks.is_empty()).then(|| json!({ "hooks": { "PreToolUse": hooks } }))
 }
 
 /// Writes Claude's `--settings` file at startup, or removes a stale one when
@@ -393,6 +393,7 @@ mod tests {
         assert_eq!(no_graph["hooks"]["PreToolUse"].as_array().unwrap().len(), 2, "no graph, no graph hook");
         assert!(!no_graph.to_string().contains("graph-hook"));
         assert_eq!(claude_settings_json(exe, false, false, true).unwrap()["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
+        assert!(claude_settings_json(exe, false, false, false).is_none(), "no hook, no settings file");
     }
 
     #[test]

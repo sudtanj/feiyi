@@ -6,6 +6,7 @@
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 pub const HOOK_CMD: &str = "graph-hook";
@@ -24,12 +25,20 @@ pub fn hook_main() {
     }
     let Ok(event) = serde_json::from_str::<Value>(&input) else { return };
     let Some((dir, q)) = query_for(&event) else { return };
+    if !in_repo(&dir) {
+        return;
+    }
     let Some(text) = ask_daemon(&dir, &q) else { return };
     if let Some(out) = render(&q, &text) {
         let mut stdout = std::io::stdout();
         let _ = stdout.write_all(out.to_string().as_bytes());
         let _ = stdout.flush();
     }
+}
+
+/// A git checkout: the graph indexes projects, not $HOME or /tmp where an agent happens to grep.
+fn in_repo(dir: &str) -> bool {
+    Path::new(dir).join(".git").exists()
 }
 
 /// The project directory and the `graph_query` text for this tool call, None
@@ -48,7 +57,7 @@ fn query_for(event: &Value) -> Option<(String, String)> {
                 return None;
             }
             // The graph stores paths relative to the project directory.
-            path.strip_prefix(dir).map_or(path, |p| p.trim_start_matches('/')).to_string()
+            Path::new(path).strip_prefix(dir).ok().and_then(|p| p.to_str()).unwrap_or(path).to_string()
         }
         _ => return None,
     };
@@ -90,6 +99,8 @@ fn render(q: &str, text: &str) -> Option<Value> {
     if text.is_empty() || text.starts_with("nothing matches") {
         return None;
     }
+    // Control characters other than the daemon's own line breaks (ESC, CR, tab) could dress up the context as something else.
+    let text: String = text.chars().map(|c| if c.is_control() && c != '\n' { ' ' } else { c }).collect();
     let context = crate::util::truncate(&format!("Code graph for {q}:\n{text}"), MAX_CONTEXT);
     Some(json!({ "hookSpecificOutput": { "hookEventName": "PreToolUse", "additionalContext": context } }))
 }
@@ -101,7 +112,9 @@ fn endpoint(config: &Value) -> Option<(SocketAddr, String, String)> {
     let rest = server.get("url")?.as_str()?.strip_prefix("http://")?;
     let (host, path) = rest.split_once('/')?;
     let token = server.pointer("/headers/Authorization")?.as_str()?.strip_prefix("Bearer ")?;
-    Some((host.parse().ok()?, format!("/{path}"), token.to_string()))
+    let addr: SocketAddr = host.parse().ok()?;
+    // The token goes over plain HTTP: only to this machine.
+    addr.ip().is_loopback().then(|| (addr, format!("/{path}"), token.to_string()))
 }
 
 fn ask_daemon(dir: &str, q: &str) -> Option<String> {
@@ -197,5 +210,42 @@ mod tests {
         let config = json!({ "mcpServers": { "feiyi": { "type": "http", "url": "http://127.0.0.1:8123/mcp", "headers": { "Authorization": "Bearer abc" } } } });
         assert_eq!(endpoint(&config), Some(("127.0.0.1:8123".parse().unwrap(), "/mcp".into(), "abc".into())));
         assert!(endpoint(&json!({ "mcpServers": {} })).is_none());
+    }
+
+    #[test]
+    fn only_git_checkouts_are_looked_up() {
+        let dir = std::env::temp_dir().join(format!("graph-hook-repo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_str().unwrap();
+        assert!(!in_repo(d));
+        std::fs::write(dir.join(".git"), "gitdir: /elsewhere\n").unwrap();
+        assert!(in_repo(d), "a worktree's .git is a file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_sibling_directory_with_the_same_prefix_is_not_the_project() {
+        let long = long_file(crate::outline::READ_WHOLE_MAX_LINES + 1);
+        let (dir, _) = long.rsplit_once('/').unwrap();
+        let ev = json!({ "tool_name": "Read", "tool_input": { "file_path": long }, "cwd": &dir[..dir.len() - 1] });
+        assert_eq!(query_for(&ev).unwrap().1, long, "not cut at a character inside a directory name");
+        let _ = std::fs::remove_file(long);
+    }
+
+    #[test]
+    fn control_characters_cannot_dress_up_the_context() {
+        let out = render("foo", "fn a\u{1b}[2J b.rs:1-2\r\nfn c\td.rs:3-4\n").unwrap();
+        let context = out["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
+        assert!(!context.contains(['\u{1b}', '\r', '\t']), "{context:?}");
+        assert!(context.contains("fn a [2J b.rs:1-2 \nfn c d.rs:3-4"));
+    }
+
+    #[test]
+    fn the_token_only_goes_to_loopback() {
+        let at = |host: &str| json!({ "mcpServers": { "feiyi": { "url": format!("http://{host}/mcp"), "headers": { "Authorization": "Bearer abc" } } } });
+        assert!(endpoint(&at("127.0.0.1:8123")).is_some());
+        assert!(endpoint(&at("[::1]:8123")).is_some());
+        assert!(endpoint(&at("192.168.1.5:8123")).is_none());
+        assert!(endpoint(&at("0.0.0.0:8123")).is_none());
     }
 }

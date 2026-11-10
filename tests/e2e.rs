@@ -385,7 +385,7 @@ async fn daemon_config_custom_models_round_trip() {
 async fn project_add_and_list() {
     let d = start("project", None);
     let proj = d.dir.join("myproject");
-    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::create_dir_all(proj.join(".git")).unwrap();
     let mut ws = connect(d.port).await;
     hello(&mut ws, None).await;
     send(&mut ws, session(json!({ "type": "project.add.request", "requestId": "p1", "cwd": proj.to_string_lossy() }))).await;
@@ -1489,7 +1489,7 @@ async fn terminal_payload(ws: &mut Ws, kind: &str) -> Value {
 async fn terminal_runs_a_shell_streams_output_and_reattaches() {
     let d = start_with(unique_dir("term"), None, "ok", &[("SHELL", "/bin/sh")]);
     let proj = d.dir.join("proj");
-    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::create_dir_all(proj.join(".git")).unwrap();
     let cwd = proj.to_string_lossy().into_owned();
     let mut ws = connect(d.port).await;
     hello(&mut ws, None).await;
@@ -1857,7 +1857,7 @@ async fn pull_request_checkout_rejects_bad_input_cleanly_and_archive_keeps_the_b
 async fn archiving_a_workspace_ends_its_terminals() {
     let d = start_with(unique_dir("termarch"), None, "ok", &[("SHELL", "/bin/sh")]);
     let proj = d.dir.join("proj");
-    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::create_dir_all(proj.join(".git")).unwrap();
     let cwd = proj.to_string_lossy().into_owned();
     let mut ws = connect(d.port).await;
     hello(&mut ws, None).await;
@@ -2407,7 +2407,7 @@ fn graph_tools_are_listed_and_say_what_to_configure_without_turso() {
     }
     let called = mcp_call(&d, "tools/call", json!({ "name": "graph_query", "arguments": { "dir": d.dir.to_str().unwrap(), "q": "main" } }));
     assert_eq!(called["result"]["isError"], true, "{called}");
-    assert_eq!(called["result"]["content"][0]["text"], "code graph needs backup.tursoUrl and backup.tursoToken");
+    assert_eq!(called["result"]["content"][0]["text"], "code graph is off: set backup.codeGraph=true with backup.tursoUrl and backup.tursoToken");
 }
 
 /// A daemon home whose `daemon-config.json` has a backup section: the graph is
@@ -2561,6 +2561,7 @@ fn graph_hook_hands_a_grep_the_graph_context_from_the_daemon() {
     let (listener, seen) = fake_mcp("200 OK", mcp_text("2 nodes\nfn foo src/a.rs:1-3\n", false));
     write_mcp_config(&home, listener.local_addr().unwrap().port());
     let cwd = home.join("proj");
+    std::fs::create_dir_all(cwd.join(".git")).unwrap();
     let out = graph_hook(&home, &grep_event(&cwd, r"fn\s+foo\("));
     assert_context(out, "Code graph for foo:\n2 nodes\nfn foo src/a.rs:1-3");
     let request = seen.join().unwrap();
@@ -2577,7 +2578,7 @@ fn graph_hook_hands_a_grep_the_graph_context_from_the_daemon() {
 fn graph_hook_asks_about_a_long_file_by_its_project_relative_path_and_caps_the_context() {
     let home = unique_dir("hook-read");
     let proj = home.join("proj");
-    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::create_dir_all(proj.join(".git")).unwrap();
     let big = proj.join("big.rs");
     std::fs::write(&big, "// line\n".repeat(301)).unwrap();
     let (listener, seen) = fake_mcp("200 OK", mcp_text(&"edge ".repeat(2000), false));
@@ -2593,7 +2594,7 @@ fn graph_hook_asks_about_a_long_file_by_its_project_relative_path_and_caps_the_c
 fn graph_hook_stays_silent_when_there_is_nothing_to_ask_or_nothing_to_say() {
     let home = unique_dir("hook-silent");
     let proj = home.join("proj");
-    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::create_dir_all(proj.join(".git")).unwrap();
     let big = proj.join("big.rs");
     let small = proj.join("small.rs");
     std::fs::write(&big, "x\n".repeat(301)).unwrap();
@@ -2627,6 +2628,7 @@ fn graph_hook_stays_silent_when_there_is_nothing_to_ask_or_nothing_to_say() {
 fn graph_hook_stays_silent_when_the_daemon_has_no_answer() {
     let home = unique_dir("hook-nodaemon");
     let proj = home.join("proj");
+    std::fs::create_dir_all(proj.join(".git")).unwrap();
     let event = grep_event(&proj, "handle_request");
 
     // No config file at all, and a config that is not JSON or has no server entry.
@@ -2641,7 +2643,7 @@ fn graph_hook_stays_silent_when_the_daemon_has_no_answer() {
     assert_allowed(graph_hook(&home, &event), "connection refused");
 
     for (what, status, body) in [
-        ("a tool error", "200 OK", mcp_text("code graph needs backup.tursoUrl and backup.tursoToken", true)),
+        ("a tool error", "200 OK", mcp_text("code graph is off: set backup.codeGraph=true with backup.tursoUrl and backup.tursoToken", true)),
         ("no match", "200 OK", mcp_text("nothing matches \"handle_request\" in /x\n", false)),
         ("an empty answer", "200 OK", mcp_text("  \n", false)),
         ("HTTP 401", "401 Unauthorized", "{\"error\":\"unauthorized\"}".to_string()),
@@ -2663,6 +2665,7 @@ fn graph_hook_gives_up_on_a_daemon_that_never_replies() {
     let home = unique_dir("hook-hang");
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     write_mcp_config(&home, listener.local_addr().unwrap().port());
+    std::fs::create_dir_all(home.join(".git")).unwrap();
     let holder = std::thread::spawn(move || {
         let (s, _) = listener.accept().unwrap();
         std::thread::sleep(Duration::from_secs(6));

@@ -11,7 +11,7 @@ pub const READ_WHOLE_MAX_LINES: usize = 300;
 const MAX_SYMBOLS: usize = 400;
 
 #[derive(Clone, Copy, PartialEq)]
-enum Lang {
+pub(crate) enum Lang {
     Rust,
     Python,
     Go,
@@ -20,7 +20,7 @@ enum Lang {
     Shell,
 }
 
-fn lang(path: &Path) -> Option<Lang> {
+pub(crate) fn lang(path: &Path) -> Option<Lang> {
     Some(match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
         "rs" => Lang::Rust,
         "py" | "pyi" => Lang::Python,
@@ -32,25 +32,25 @@ fn lang(path: &Path) -> Option<Lang> {
     })
 }
 
-fn strip_any<'a>(mut s: &'a str, mods: &[&str]) -> &'a str {
+pub(crate) fn strip_any<'a>(mut s: &'a str, mods: &[&str]) -> &'a str {
     while let Some(rest) = mods.iter().find_map(|m| s.strip_prefix(m)) {
         s = rest.trim_start();
     }
     s
 }
 
-fn starts_any(s: &str, kws: &[&str]) -> bool {
+pub(crate) fn starts_any(s: &str, kws: &[&str]) -> bool {
     kws.iter().any(|k| s.starts_with(k))
 }
 
-fn ident_call(s: &str) -> bool {
+pub(crate) fn ident_call(s: &str) -> bool {
     let name: String = s.chars().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$').collect();
     const NOT: [&str; 12] = ["if", "for", "while", "switch", "catch", "return", "else", "do", "try", "with", "new", "await"];
     !name.is_empty() && !NOT.contains(&name.as_str()) && s[name.len()..].trim_start().starts_with(['(', '<'])
 }
 
 /// Is `line` (indented by `indent`) a declaration worth listing?
-fn is_decl(lang: Lang, line: &str, indent: usize) -> bool {
+pub(crate) fn is_decl(lang: Lang, line: &str, indent: usize) -> bool {
     let t = line.trim_start();
     match lang {
         Lang::Rust => {
@@ -77,6 +77,31 @@ fn is_decl(lang: Lang, line: &str, indent: usize) -> bool {
     }
 }
 
+/// A declaration line, with the line it runs to.
+pub(crate) struct Decl {
+    /// 0-based index of the declaration line.
+    pub line: usize,
+    pub indent: usize,
+    /// 1-based last line: runs until the next declaration at the same or an outer level.
+    pub end: usize,
+}
+
+pub(crate) fn declarations(lang: Lang, lines: &[&str]) -> Vec<Decl> {
+    let indent_of = |l: &str| l.len() - l.trim_start().len();
+    let found: Vec<(usize, usize)> = lines.iter().enumerate().filter(|(_, l)| !l.trim().is_empty() && is_decl(lang, l, indent_of(l))).map(|(i, l)| (i, indent_of(l))).collect();
+    found
+        .iter()
+        .enumerate()
+        .map(|(k, &(i, indent))| {
+            let mut end = found[k + 1..].iter().find(|(_, d)| *d <= indent).map(|(j, _)| *j).unwrap_or(lines.len());
+            while end > i + 1 && lines[end - 1].trim().is_empty() {
+                end -= 1;
+            }
+            Decl { line: i, indent, end }
+        })
+        .collect()
+}
+
 /// The outline of `path` as compact text: `start-end  signature` per
 /// declaration, nested ones indented. Err when it can't be read or the
 /// language is unknown.
@@ -89,17 +114,11 @@ pub fn outline(path: &str) -> Result<String, String> {
     let text = std::fs::read(p).map_err(|e| format!("{path}: {e}"))?;
     let text = String::from_utf8_lossy(&text);
     let lines: Vec<&str> = text.lines().collect();
-    let indent_of = |l: &str| l.len() - l.trim_start().len();
-    let decls: Vec<(usize, usize)> = lines.iter().enumerate().filter(|(_, l)| !l.trim().is_empty() && is_decl(lang, l, indent_of(l))).map(|(i, l)| (i, indent_of(l))).collect();
+    let decls = declarations(lang, &lines);
     let mut out = format!("{path} ({} lines)\n", lines.len());
-    for (k, &(i, indent)) in decls.iter().enumerate().take(MAX_SYMBOLS) {
-        // Runs until the next declaration at the same or an outer level.
-        let mut end = decls[k + 1..].iter().find(|(_, d)| *d <= indent).map(|(j, _)| *j).unwrap_or(lines.len());
-        while end > i + 1 && lines[end - 1].trim().is_empty() {
-            end -= 1;
-        }
-        let sig: String = lines[i].trim().chars().take(160).collect();
-        out.push_str(&format!("{}{}-{}  {}\n", " ".repeat(indent.min(12)), i + 1, end, sig));
+    for d in decls.iter().take(MAX_SYMBOLS) {
+        let sig: String = lines[d.line].trim().chars().take(160).collect();
+        out.push_str(&format!("{}{}-{}  {}\n", " ".repeat(d.indent.min(12)), d.line + 1, d.end, sig));
     }
     if decls.len() > MAX_SYMBOLS {
         out.push_str(&format!("… {} more declarations\n", decls.len() - MAX_SYMBOLS));

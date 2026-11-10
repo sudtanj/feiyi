@@ -2380,3 +2380,32 @@ async fn rapid_double_directory_create_yields_one_workspace() {
     let list = rpc(&mut ws2, json!({ "type": "fetch_workspaces_request", "requestId": "l1" }), "fetch_workspaces_response").await;
     assert_eq!(list["entries"].as_array().unwrap().len(), 1, "{list}");
 }
+
+/// One JSON-RPC call to the daemon's own MCP server, with the token from the
+/// `--mcp-config` file the daemon wrote for its agents.
+fn mcp_call(d: &Daemon, method: &str, params: Value) -> Value {
+    let config: Value = serde_json::from_slice(&std::fs::read(d.dir.join("home").join("claude-mcp.json")).unwrap()).unwrap();
+    let auth = config["mcpServers"]["feiyi"]["headers"]["Authorization"].as_str().unwrap().to_string();
+    let body = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params }).to_string();
+    let mut s = TcpStream::connect(("127.0.0.1", d.port)).unwrap();
+    write!(s, "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: {auth}\r\nContent-Type: application/json\r\nAccept: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+    let mut raw = String::new();
+    s.read_to_string(&mut raw).unwrap();
+    let (head, reply) = raw.split_once("\r\n\r\n").unwrap_or_else(|| panic!("no body: {raw}"));
+    assert!(head.starts_with("HTTP/1.1 200"), "{raw}");
+    serde_json::from_str(reply).unwrap_or_else(|e| panic!("{e}: {reply}"))
+}
+
+#[test]
+fn graph_tools_are_listed_and_say_what_to_configure_without_turso() {
+    let d = start("graph", None);
+    let listed = mcp_call(&d, "tools/list", json!({}));
+    let tools = listed["result"]["tools"].as_array().unwrap();
+    for name in ["graph_query", "graph_impact", "graph_path", "graph_report", "graph_rebuild"] {
+        let tool = tools.iter().find(|t| t["name"] == name).unwrap_or_else(|| panic!("{name} not listed"));
+        assert_eq!(tool["annotations"]["readOnlyHint"], name != "graph_rebuild", "{name}");
+    }
+    let called = mcp_call(&d, "tools/call", json!({ "name": "graph_query", "arguments": { "dir": d.dir.to_str().unwrap(), "q": "main" } }));
+    assert_eq!(called["result"]["isError"], true, "{called}");
+    assert_eq!(called["result"]["content"][0]["text"], "code graph needs backup.tursoUrl and backup.tursoToken");
+}

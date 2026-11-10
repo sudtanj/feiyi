@@ -91,7 +91,7 @@ struct Ready {
 }
 
 #[derive(Clone)]
-struct Turso {
+pub(crate) struct Turso {
     host: String,
     token: String,
 }
@@ -152,6 +152,12 @@ impl BackupConfig {
     fn ready(&self) -> Result<Option<Ready>, String> {
         let (Some(url), Some(token), Some(passphrase)) = (&self.url, &self.token, &self.passphrase) else { return Ok(None) };
         Ok(Some(Ready { turso: Turso { host: host_of(url)?, token: token.clone() }, passphrase: passphrase.clone() }))
+    }
+
+    /// The database alone, without the passphrase: the code graph (graph/mod.rs) keeps plain rows there.
+    pub(crate) fn turso(&self) -> Result<Option<Turso>, String> {
+        let (Some(url), Some(token)) = (&self.url, &self.token) else { return Ok(None) };
+        Ok(Some(Turso { host: host_of(url)?, token: token.clone() }))
     }
 
     /// For `daemon_status`: no secrets, only whether each is set.
@@ -378,16 +384,16 @@ fn join_chunks(rows: BTreeMap<String, String>) -> Result<BTreeMap<String, String
 
 // --- Turso HTTP API -----------------------------------------------------------
 
-struct Stmt {
-    sql: &'static str,
-    args: Vec<Value>,
+pub(crate) struct Stmt {
+    pub(crate) sql: &'static str,
+    pub(crate) args: Vec<Value>,
 }
 
-fn text(s: &str) -> Value {
+pub(crate) fn text(s: &str) -> Value {
     json!({ "type": "text", "value": s })
 }
 
-fn int(n: i64) -> Value {
+pub(crate) fn int(n: i64) -> Value {
     json!({ "type": "integer", "value": n.to_string() })
 }
 
@@ -424,7 +430,7 @@ fn parse_pipeline(body: &str, statements: usize) -> Result<Vec<Rows>, String> {
 }
 
 impl Turso {
-    async fn run(&self, stmts: Vec<Stmt>) -> Result<Vec<Rows>, String> {
+    pub(crate) async fn run(&self, stmts: Vec<Stmt>) -> Result<Vec<Rows>, String> {
         let auth = format!("Authorization: Bearer {}\r\n", self.token);
         let (status, body) = crate::push::request("POST", &self.host, "/v2/pipeline", Some(&pipeline_body(&stmts)), &auth, MAX_RESPONSE, REQUEST_TIMEOUT)
             .await
@@ -545,7 +551,7 @@ fn items(home: &Path, projects: &[Value]) -> Result<BTreeMap<String, Item>, Stri
 // --- change detection ----------------------------------------------------------------
 
 /// Local-only change detector (FNV-1a); never leaves the machine.
-fn fingerprint(bytes: &[u8]) -> u64 {
+pub(crate) fn fingerprint(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf29ce484222325, |h, b| (h ^ *b as u64).wrapping_mul(0x100000001b3))
 }
 

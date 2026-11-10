@@ -310,6 +310,28 @@ Ported from zilong-router's Token Saver (9router's page of the same name). zilon
 
 `daemon_status` shows the active settings under `config.tokenSaver`.
 
+## Code graph
+
+feiyi keeps a graph of each project's code: files and symbols as nodes, calls and imports as edges. It is built per project directory and stored as plain rows in the backup Turso database, so it needs `backup.tursoUrl` and `backup.tursoToken`. Without them, or with `"codeGraph": false`, every graph tool answers "code graph is off: set backup.codeGraph=true with backup.tursoUrl and backup.tursoToken".
+
+**The graph rows are stored unencrypted**, unlike the encrypted backup items: file paths, symbol names and line ranges are readable by anyone with access to the database. Set `"codeGraph": false` in the `backup` section of `daemon-config.json` to turn the graph off (the tools then answer with the same error and the Grep/Read hook is not installed). It is on by default whenever the Turso URL and token are set; no passphrase is needed. The database stays small: at most 12 projects, 80,000 rows per project and 400,000 rows in total, least recently used projects evicted first, and a project's rows are deleted when its last workspace is archived or, in a daily sweep, when its directory is gone or unused for 14 days. The graph is built on first use and refreshed when files change.
+
+The `feiyi` MCP server (see [MCP: feiyi](#mcp-feiyi)) has five tools for it, each taking the project directory as `dir`:
+
+| Tool | What it returns |
+|---|---|
+| `graph_query` | `{q, depth, budget}`: the symbols or files whose name or path contain `q`, with their callers, callees and imports up to `depth` edges |
+| `graph_impact` | `{symbol, budget}`: everything that calls the symbol, directly or through other callers, grouped by file |
+| `graph_path` | `{from, to}`: the shortest chain of calls and imports between two symbols or files |
+| `graph_report` | file, symbol and edge counts, communities, the most depended-on nodes and the last scan |
+| `graph_rebuild` | rescans the project and rewrites every row, ignoring the stored hashes |
+
+`graph_rebuild` is only needed when the graph looks wrong.
+
+For Claude Code, the daemon also adds a `PreToolUse` hook (`feiyi graph-hook`, 5 s timeout, in the same `claude-settings.json` as the RTK hook) on Grep and Read. Before a Grep it looks up the longest plain word of the pattern; before a Read of a file over 300 lines with no `offset` or `limit` it looks up the file's path. It calls `graph_query` with depth 1 and a 1500 character budget, and gives the answer to Claude as extra context. The hook is advisory: the tool always runs. It only runs when the working directory itself contains `.git`, so scratch directories are never indexed. If Turso is not configured, the daemon does not answer within 3 s, or nothing matches, the hook prints nothing. It reads the daemon's bearer token from the private MCP config file in the state directory, never from the command line.
+
+Limits: 12 projects, 80,000 rows per project and 400,000 rows in total. A project nobody queried for 14 days is removed, and a project's rows are deleted when the last workspace on its directory is archived.
+
 ## Layout
 
 ```

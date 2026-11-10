@@ -2380,3 +2380,300 @@ async fn rapid_double_directory_create_yields_one_workspace() {
     let list = rpc(&mut ws2, json!({ "type": "fetch_workspaces_request", "requestId": "l1" }), "fetch_workspaces_response").await;
     assert_eq!(list["entries"].as_array().unwrap().len(), 1, "{list}");
 }
+
+/// One JSON-RPC call to the daemon's own MCP server, with the token from the
+/// `--mcp-config` file the daemon wrote for its agents.
+fn mcp_call(d: &Daemon, method: &str, params: Value) -> Value {
+    let config: Value = serde_json::from_slice(&std::fs::read(d.dir.join("home").join("claude-mcp.json")).unwrap()).unwrap();
+    let auth = config["mcpServers"]["feiyi"]["headers"]["Authorization"].as_str().unwrap().to_string();
+    let body = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params }).to_string();
+    let mut s = TcpStream::connect(("127.0.0.1", d.port)).unwrap();
+    write!(s, "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: {auth}\r\nContent-Type: application/json\r\nAccept: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+    let mut raw = String::new();
+    s.read_to_string(&mut raw).unwrap();
+    let (head, reply) = raw.split_once("\r\n\r\n").unwrap_or_else(|| panic!("no body: {raw}"));
+    assert!(head.starts_with("HTTP/1.1 200"), "{raw}");
+    serde_json::from_str(reply).unwrap_or_else(|e| panic!("{e}: {reply}"))
+}
+
+#[test]
+fn graph_tools_are_listed_and_say_what_to_configure_without_turso() {
+    let d = start("graph", None);
+    let listed = mcp_call(&d, "tools/list", json!({}));
+    let tools = listed["result"]["tools"].as_array().unwrap();
+    for name in ["graph_query", "graph_impact", "graph_path", "graph_report", "graph_rebuild"] {
+        let tool = tools.iter().find(|t| t["name"] == name).unwrap_or_else(|| panic!("{name} not listed"));
+        assert_eq!(tool["annotations"]["readOnlyHint"], name != "graph_rebuild", "{name}");
+    }
+    let called = mcp_call(&d, "tools/call", json!({ "name": "graph_query", "arguments": { "dir": d.dir.to_str().unwrap(), "q": "main" } }));
+    assert_eq!(called["result"]["isError"], true, "{called}");
+    assert_eq!(called["result"]["content"][0]["text"], "code graph is off: set backup.codeGraph=true with backup.tursoUrl and backup.tursoToken");
+}
+
+/// A daemon home whose `daemon-config.json` has a backup section: the graph is
+/// on unless `code_graph` is false. The host never resolves, so nothing leaves.
+fn start_with_graph_config(tag: &str, code_graph: Option<bool>) -> Daemon {
+    let dir = unique_dir(tag);
+    std::fs::create_dir_all(dir.join("home")).unwrap();
+    let mut backup = json!({ "tursoUrl": "libsql://graph.invalid", "tursoToken": "tok-graph" });
+    if let Some(on) = code_graph {
+        backup["codeGraph"] = json!(on);
+    }
+    std::fs::write(dir.join("home").join("daemon-config.json"), json!({ "backup": backup }).to_string()).unwrap();
+    start_at(dir, None, "ok")
+}
+
+fn graph_status(d: &Daemon) -> Value {
+    let status = mcp_call(d, "tools/call", json!({ "name": "daemon_status", "arguments": {} }));
+    let text = status["result"]["content"][0]["text"].as_str().unwrap_or_else(|| panic!("{status}"));
+    serde_json::from_str::<Value>(text).unwrap()["graph"].clone()
+}
+
+#[test]
+fn every_graph_tool_errors_cleanly_when_the_flag_is_off_and_status_says_so() {
+    let d = start_with_graph_config("graph-off", Some(false));
+    let listed = mcp_call(&d, "tools/list", json!({}));
+    let names: Vec<&str> = listed["result"]["tools"].as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).collect();
+    for name in ["graph_query", "graph_impact", "graph_path", "graph_report", "graph_rebuild"] {
+        assert!(names.contains(&name), "{name} not listed");
+        let args = json!({ "dir": d.dir.to_str().unwrap(), "q": "main", "symbol": "main", "from": "a", "to": "b" });
+        let called = mcp_call(&d, "tools/call", json!({ "name": name, "arguments": args }));
+        assert_eq!(called["result"]["isError"], true, "{name}: {called}");
+        let text = called["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.starts_with("code graph"), "{name}: {text}");
+        assert!(!text.contains("graph.invalid") && !text.contains("tok-graph"), "{name} leaks the database: {text}");
+    }
+    let graph = graph_status(&d);
+    assert_eq!(graph["enabled"], false, "{graph}");
+    assert_eq!(graph["projects"], json!([]), "{graph}");
+    assert_eq!(graph["rows"], 0, "{graph}");
+    assert_eq!((graph["cap"].as_u64(), graph["maxProjects"].as_u64()), (Some(400_000), Some(12)), "{graph}");
+}
+
+#[tokio::test]
+async fn archiving_a_workspace_with_the_graph_off_does_not_block() {
+    let d = start_with_graph_config("graph-off-archive", Some(false));
+    let dir = d.dir.join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let cwd = dir.to_string_lossy().into_owned();
+    let mut ws = connect(d.port).await;
+    hello(&mut ws, None).await;
+    let first = create_dir_workspace(&mut ws, "g1", &cwd).await;
+    let started = Instant::now();
+    let r = rpc(&mut ws, json!({ "type": "archive_workspace_request", "requestId": "g2", "workspaceId": first["workspace"]["id"] }), "archive_workspace_response").await;
+    assert!(r["error"].is_null(), "{r}");
+    assert!(started.elapsed() < Duration::from_secs(5), "archive took {:?}", started.elapsed());
+    let list = rpc(&mut ws, json!({ "type": "fetch_workspaces_request", "requestId": "g3" }), "fetch_workspaces_response").await;
+    assert!(list["entries"].as_array().unwrap().is_empty(), "{list}");
+}
+
+#[tokio::test]
+async fn archiving_the_last_workspace_with_an_unreachable_graph_database_still_succeeds() {
+    let d = start_with_graph_config("graph-on-archive", None);
+    assert_eq!(graph_status(&d)["enabled"], true, "codeGraph defaults to on");
+    let dir = d.dir.join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let cwd = dir.to_string_lossy().into_owned();
+    let mut ws = connect(d.port).await;
+    hello(&mut ws, None).await;
+    let first = create_dir_workspace(&mut ws, "h1", &cwd).await;
+    let r = rpc(&mut ws, json!({ "type": "archive_workspace_request", "requestId": "h2", "workspaceId": first["workspace"]["id"] }), "archive_workspace_response").await;
+    assert!(r["error"].is_null(), "the forget runs in the background and its failure is not the caller's: {r}");
+    let called = mcp_call(&d, "tools/call", json!({ "name": "graph_report", "arguments": { "dir": cwd } }));
+    assert_eq!(called["result"]["isError"], true, "{called}");
+    let text = called["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.starts_with("code graph database:") && !text.contains("graph.invalid") && !text.contains("tok-graph"), "{text}");
+}
+
+/// `feiyi graph-hook` with `input` on stdin and `home` as the daemon home.
+fn graph_hook(home: &std::path::Path, input: &str) -> (Option<i32>, String) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_feiyi"));
+    cmd.arg("graph-hook").env("HOME", home).env("PASEO_LITE_HOME", home);
+    pipe(cmd, input)
+}
+
+/// A one-shot loopback stand-in for the daemon's MCP server: answers the first
+/// request with `status` and `body`, and hands back the request it saw.
+fn fake_mcp(status: &str, body: String) -> (std::net::TcpListener, std::thread::JoinHandle<String>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let serving = listener.try_clone().unwrap();
+    let status = status.to_string();
+    let seen = std::thread::spawn(move || {
+        let (mut s, _) = serving.accept().unwrap();
+        let mut raw = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = s.read(&mut chunk).unwrap();
+            raw.extend_from_slice(&chunk[..n]);
+            let text = String::from_utf8_lossy(&raw).into_owned();
+            if let Some((head, rest)) = text.split_once("\r\n\r\n") {
+                let len = head.to_ascii_lowercase().lines().find_map(|l| l.strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap())).unwrap_or(0);
+                if rest.len() >= len || n == 0 {
+                    break;
+                }
+            }
+            assert!(n > 0, "hook closed early");
+        }
+        let _ = write!(s, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        String::from_utf8_lossy(&raw).into_owned()
+    });
+    (listener, seen)
+}
+
+fn write_mcp_config(home: &std::path::Path, port: u16) {
+    std::fs::create_dir_all(home).unwrap();
+    let config = json!({ "mcpServers": { "feiyi": { "type": "http", "url": format!("http://127.0.0.1:{port}/mcp"), "headers": { "Authorization": "Bearer tok-hook" } } } });
+    std::fs::write(home.join("claude-mcp.json"), config.to_string()).unwrap();
+}
+
+fn mcp_text(text: &str, is_error: bool) -> String {
+    json!({ "jsonrpc": "2.0", "id": 1, "result": { "content": [{ "type": "text", "text": text }], "isError": is_error } }).to_string()
+}
+
+fn grep_event(cwd: &std::path::Path, pattern: &str) -> String {
+    json!({ "hook_event_name": "PreToolUse", "tool_name": "Grep", "tool_input": { "pattern": pattern }, "cwd": cwd }).to_string()
+}
+
+fn read_event(cwd: &std::path::Path, file: &std::path::Path, extra: Value) -> String {
+    let mut input = json!({ "file_path": file });
+    input.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+    json!({ "hook_event_name": "PreToolUse", "tool_name": "Read", "tool_input": input, "cwd": cwd }).to_string()
+}
+
+/// Exactly the defined shape: context only, never a permission decision.
+fn assert_context(out: (Option<i32>, String), starts_with: &str) -> String {
+    assert_eq!(out.0, Some(0));
+    let v: Value = serde_json::from_str(&out.1).unwrap_or_else(|e| panic!("not JSON ({e}): {:?}", out.1));
+    let hook = v["hookSpecificOutput"].as_object().unwrap();
+    assert_eq!(v.as_object().unwrap().len(), 1, "{v}");
+    let mut keys: Vec<&str> = hook.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["additionalContext", "hookEventName"], "{v}");
+    assert_eq!(hook["hookEventName"], "PreToolUse");
+    let context = hook["additionalContext"].as_str().unwrap().to_string();
+    assert!(context.starts_with(starts_with), "{context}");
+    context
+}
+
+#[test]
+fn graph_hook_hands_a_grep_the_graph_context_from_the_daemon() {
+    let home = unique_dir("hook-grep");
+    let (listener, seen) = fake_mcp("200 OK", mcp_text("2 nodes\nfn foo src/a.rs:1-3\n", false));
+    write_mcp_config(&home, listener.local_addr().unwrap().port());
+    let cwd = home.join("proj");
+    std::fs::create_dir_all(cwd.join(".git")).unwrap();
+    let out = graph_hook(&home, &grep_event(&cwd, r"fn\s+foo\("));
+    assert_context(out, "Code graph for foo:\n2 nodes\nfn foo src/a.rs:1-3");
+    let request = seen.join().unwrap();
+    assert!(request.starts_with("POST /mcp HTTP/1.1\r\n"), "{request}");
+    assert!(request.contains("Authorization: Bearer tok-hook\r\n"), "{request}");
+    let call: Value = serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+    assert_eq!(call["method"], "tools/call");
+    assert_eq!(call["params"]["name"], "graph_query");
+    assert_eq!(call["params"]["arguments"], json!({ "dir": cwd, "q": "foo", "depth": 1, "budget": 1500 }));
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn graph_hook_asks_about_a_long_file_by_its_project_relative_path_and_caps_the_context() {
+    let home = unique_dir("hook-read");
+    let proj = home.join("proj");
+    std::fs::create_dir_all(proj.join(".git")).unwrap();
+    let big = proj.join("big.rs");
+    std::fs::write(&big, "// line\n".repeat(301)).unwrap();
+    let (listener, seen) = fake_mcp("200 OK", mcp_text(&"edge ".repeat(2000), false));
+    write_mcp_config(&home, listener.local_addr().unwrap().port());
+    let context = assert_context(graph_hook(&home, &read_event(&proj, &big, json!({}))), "Code graph for big.rs:\n");
+    assert!(context.len() <= 1500 + 3, "{} bytes", context.len());
+    let call: Value = serde_json::from_str(seen.join().unwrap().split_once("\r\n\r\n").unwrap().1).unwrap();
+    assert_eq!(call["params"]["arguments"]["q"], "big.rs");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn graph_hook_stays_silent_when_there_is_nothing_to_ask_or_nothing_to_say() {
+    let home = unique_dir("hook-silent");
+    let proj = home.join("proj");
+    std::fs::create_dir_all(proj.join(".git")).unwrap();
+    let big = proj.join("big.rs");
+    let small = proj.join("small.rs");
+    std::fs::write(&big, "x\n".repeat(301)).unwrap();
+    std::fs::write(&small, "x\n".repeat(10)).unwrap();
+    // Never answers: a call that reaches it would show as a connection.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    write_mcp_config(&home, listener.local_addr().unwrap().port());
+    let silent = [
+        ("a small file", read_event(&proj, &small, json!({}))),
+        ("a ranged read", read_event(&proj, &big, json!({ "offset": 10, "limit": 20 }))),
+        ("a missing file", read_event(&proj, &proj.join("nope.rs"), json!({}))),
+        ("a directory", read_event(&proj, &proj, json!({}))),
+        ("an unrelated tool", hook_event("Bash", "command", "ls")),
+        ("a pattern without a word", grep_event(&proj, r"\s*\(.*\)")),
+        ("no cwd", hook_event("Grep", "pattern", "foo_bar")),
+        ("malformed JSON", "{not json".to_string()),
+        ("a JSON array", "[1,2]".to_string()),
+        ("null", "null".to_string()),
+        ("empty input", String::new()),
+        ("a tool_input that is not an object", json!({ "tool_name": "Grep", "tool_input": "x", "cwd": proj }).to_string()),
+    ];
+    for (what, input) in silent {
+        assert_allowed(graph_hook(&home, &input), what);
+    }
+    assert!(listener.accept().is_err(), "the hook called the daemon for something it should have skipped");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn graph_hook_stays_silent_when_the_daemon_has_no_answer() {
+    let home = unique_dir("hook-nodaemon");
+    let proj = home.join("proj");
+    std::fs::create_dir_all(proj.join(".git")).unwrap();
+    let event = grep_event(&proj, "handle_request");
+
+    // No config file at all, and a config that is not JSON or has no server entry.
+    assert_allowed(graph_hook(&home.join("missing"), &event), "missing config");
+    std::fs::write(home.join("claude-mcp.json"), "garbage").unwrap();
+    assert_allowed(graph_hook(&home, &event), "garbage config");
+    std::fs::write(home.join("claude-mcp.json"), json!({ "mcpServers": {} }).to_string()).unwrap();
+    assert_allowed(graph_hook(&home, &event), "no feiyi entry");
+
+    // A daemon that is not listening.
+    write_mcp_config(&home, free_port());
+    assert_allowed(graph_hook(&home, &event), "connection refused");
+
+    for (what, status, body) in [
+        ("a tool error", "200 OK", mcp_text("code graph is off: set backup.codeGraph=true with backup.tursoUrl and backup.tursoToken", true)),
+        ("no match", "200 OK", mcp_text("nothing matches \"handle_request\" in /x\n", false)),
+        ("an empty answer", "200 OK", mcp_text("  \n", false)),
+        ("HTTP 401", "401 Unauthorized", "{\"error\":\"unauthorized\"}".to_string()),
+        ("HTTP 500", "500 Internal Server Error", mcp_text("boom", false)),
+        ("a body that is not JSON", "200 OK", "<html>".to_string()),
+        ("a JSON-RPC error", "200 OK", json!({ "jsonrpc": "2.0", "id": 1, "error": { "code": -32602, "message": "x" } }).to_string()),
+        ("a result without text", "200 OK", json!({ "jsonrpc": "2.0", "id": 1, "result": { "content": [] } }).to_string()),
+    ] {
+        let (listener, seen) = fake_mcp(status, body);
+        write_mcp_config(&home, listener.local_addr().unwrap().port());
+        assert_allowed(graph_hook(&home, &event), what);
+        seen.join().unwrap();
+    }
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn graph_hook_gives_up_on_a_daemon_that_never_replies() {
+    let home = unique_dir("hook-hang");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    write_mcp_config(&home, listener.local_addr().unwrap().port());
+    std::fs::create_dir_all(home.join(".git")).unwrap();
+    let holder = std::thread::spawn(move || {
+        let (s, _) = listener.accept().unwrap();
+        std::thread::sleep(Duration::from_secs(6));
+        drop(s);
+    });
+    let started = Instant::now();
+    assert_allowed(graph_hook(&home, &grep_event(&home, "handle_request")), "a hung daemon");
+    assert!(started.elapsed() < Duration::from_secs(5), "the hook took {:?}; its own timeout is 5 s", started.elapsed());
+    holder.join().unwrap();
+    let _ = std::fs::remove_dir_all(&home);
+}

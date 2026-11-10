@@ -11,6 +11,7 @@ mod egress;
 mod files;
 mod filewatch;
 mod git_actions;
+mod graph;
 mod guard;
 mod limits;
 mod manager;
@@ -93,6 +94,7 @@ fn main() {
     match args.first().map(String::as_str) {
         Some(token_saver::HOOK_CMD) => return token_saver::hook_main(),
         Some(guard::HOOK_CMD) => return guard::hook_main(),
+        Some(graph::HOOK_CMD) => return graph::hook_main(),
         Some(token_saver::RUN_CMD) => token_saver::run_main(&args[1..]),
         _ => {}
     }
@@ -143,6 +145,7 @@ async fn run(cfg: Config, identity: Arc<e2ee::DaemonIdentity>) {
     mcp::write_claude_config(&cfg);
     token_saver::write_claude_settings(&cfg);
     backup::spawn(&cfg, ctx.cmds.clone());
+    graph::configure(&cfg, ctx.cmds.clone());
     uploads::prune(&cfg.home);
     usage::load_prices(&cfg.home);
     tokio::spawn(usage::refresh_prices(cfg.home.clone()));

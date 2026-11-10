@@ -118,6 +118,11 @@ impl Manager {
             .collect()
     }
 
+    /// Directories of the workspaces that are not archived.
+    pub fn active_directories(&self) -> Vec<String> {
+        self.workspaces.iter().filter(|w| w.archived_at.is_none()).map(|w| w.directory.clone()).collect()
+    }
+
     /// Archive a workspace and its agents. Returns the archive timestamp.
     pub fn archive_workspace(&mut self, id: &str) -> Result<String, String> {
         let Some(idx) = self.workspaces.iter().position(|w| w.id == id) else {
@@ -137,6 +142,10 @@ impl Manager {
         self.workspaces[idx].archived_at = Some(now.clone());
         let root = self.workspaces[idx].project_root.clone();
         self.store.save_workspaces(&self.workspaces);
+        let dir = self.workspaces[idx].directory.clone();
+        if crate::graph::should_forget(&dir, &self.active_directories()) {
+            crate::graph::forget(&dir);
+        }
         let mut payload = json!({ "kind": "remove", "id": id });
         if !self.workspaces.iter().any(|w| w.archived_at.is_none() && w.project_root == root) {
             payload["emptyProject"] = project_descriptor(&root);

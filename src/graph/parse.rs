@@ -33,6 +33,9 @@ pub struct Parsed {
     pub lines: usize,
 }
 
+/// Symbols kept per file: a generated file must not blow up the rows or the memory of a build.
+pub const MAX_SYMBOLS: usize = 2000;
+
 const NOT_CALLS: [&str; 26] = [
     "if", "for", "while", "switch", "catch", "return", "else", "do", "try", "with", "new", "await", "match", "loop", "sizeof", "fn", "def", "function", "impl", "in", "and", "or", "not", "yield", "throw", "typeof",
 ];
@@ -302,6 +305,10 @@ pub fn parse(path: &Path, text: &str) -> Option<Parsed> {
         };
         scopes.push((d.indent, name.clone()));
         if kind == "impl" {
+            slots.push((None, Some(name)));
+            continue;
+        }
+        if out.symbols.len() >= MAX_SYMBOLS {
             slots.push((None, Some(name)));
             continue;
         }

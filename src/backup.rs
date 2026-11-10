@@ -73,6 +73,8 @@ pub struct BackupConfig {
     url: Option<String>,
     token: Option<String>,
     passphrase: Option<String>,
+    /// Keep the code graph (graph/mod.rs) in the same database; on unless `codeGraph` is false.
+    code_graph: bool,
     interval: Duration,
 }
 
@@ -144,6 +146,7 @@ impl BackupConfig {
             url: text("tursoUrl", &env.url),
             token: text("tursoToken", &env.token),
             passphrase: text("passphrase", &env.passphrase),
+            code_graph: section.and_then(|s| s.get("codeGraph")).and_then(Value::as_bool).unwrap_or(true),
             interval: Duration::from_secs(interval.clamp(60, 86_400)),
         }
     }
@@ -154,10 +157,15 @@ impl BackupConfig {
         Ok(Some(Ready { turso: Turso { host: host_of(url)?, token: token.clone() }, passphrase: passphrase.clone() }))
     }
 
-    /// The database alone, without the passphrase: the code graph (graph/mod.rs) keeps plain rows there.
+    /// The database alone, without the passphrase, when the code graph (graph/mod.rs) is on: it keeps plain rows there.
     pub(crate) fn turso(&self) -> Result<Option<Turso>, String> {
-        let (Some(url), Some(token)) = (&self.url, &self.token) else { return Ok(None) };
+        let (true, Some(url), Some(token)) = (self.code_graph, &self.url, &self.token) else { return Ok(None) };
         Ok(Some(Turso { host: host_of(url)?, token: token.clone() }))
+    }
+
+    /// The code graph is on: not switched off and the URL and token are set.
+    pub(crate) fn graph_enabled(&self) -> bool {
+        matches!(self.turso(), Ok(Some(_)))
     }
 
     /// For `daemon_status`: no secrets, only whether each is set.
@@ -167,6 +175,7 @@ impl BackupConfig {
             "urlSet": self.url.is_some(),
             "tokenSet": self.token.is_some(),
             "passphraseSet": self.passphrase.is_some(),
+            "codeGraph": self.code_graph,
             "intervalSecs": self.interval.as_secs(),
         })
     }
@@ -207,7 +216,7 @@ pub fn status() -> Value {
 
 /// The fixed text the app may see for a failure: no host, path or remote text.
 /// Unrecognised errors get a generic label, so a new error cannot leak by default.
-fn category(error: &str) -> String {
+pub(crate) fn category(error: &str) -> String {
     if let Some(code) = error.strip_prefix("turso returned HTTP ").and_then(|rest| rest.split(':').next()).and_then(|code| code.parse::<u16>().ok()) {
         return format!("http {code}");
     }
@@ -1320,6 +1329,17 @@ mod tests {
         assert!(shown.contains("\"tokenSet\":true") && !shown.contains("tok\"") && !shown.contains("pw"));
         assert_eq!(host_of("https://h.turso.io/").unwrap(), "h.turso.io");
         assert!(host_of("http://h.turso.io").is_err() && host_of("libsql://").is_err());
+    }
+
+    #[test]
+    fn code_graph_flag_is_on_by_default_and_switches_the_graph_off() {
+        let on = json!({ "tursoUrl": "libsql://db-org.turso.io", "tursoToken": "tok" });
+        assert!(BackupConfig::from_value(Some(&on), None).graph_enabled(), "no passphrase needed");
+        let off = json!({ "tursoUrl": "libsql://db-org.turso.io", "tursoToken": "tok", "codeGraph": false });
+        let cfg = BackupConfig::from_value(Some(&off), None);
+        assert!(!cfg.graph_enabled() && cfg.turso().unwrap().is_none());
+        assert_eq!(cfg.redacted()["codeGraph"], false);
+        assert!(!BackupConfig::from_value(None, None).graph_enabled(), "needs the URL and token");
     }
 
     fn sealed_bytes(sealed: &str) -> Vec<u8> {

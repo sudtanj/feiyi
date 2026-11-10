@@ -32,6 +32,8 @@ const IMPACT_DEPTH: usize = 8;
 const PATH_DEPTH: usize = 6;
 const MAX_FILES: usize = 4000;
 const MAX_FILE_BYTES: u64 = 200 * 1024;
+const MAX_DIRS: usize = 50_000;
+const MAX_LISTED: usize = 100_000;
 // The Turso free tier is the budget: a few projects, rows capped per project and in total, and nothing written on a scan that finds no change.
 const MAX_PROJECTS: usize = 12;
 const MAX_ROWS_PROJECT: usize = 80_000;
@@ -45,6 +47,11 @@ const FRESH: Duration = Duration::from_secs(30);
 const GIT_TIMEOUT: Duration = Duration::from_secs(30);
 const SKIP_DIRS: [&str; 5] = ["node_modules", "target", "dist", "build", "vendor"];
 const NO_DB: &str = "code graph needs backup.tursoUrl and backup.tursoToken";
+
+/// `Turso::run` with the failure reduced to a category: a response body never reaches a log or an agent.
+async fn db(turso: &Turso, stmts: Vec<Stmt>) -> Result<Vec<Vec<Vec<String>>>, String> {
+    turso.run(stmts).await.map_err(|e| format!("code graph database: {}", crate::backup::category(&e)))
+}
 
 const CREATE: [&str; 7] = [
     "CREATE TABLE IF NOT EXISTS feiyi_graph_projects(project TEXT PRIMARY KEY, root TEXT NOT NULL, updated_at INTEGER NOT NULL, used_at INTEGER NOT NULL)",
@@ -108,6 +115,7 @@ static PROJECTS: Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<Project>>>> = Mut
 static INFOS: Mutex<BTreeMap<String, Info>> = Mutex::new(BTreeMap::new());
 
 static TOTALS: Mutex<Option<(usize, usize)>> = Mutex::new(None);
+static BUILD: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 
 /// What the last stored row of a file says: the stat it was hashed at and
 /// `hash` = 16 hex of the content, 16 hex of the resolved edges.
@@ -123,6 +131,8 @@ struct Project {
     /// Listed in `feiyi_graph_projects` (so counted against `MAX_PROJECTS`) by this process.
     registered: bool,
     files: BTreeMap<String, Known>,
+    /// Files that exist but were left out by a row or symbol cap.
+    cut: BTreeSet<String>,
     scanned: Option<Instant>,
 }
 
@@ -248,6 +258,7 @@ fn resolve_import(index: &HashMap<String, Vec<(String, String)>>, importer: &str
 
 /// Nodes and edges of every file. A call resolves to the one symbol of that
 /// name in the repo, else to one in its own file, else it is dropped.
+// ponytail: resolution is quadratic-ish in files x imports and the first build runs inside the query that asked for it; index and background it when repos that size matter.
 fn resolve(files: &[(String, Parsed)]) -> Vec<FileGraph> {
     let ids: Vec<Vec<String>> = files.iter().map(|(path, p)| p.symbols.iter().map(|s| symbol_id(path, s)).collect()).collect();
     let mut by_name: HashMap<&str, Vec<(&str, &str)>> = HashMap::new();
@@ -324,13 +335,18 @@ async fn git_files(root: &Path) -> Option<Vec<String>> {
     let mut cmd = tokio::process::Command::new("git");
     cmd.args(["ls-files", "-z", "--cached", "--others", "--exclude-standard"]).current_dir(root).env("GIT_TERMINAL_PROMPT", "0").stdin(std::process::Stdio::null()).kill_on_drop(true);
     let out = tokio::time::timeout(GIT_TIMEOUT, cmd.output()).await.ok()?.ok()?;
-    out.status.success().then(|| out.stdout.split(|b| *b == 0).filter(|s| !s.is_empty()).map(|s| String::from_utf8_lossy(s).into_owned()).collect())
+    out.status.success().then(|| out.stdout.split(|b| *b == 0).filter(|s| !s.is_empty()).take(MAX_LISTED).map(|s| String::from_utf8_lossy(s).into_owned()).collect())
 }
 
 fn walk(root: &Path) -> Vec<String> {
     let mut found = Vec::new();
     let mut dirs = vec![root.to_path_buf()];
+    let mut visited = 0;
     while let Some(dir) = dirs.pop() {
+        visited += 1;
+        if visited > MAX_DIRS {
+            break;
+        }
         let Ok(entries) = std::fs::read_dir(&dir) else { continue };
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
@@ -345,30 +361,37 @@ fn walk(root: &Path) -> Vec<String> {
                 }
             }
         }
-        if found.len() > MAX_FILES {
+        if found.len() > MAX_LISTED {
             break;
         }
     }
     found
 }
 
-/// Source files of the project, sorted, at most `MAX_FILES`; true when more existed.
+/// Source files only, sorted by path (so the cut is the same every time), at most `MAX_FILES`; true when more existed.
+fn limit_files(mut paths: Vec<String>) -> (Vec<String>, bool) {
+    paths.retain(|p| !skipped(p) && crate::outline::lang(Path::new(p)).is_some());
+    paths.sort();
+    paths.dedup();
+    let truncated = paths.len() > MAX_FILES;
+    paths.truncate(MAX_FILES);
+    (paths, truncated)
+}
+
+/// Source files of the project (`limit_files`).
+/// (`walk` and `git ls-files` stop at `MAX_LISTED` entries and 50,000 directories, so a huge tree stays bounded.)
 async fn list_files(root: &Path) -> (Vec<String>, bool) {
     let listed = if root.join(".git").exists() { git_files(root).await } else { None };
-    let mut paths = match listed {
+    let paths = match listed {
         Some(paths) => paths,
         None => {
             let root = root.to_path_buf();
             tokio::task::spawn_blocking(move || walk(&root)).await.unwrap_or_default()
         }
     };
-    paths.retain(|p| !skipped(p) && crate::outline::lang(Path::new(p)).is_some());
-    paths.sort();
-    paths.dedup();
-    let truncated = paths.len() > MAX_FILES;
+    let (paths, truncated) = limit_files(paths);
     if truncated {
-        crate::warn!("code graph: {} has {} source files, indexing the first {MAX_FILES}", root.display(), paths.len());
-        paths.truncate(MAX_FILES);
+        crate::warn!("code graph: {} has more than {MAX_FILES} source files, indexing the first {MAX_FILES} by path", root.display());
     }
     (paths, truncated)
 }
@@ -387,7 +410,7 @@ fn scan(root: &Path, files: Vec<(String, Option<Known>)>, parse_all: bool) -> Ve
         .into_iter()
         .filter_map(|(path, known)| {
             let full = root.join(&path);
-            let meta = std::fs::metadata(&full).ok().filter(|m| m.is_file() && m.len() <= MAX_FILE_BYTES)?;
+            let meta = std::fs::symlink_metadata(&full).ok().filter(|m| m.is_file() && m.len() <= MAX_FILE_BYTES)?;
             let mtime = meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos() as u64);
             let stamp = (meta.len(), mtime);
             if let Some(known) = known.filter(|k| !parse_all && k.stamp == stamp) {
@@ -401,14 +424,22 @@ fn scan(root: &Path, files: Vec<(String, Option<Known>)>, parse_all: bool) -> Ve
         .collect()
 }
 
-async fn scan_all(root: &Path, st: &Project, paths: &[String], parse_all: bool) -> Result<Vec<Scanned>, String> {
-    let mut all = Vec::with_capacity(paths.len());
+/// Scan `paths` in chunks. With `parse_all`, stops once the parsed files hold more than `symbol_cap`
+/// symbols (true then), so a huge repo never sits in memory whole.
+async fn scan_all(root: &Path, st: &Project, paths: &[String], parse_all: bool, symbol_cap: usize) -> Result<(Vec<Scanned>, bool), String> {
+    let mut all = Vec::with_capacity(paths.len().min(CHUNK_FILES));
+    let mut symbols = 0;
     for chunk in paths.chunks(CHUNK_FILES) {
         let files: Vec<(String, Option<Known>)> = chunk.iter().map(|p| (p.clone(), if parse_all { None } else { st.files.get(p).cloned() })).collect();
         let root = root.to_path_buf();
-        all.extend(tokio::task::spawn_blocking(move || scan(&root, files, parse_all)).await.map_err(|e| format!("scan failed: {e}"))?);
+        let scanned = tokio::task::spawn_blocking(move || scan(&root, files, parse_all)).await.map_err(|e| format!("scan failed: {e}"))?;
+        symbols += scanned.iter().filter_map(|s| s.parsed.as_ref()).map(|p| p.symbols.len()).sum::<usize>();
+        all.extend(scanned);
+        if symbols > symbol_cap {
+            return Ok((all, true));
+        }
     }
-    Ok(all)
+    Ok((all, false))
 }
 
 // --- writing -----------------------------------------------------------------------------
@@ -463,7 +494,7 @@ impl Batcher {
 async fn load_known(turso: &Turso, key: &str, st: &mut Project) -> Result<(), String> {
     let mut stmts: Vec<Stmt> = CREATE.iter().map(|sql| Stmt { sql, args: vec![] }).collect();
     stmts.push(Stmt { sql: SELECT_FILES, args: vec![text(key)] });
-    let rows = turso.run(stmts).await?.pop().unwrap_or_default();
+    let rows = db(&turso, stmts).await?.pop().unwrap_or_default();
     st.files = rows
         .into_iter()
         .filter_map(|r| match <[String; 2]>::try_from(r) {
@@ -488,8 +519,11 @@ async fn build(turso: &Turso, key: &str, st: &mut Project, force: bool) -> Resul
     if !st.loaded || force {
         load_known(turso, key, st).await?;
     }
-    let seen = scan_all(&root, st, &paths, false).await?;
-    let unchanged = !force && seen.len() == st.files.len() && seen.iter().all(|s| st.files.get(&s.path).is_some_and(|k| k.hash[..16] == s.content));
+    let (seen, _) = scan_all(&root, st, &paths, false, usize::MAX).await?;
+    // Files cut by a row cap are not stored: they only have to be unchanged in number, so a capped project is not re-parsed every scan.
+    let unchanged = !force
+        && seen.len() == st.files.len() + st.cut.len()
+        && seen.iter().all(|s| st.files.get(&s.path).map_or_else(|| st.cut.contains(&s.path), |k| k.hash[..16] == s.content));
     if unchanged {
         for s in seen {
             if let Some(k) = st.files.get_mut(&s.path) {
@@ -505,16 +539,18 @@ async fn build(turso: &Turso, key: &str, st: &mut Project, force: bool) -> Resul
 
     let mut stamps: BTreeMap<String, ((u64, u64), String)> = BTreeMap::new();
     let mut files = Vec::new();
-    for s in scan_all(&root, st, &paths, true).await? {
+    let (scanned, cut_early) = scan_all(&root, st, &paths, true, MAX_ROWS_PROJECT).await?;
+    for s in scanned {
         if let Some(parsed) = s.parsed {
             stamps.insert(s.path.clone(), (s.stamp, s.content));
             files.push((s.path, parsed));
         }
     }
     let (graphs, capped) = tokio::task::spawn_blocking(move || resolve_capped(files, MAX_ROWS_PROJECT)).await.map_err(|e| format!("resolve failed: {e}"))?;
-    let truncated = truncated || capped;
+    let truncated = truncated || capped || cut_early;
+    let rows: usize = graphs.iter().map(|g| g.nodes.len() + g.edges.len()).sum();
     if !st.registered {
-        register(turso, key, st).await?;
+        register(turso, key, st, rows).await?;
     }
 
     let mut next: BTreeMap<String, Known> = BTreeMap::new();
@@ -526,25 +562,26 @@ async fn build(turso: &Turso, key: &str, st: &mut Project, force: bool) -> Resul
         if force || st.files.get(&g.path).map_or(true, |k| k.hash != hash) {
             rewritten += 1;
             for batch in batcher.add(file_statements(key, g, &hash)) {
-                turso.run(batch).await?;
+                db(&turso, batch).await?;
             }
         }
         next.insert(g.path.clone(), Known { stamp: *stamp, hash });
     }
     for path in st.files.keys().filter(|p| !next.contains_key(*p)) {
         for batch in batcher.add(gone_statements(key, path)) {
-            turso.run(batch).await?;
+            db(&turso, batch).await?;
         }
     }
     if rewritten > 0 {
         for batch in batcher.add(vec![upsert_project(key)]) {
-            turso.run(batch).await?;
+            db(&turso, batch).await?;
         }
     }
     let rest = std::mem::take(&mut batcher.pending);
     if !rest.is_empty() {
-        turso.run(rest).await?;
+        db(&turso, rest).await?;
     }
+    st.cut = seen.iter().map(|s| s.path.clone()).filter(|p| !next.contains_key(p)).collect();
     st.files = next;
     st.scanned = Some(Instant::now());
 
@@ -568,11 +605,18 @@ async fn ensure(dir: &str, force: bool) -> Result<(Turso, String), String> {
     }
     let key = root.to_string_lossy().into_owned();
     let project = PROJECTS.lock().map_err(|_| "code graph state is poisoned")?.entry(key.clone()).or_default().clone();
-    let mut st = project.lock().await;
-    if force || st.scanned.map_or(true, |t| t.elapsed() > FRESH) {
-        build(&turso, &key, &mut st, force).await?;
+    let stale = |st: &Project| force || st.scanned.map_or(true, |t| t.elapsed() > FRESH);
+    if stale(&*project.lock().await) {
+        // One build at a time in the process; waiting for the permit before the project lock keeps `register`
+        // (which waits for a victim's lock while holding the permit) from deadlocking with a build.
+        let _permit = BUILD.acquire().await.map_err(|_| "code graph builds are stopped")?;
+        let mut st = project.lock().await;
+        if stale(&st) {
+            build(&turso, &key, &mut st, force).await?;
+        }
     }
     Ok((turso, key))
+}
 }
 
 // --- capacity and cleanup ---------------------------------------------------------------------
@@ -603,7 +647,7 @@ fn forget_statements(key: &str) -> Vec<Stmt> {
 async fn run_all(turso: &Turso, mut stmts: Vec<Stmt>) -> Result<(), String> {
     while !stmts.is_empty() {
         let rest = if stmts.len() > BATCH { stmts.split_off(BATCH) } else { Vec::new() };
-        turso.run(std::mem::replace(&mut stmts, rest)).await?;
+        db(&turso, std::mem::replace(&mut stmts, rest)).await?;
     }
     Ok(())
 }
@@ -616,25 +660,53 @@ fn forget_memory(key: &str) -> Option<Arc<tokio::sync::Mutex<Project>>> {
     PROJECTS.lock().ok().and_then(|mut p| p.remove(key))
 }
 
-/// The projects to drop, least recently used first, so `project` fits under `max` projects.
-fn evict_for(listed: &[(String, i64)], project: &str, max: usize) -> Vec<String> {
-    if listed.iter().any(|(p, _)| p == project) {
-        return Vec::new();
+/// The projects to drop, least recently used first, so `project` writing `incoming` rows fits
+/// `max_projects` and `max_rows` (its own stored rows are replaced, so they do not count).
+fn evict_for(stored: &[Stored], project: &str, incoming: usize, max_projects: usize, max_rows: usize) -> Vec<String> {
+    let mut others: Vec<&Stored> = stored.iter().filter(|s| s.project != project).collect();
+    others.sort_by(|a, b| a.used_at.cmp(&b.used_at).then_with(|| a.project.cmp(&b.project)));
+    let mut rows: usize = others.iter().map(|s| s.rows).sum();
+    let mut count = others.len();
+    let mut victims = Vec::new();
+    for s in others {
+        if count < max_projects && rows + incoming <= max_rows {
+            break;
+        }
+        rows -= s.rows;
+        count -= 1;
+        victims.push(s.project.clone());
     }
-    let mut by_use: Vec<&(String, i64)> = listed.iter().collect();
-    by_use.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
-    let excess = (listed.len() + 1).saturating_sub(max);
-    by_use.into_iter().take(excess).map(|(p, _)| p.clone()).collect()
+    victims
+}
+
+/// The registry rows joined with their row counts; rows of a project nobody registered are orphans: no root, never used.
+fn stored_projects(listed: &[Vec<String>], node_rows: &[Vec<String>], edge_rows: &[Vec<String>]) -> Vec<Stored> {
+    let mut stored: BTreeMap<String, Stored> = BTreeMap::new();
+    for r in listed {
+        if let [project, root, used_at] = r.as_slice() {
+            stored.insert(project.clone(), Stored { project: project.clone(), root: root.clone(), used_at: used_at.parse().unwrap_or(0), rows: 0 });
+        }
+    }
+    for r in node_rows.iter().chain(edge_rows) {
+        if let [project, count] = r.as_slice() {
+            stored.entry(project.clone()).or_insert_with(|| Stored { project: project.clone(), root: String::new(), used_at: 0, rows: 0 }).rows += count.parse().unwrap_or(0);
+        }
+    }
+    stored.into_values().collect()
 }
 
 /// Add the project to `feiyi_graph_projects`, first evicting the least recently used ones when it would be one too many.
-async fn register(turso: &Turso, key: &str, st: &mut Project) -> Result<(), String> {
-    let rows = turso.run(vec![Stmt { sql: SELECT_PROJECTS, args: vec![] }]).await?.pop().unwrap_or_default();
-    let listed: Vec<(String, i64)> = rows.iter().filter_map(|r| Some((r.first()?.clone(), r.get(2)?.parse().ok()?))).collect();
+async fn register(turso: &Turso, key: &str, st: &mut Project, incoming: usize) -> Result<(), String> {
+    let stmts = Vec::from([SELECT_PROJECTS, ROWS_PER_PROJECT[0], ROWS_PER_PROJECT[1]].map(|sql| Stmt { sql, args: vec![] }));
+    let mut rows = db(turso, stmts).await?;
+    let (edge_rows, node_rows, listed) = (rows.pop().unwrap_or_default(), rows.pop().unwrap_or_default(), rows.pop().unwrap_or_default());
+    let stored = stored_projects(&listed, &node_rows, &edge_rows);
     let mut stmts = Vec::new();
-    for victim in evict_for(&listed, key, MAX_PROJECTS) {
-        crate::log!("code graph: evicting {victim}, the least recently used of {MAX_PROJECTS} projects");
-        forget_memory(&victim);
+    for victim in evict_for(&stored, key, incoming, MAX_PROJECTS, MAX_ROWS_TOTAL) {
+        crate::log!("code graph: evicting {victim}, the least recently used, to stay under {MAX_PROJECTS} projects and {MAX_ROWS_TOTAL} rows");
+        if let Some(running) = forget_memory(&victim) {
+            drop(running.lock().await);
+        }
         stmts.extend(forget_statements(&victim));
     }
     stmts.push(upsert_project(key));
@@ -645,6 +717,10 @@ async fn register(turso: &Turso, key: &str, st: &mut Project) -> Result<(), Stri
 
 /// Whether archiving a workspace on `dir` leaves nobody else on the same directory.
 pub fn should_forget(dir: &str, active_dirs: &[String]) -> bool {
+    DB.get().is_some() && unused(dir, active_dirs)
+}
+
+fn unused(dir: &str, active_dirs: &[String]) -> bool {
     let key = key_of(dir);
     !active_dirs.iter().any(|a| key_of(a) == key)
 }
@@ -658,9 +734,10 @@ pub fn forget(dir: &str) {
         if let Some(project) = running {
             drop(project.lock().await);
         }
-        match run_all(&turso, forget_statements(&key)).await {
+        let mut stmts: Vec<Stmt> = CREATE.iter().map(|sql| Stmt { sql, args: vec![] }).collect();
+        stmts.extend(forget_statements(&key));
+        match run_all(&turso, stmts).await {
             Ok(()) => crate::log!("code graph: forgot {key}"),
-            Err(e) if e.contains("no such table") => {}
             Err(e) => crate::warn!("code graph: cannot forget {key}: {e}"),
         }
     });
@@ -711,21 +788,9 @@ async fn sweep(cmds: &tokio::sync::mpsc::UnboundedSender<Cmd>) -> Result<String,
 
     let mut stmts: Vec<Stmt> = CREATE.iter().map(|sql| Stmt { sql, args: vec![] }).collect();
     stmts.extend([SELECT_PROJECTS, ROWS_PER_PROJECT[0], ROWS_PER_PROJECT[1]].map(|sql| Stmt { sql, args: vec![] }));
-    let mut rows = turso.run(stmts).await?;
+    let mut rows = db(&turso, stmts).await?;
     let (edge_rows, node_rows, listed) = (rows.pop().unwrap_or_default(), rows.pop().unwrap_or_default(), rows.pop().unwrap_or_default());
-    let mut stored: BTreeMap<String, Stored> = BTreeMap::new();
-    for r in &listed {
-        if let [project, root, used_at] = r.as_slice() {
-            stored.insert(project.clone(), Stored { project: project.clone(), root: root.clone(), used_at: used_at.parse().unwrap_or(0), rows: 0 });
-        }
-    }
-    for r in node_rows.iter().chain(&edge_rows) {
-        if let [project, count] = r.as_slice() {
-            // Rows of a project nobody registered are orphans: no root, so they go.
-            stored.entry(project.clone()).or_insert_with(|| Stored { project: project.clone(), root: String::new(), used_at: 0, rows: 0 }).rows += count.parse().unwrap_or(0);
-        }
-    }
-    let stored: Vec<Stored> = stored.into_values().collect();
+    let stored = stored_projects(&listed, &node_rows, &edge_rows);
     let victims = sweep_victims(&stored, now_secs(), &active, |root| Path::new(root).exists());
     let mut delete = Vec::new();
     for v in &victims {
@@ -793,7 +858,7 @@ pub async fn query(dir: &str, q: &str, depth: usize, budget: usize) -> Result<St
     let (turso, key) = ensure(dir, false).await?;
     let (pattern, depth) = (format!("%{}%", like_escape(q)), depth.clamp(1, MAX_DEPTH) as i64);
     let reach = || vec![text(&key), text(&pattern), text(&pattern), text(&key), int(depth), text(&key), int(depth), text(&key)];
-    let mut rows = turso.run(vec![touch(&key), Stmt { sql: QUERY_NODES, args: reach() }, Stmt { sql: QUERY_EDGES, args: reach() }]).await?;
+    let mut rows = db(&turso, vec![touch(&key), Stmt { sql: QUERY_NODES, args: reach() }, Stmt { sql: QUERY_EDGES, args: reach() }]).await?;
     let edges = rows.pop().unwrap_or_default();
     let nodes = rows.pop().unwrap_or_default();
     if nodes.is_empty() {
@@ -816,7 +881,7 @@ pub async fn impact(dir: &str, symbol: &str, budget: usize) -> Result<String, St
     }
     let (turso, key) = ensure(dir, false).await?;
     let args = vec![text(&key), text(symbol), text(symbol), text(&key), int(IMPACT_DEPTH as i64), text(&key)];
-    let rows = turso.run(vec![touch(&key), Stmt { sql: IMPACT, args }]).await?.pop().unwrap_or_default();
+    let rows = db(&turso, vec![touch(&key), Stmt { sql: IMPACT, args }]).await?.pop().unwrap_or_default();
     let (targets, callers): (Vec<_>, Vec<_>) = rows.iter().partition(|r| r[5] == "0");
     if targets.is_empty() {
         return Ok(format!("no symbol named {symbol} in {key}\n"));
@@ -878,7 +943,7 @@ pub async fn path(dir: &str, from: &str, to: &str) -> Result<String, String> {
     }
     let (turso, key) = ensure(dir, false).await?;
     let find = |name: &str| Stmt { sql: FIND_NODE, args: vec![text(&key), text(name), text(name), text(name)] };
-    let mut found = turso.run(vec![touch(&key), find(from), find(to)]).await?;
+    let mut found = db(&turso, vec![touch(&key), find(from), find(to)]).await?;
     let ends: HashSet<String> = found.pop().unwrap_or_default().into_iter().flatten().collect();
     let starts: Vec<String> = found.pop().unwrap_or_default().into_iter().flatten().collect();
     if starts.is_empty() || ends.is_empty() {
@@ -894,7 +959,7 @@ pub async fn path(dir: &str, from: &str, to: &str) -> Result<String, String> {
             break;
         }
         let ids = json!(frontier).to_string();
-        let rows = turso.run(vec![Stmt { sql: NEIGHBOURS, args: vec![text(&key), text(&ids), text(&ids)] }]).await?.pop().unwrap_or_default();
+        let rows = db(&turso, vec![Stmt { sql: NEIGHBOURS, args: vec![text(&key), text(&ids), text(&ids)] }]).await?.pop().unwrap_or_default();
         frontier = advance(&frontier, &rows, &mut reached);
     }
     Ok(format!("no path from {from} to {to} within {PATH_DEPTH} edges\n"))
@@ -904,7 +969,7 @@ pub async fn path(dir: &str, from: &str, to: &str) -> Result<String, String> {
 pub async fn report(dir: &str) -> Result<String, String> {
     let (turso, key) = ensure(dir, false).await?;
     let one = |sql| Stmt { sql, args: vec![text(&key)] };
-    let mut rows = turso.run(vec![touch(&key), one(COUNT_ALL[0]), one(COUNT_ALL[1]), one(COUNT_ALL[2]), one(COUNT_FILES), one(COUNT_SYMBOLS), one(COUNT_EDGES), one("SELECT path FROM feiyi_graph_files WHERE project = ?"), Stmt { sql: GOD_NODES, args: vec![text(&key), text(&key)] }]).await?;
+    let mut rows = db(&turso, vec![touch(&key), one(COUNT_ALL[0]), one(COUNT_ALL[1]), one(COUNT_ALL[2]), one(COUNT_FILES), one(COUNT_SYMBOLS), one(COUNT_EDGES), one("SELECT path FROM feiyi_graph_files WHERE project = ?"), Stmt { sql: GOD_NODES, args: vec![text(&key), text(&key)] }]).await?;
     let gods = rows.pop().unwrap_or_default();
     let paths = rows.pop().unwrap_or_default();
     let edge_kinds = rows.pop().unwrap_or_default();
@@ -1079,19 +1144,61 @@ mod tests {
         assert_eq!(query("/tmp", "x", 2, 100).await.unwrap_err(), NO_DB);
         assert_eq!(rebuild("/tmp").await.unwrap_err(), NO_DB);
         assert_eq!(status()["enabled"], false);
+        assert!(!should_forget("/tmp", &[]), "no database: nothing to forget, no canonicalizing");
     }
 
-    fn listed(items: &[(&str, i64)]) -> Vec<(String, i64)> {
-        items.iter().map(|(p, t)| (p.to_string(), *t)).collect()
+    fn stored(items: &[(&str, i64, usize)]) -> Vec<Stored> {
+        items.iter().map(|(p, used, rows)| Stored { project: p.to_string(), root: p.to_string(), used_at: *used, rows: *rows }).collect()
     }
 
     #[test]
     fn a_new_project_evicts_the_least_recently_used_ones() {
-        let all = listed(&[("/c", 30), ("/a", 10), ("/b", 20)]);
-        assert_eq!(evict_for(&all, "/new", 3), ["/a"]);
-        assert_eq!(evict_for(&all, "/new", 2), ["/a", "/b"]);
-        assert!(evict_for(&all, "/new", 4).is_empty());
-        assert!(evict_for(&all, "/b", 1).is_empty(), "already listed");
+        let all = stored(&[("/c", 30, 1), ("/a", 10, 1), ("/b", 20, 1)]);
+        assert_eq!(evict_for(&all, "/new", 1, 4, 100), Vec::<String>::new());
+        assert_eq!(evict_for(&all, "/new", 1, 3, 100), ["/a"]);
+        assert_eq!(evict_for(&all, "/new", 1, 2, 100), ["/a", "/b"]);
+        assert!(evict_for(&all, "/b", 1, 3, 100).is_empty(), "already listed, replaced in place");
+    }
+
+    #[test]
+    fn the_total_row_cap_evicts_least_recently_used_projects_at_write_time() {
+        let all = stored(&[("/old", 10, 300), ("/mid", 20, 50), ("/self", 5, 900), ("/new", 30, 40)]);
+        // /self is rewritten, so its 900 rows do not count; 390 stored + 100 incoming > 400.
+        assert_eq!(evict_for(&all, "/self", 100, 12, 400), ["/old"]);
+        assert_eq!(evict_for(&all, "/self", 100, 12, 600), Vec::<String>::new());
+        assert_eq!(evict_for(&all, "/self", 380, 12, 400), ["/old", "/mid", "/new"]);
+    }
+
+    #[test]
+    fn files_are_cut_by_path_not_by_discovery_order() {
+        let mut paths: Vec<String> = (0..MAX_FILES + 5).rev().map(|i| format!("src/f{i:05}.rs")).collect();
+        paths.push("notes.txt".into());
+        paths.push("node_modules/x/a.js".into());
+        let (kept, cut) = limit_files(paths);
+        assert!(cut && kept.len() == MAX_FILES);
+        assert_eq!(kept[0], "src/f00000.rs");
+        assert_eq!(kept[MAX_FILES - 1], format!("src/f{:05}.rs", MAX_FILES - 1));
+    }
+
+    #[test]
+    fn a_file_keeps_at_most_the_symbol_cap() {
+        let src: String = (0..parse::MAX_SYMBOLS + 50).map(|i| format!("fn f{i}() {{}}\n")).collect();
+        let (_, p) = parsed("big.rs", &src);
+        assert_eq!(p.symbols.len(), parse::MAX_SYMBOLS);
+    }
+
+    #[test]
+    fn a_scan_ignores_symlinks_and_oversized_files() {
+        let dir = std::env::temp_dir().join(format!("graph-scan-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("real.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(dir.join("big.rs"), "x".repeat(MAX_FILE_BYTES as usize + 1)).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(dir.join("real.rs"), dir.join("link.rs")).unwrap();
+        let names = ["real.rs", "big.rs", "link.rs"].map(|p| (p.to_string(), None));
+        let found: Vec<String> = scan(&dir, names.to_vec(), true).into_iter().map(|s| s.path).collect();
+        assert_eq!(found, ["real.rs"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1117,9 +1224,9 @@ mod tests {
         let alias = base.join("alias");
         std::os::unix::fs::symlink(&real, &alias).unwrap();
         let (real, alias) = (real.to_string_lossy().into_owned(), alias.to_string_lossy().into_owned());
-        assert!(should_forget(&real, &[]));
-        assert!(should_forget(&real, &["/somewhere/else".to_string()]));
-        assert!(!should_forget(&real, &[alias]), "the same canonical directory is still in use");
+        assert!(unused(&real, &[]));
+        assert!(unused(&real, &["/somewhere/else".to_string()]));
+        assert!(!unused(&real, &[alias]), "the same canonical directory is still in use");
         let _ = std::fs::remove_dir_all(&base);
     }
 

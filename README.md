@@ -312,7 +312,9 @@ Ported from zilong-router's Token Saver (9router's page of the same name). zilon
 
 ## Code graph
 
-feiyi keeps a graph of each project's code: files and symbols as nodes, calls and imports as edges. It is built per project directory and stored as plain rows in the backup Turso database, so it needs `backup.tursoUrl` and `backup.tursoToken`. Without them every graph tool answers "code graph needs backup.tursoUrl and backup.tursoToken". The graph is built on first use and refreshed when files change.
+feiyi keeps a graph of each project's code: files and symbols as nodes, calls and imports as edges. It is built per project directory and stored as plain rows in the backup Turso database, so it needs `backup.tursoUrl` and `backup.tursoToken`. Without them every graph tool answers "code graph needs backup.tursoUrl and backup.tursoToken".
+
+**The graph rows are stored unencrypted**, unlike the encrypted backup items: file paths, symbol names and line ranges are readable by anyone with access to the database. Set `"codeGraph": false` in the `backup` section of `daemon-config.json` to turn the graph off (the tools then answer with the same error and the Grep/Read hook is not installed). It is on by default whenever the Turso URL and token are set; no passphrase is needed. The database stays small: at most 12 projects, 80,000 rows per project and 400,000 rows in total, least recently used projects evicted first, and a project's rows are deleted when its last workspace is archived or, in a daily sweep, when its directory is gone or unused for 14 days. The graph is built on first use and refreshed when files change.
 
 The `feiyi` MCP server (see [MCP: feiyi](#mcp-feiyi)) has five tools for it, each taking the project directory as `dir`:
 

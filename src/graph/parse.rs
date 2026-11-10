@@ -436,4 +436,140 @@ mod tests {
         assert!(p.calls[0].owner.is_none() && p.calls[0].name == "setup");
         assert!(parse(Path::new("README.md"), "x").is_none());
     }
+
+    const FILES: [&str; 7] = ["a.rs", "a.py", "a.go", "a.ts", "a.js", "a.c", "a.sh"];
+
+    #[test]
+    fn an_empty_file_has_no_symbols_calls_or_imports() {
+        for file in FILES {
+            let p = run(file, "");
+            assert!(p.symbols.is_empty() && p.calls.is_empty() && p.imports.is_empty() && p.lines == 0, "{file}");
+        }
+    }
+
+    #[test]
+    fn a_file_of_only_comments_has_no_symbols_or_calls() {
+        let cases = [("a.rs", "// fn ghost() {}\n/// helper(1)\n"), ("a.py", "# def ghost():\n# helper(1)\n"), ("a.ts", "// function ghost() {}\n// helper(1)\n"), ("a.go", "// func ghost() {}\n// helper(1)\n"), ("a.c", "// int ghost(void) {}\n// helper(1)\n"), ("a.sh", "# ghost() {\n# helper 1\n")];
+        for (file, src) in cases {
+            let p = run(file, src);
+            assert!(p.symbols.is_empty() && p.calls.is_empty(), "{file}: {:?}", names(&p));
+        }
+    }
+
+    #[test]
+    fn bytes_that_are_not_utf8_parse_as_lossy_text() {
+        let mut bytes = b"fn before() {}\n// \xff\xfe\xc3\x28 broken\nfn after() {\n    call_me(\"\xe2\x82\");\n}\n".to_vec();
+        bytes.extend_from_slice(&[0, 0x80, 0xff]);
+        let p = run("a.rs", &String::from_utf8_lossy(&bytes));
+        assert_eq!(names(&p), ["fn before", "fn after"]);
+        assert!(called(&p, "after").is_empty(), "the call is inside a string");
+    }
+
+    #[test]
+    fn a_very_long_line_parses_without_blowing_up() {
+        let line = format!("fn big() {{ {} }}\n", "call_one(1); ".repeat(200_000));
+        for file in ["a.rs", "a.ts", "a.py", "a.c"] {
+            let started = std::time::Instant::now();
+            let p = run(file, &format!("{line}fn after() {{}}\n"));
+            assert!(started.elapsed().as_secs() < 10, "{file} took {:?}", started.elapsed());
+            assert!(p.symbols.len() <= MAX_SYMBOLS && p.lines == 2, "{file}");
+        }
+        let p = run("a.rs", &line);
+        assert_eq!(called(&p, "big").iter().filter(|c| *c == "call_one").count(), 1, "a name is recorded once per owner");
+    }
+
+    #[test]
+    fn a_line_of_multibyte_characters_does_not_split_a_character() {
+        for file in ["a.rs", "a.py", "a.go", "a.ts", "a.c", "a.sh"] {
+            let src = "\u{e9}\u{4e2d}\u{1f600}fn(\n\u{e9}() {\n  \u{1f600}x(\u{4e2d})\n}\nimport \"\u{e9}\"\nfunc \u{4e2d}() {}\ndef \u{e9}():\n";
+            let _ = run(file, src);
+        }
+    }
+
+    #[test]
+    fn nested_functions_belong_to_the_enclosing_one() {
+        let p = run("a.rs", "fn outer() {\n    fn inner() {\n        leaf();\n    }\n    inner();\n}\n");
+        assert_eq!(p.symbols.len(), 2);
+        assert_eq!((p.symbols[0].name.as_str(), p.symbols[0].parent.clone()), ("outer", None));
+        assert_eq!((p.symbols[1].name.as_str(), p.symbols[1].parent.as_deref()), ("inner", Some("outer")));
+        assert_eq!(called(&p, "inner"), ["leaf"]);
+        assert_eq!(called(&p, "outer"), ["inner"]);
+        let p = run("a.py", "def outer():\n    def inner():\n        leaf()\n    inner()\n");
+        assert_eq!(p.symbols.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["outer", "inner"]);
+        let p = run("a.js", "function outer() {\n  function inner() {\n    leaf();\n  }\n  inner();\n}\n");
+        assert_eq!(p.symbols.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["outer", "inner"]);
+    }
+
+    #[test]
+    fn rust_impl_methods_and_trait_impls_belong_to_their_type() {
+        let src = "struct Repo;\n\nimpl Repo {\n    pub fn open() -> Repo {\n        Repo\n    }\n    pub(crate) async fn save(&self) {\n        self.flush();\n    }\n}\n\nimpl<T: Clone> From<T> for Repo {\n    fn from(t: T) -> Repo {\n        Repo::open()\n    }\n}\n\ntrait Store {\n    fn put(&self);\n}\n";
+        let p = run("a.rs", src);
+        let n = names(&p);
+        for expected in ["struct Repo", "method Repo.open", "method Repo.save", "method Repo.from", "trait Store"] {
+            assert!(n.contains(&expected.to_string()), "{expected} missing from {n:?}");
+        }
+        assert!(called(&p, "from").contains(&"Repo".to_string()));
+        assert!(called(&p, "save").contains(&"flush".to_string()));
+    }
+
+    #[test]
+    fn script_arrow_functions_and_consts_are_symbols() {
+        let src = "export const handler = async (req) => {\n  run(req);\n};\n\nconst add = (a, b) => a + b;\nlet counter = 0;\n";
+        let p = run("a.ts", src);
+        let n = names(&p);
+        assert!(n.contains(&"const handler".to_string()), "{n:?}");
+        assert!(called(&p, "handler").contains(&"run".to_string()));
+    }
+
+    #[test]
+    fn python_decorated_functions_and_classes_are_symbols() {
+        let src = "@app.route(\"/x\")\ndef view():\n    pass\n\n@dataclass\nclass Item:\n    @staticmethod\n    def make():\n        pass\n\n    @property\n    def size(self):\n        return len(self.parts)\n";
+        let p = run("a.py", src);
+        assert_eq!(names(&p), ["fn view", "class Item", "method Item.make", "method Item.size"]);
+        assert!(called(&p, "size").contains(&"len".to_string()));
+    }
+
+    #[test]
+    fn go_methods_with_value_pointer_and_generic_receivers() {
+        let src = "package x\n\nfunc (r Repo) Get(id int) int {\n\treturn load(id)\n}\n\nfunc (r *Repo) Put() {}\n\nfunc (r *Cache[K, V]) Evict() {\n\tdrop()\n}\n\nfunc Map[T any](xs []T) []T {\n\treturn xs\n}\n";
+        let p = run("a.go", src);
+        let n: Vec<&str> = p.symbols.iter().map(|s| s.name.as_str()).collect();
+        for expected in ["Get", "Put", "Evict", "Map"] {
+            assert!(n.contains(&expected), "{expected} missing from {n:?}");
+        }
+        assert!(called(&p, "Get").contains(&"load".to_string()));
+        assert!(called(&p, "Evict").contains(&"drop".to_string()));
+    }
+
+    #[test]
+    fn every_language_keeps_at_most_the_symbol_cap() {
+        let count = MAX_SYMBOLS + 500;
+        let sources = [
+            ("a.py", (0..count).map(|i| format!("def f{i}():\n    pass\n")).collect::<String>()),
+            ("a.go", (0..count).map(|i| format!("func f{i}() {{}}\n")).collect::<String>()),
+            ("a.ts", (0..count).map(|i| format!("function f{i}() {{}}\n")).collect::<String>()),
+            ("a.c", (0..count).map(|i| format!("int f{i}(void)\n{{\n}}\n")).collect::<String>()),
+            ("a.sh", (0..count).map(|i| format!("f{i}() {{\n  :\n}}\n")).collect::<String>()),
+            ("a.py", format!("class K:\n{}", (0..count).map(|i| format!("    def m{i}(self):\n        pass\n")).collect::<String>())),
+            ("a.rs", format!("impl K {{\n{}}}\n", (0..count).map(|i| format!("    fn m{i}(&self) {{}}\n")).collect::<String>())),
+        ];
+        for (file, src) in &sources {
+            let p = run(file, src);
+            assert!(p.symbols.len() <= MAX_SYMBOLS, "{file}: {}", p.symbols.len());
+        }
+        for (file, src) in &sources[..3] {
+            assert_eq!(run(file, src).symbols.len(), MAX_SYMBOLS, "{file} stops at the cap, not before");
+        }
+        let p = run("a.rs", &sources[6].1);
+        assert_eq!(p.symbols.len(), MAX_SYMBOLS);
+        assert!(p.symbols.iter().all(|s| s.parent.as_deref() == Some("K")));
+    }
+
+    #[test]
+    fn symbols_past_the_cap_still_record_their_calls_without_an_owner_index_out_of_range() {
+        let src: String = (0..MAX_SYMBOLS + 5).map(|i| format!("fn f{i}() {{\n    callee{i}();\n}}\n")).collect();
+        let p = run("a.rs", &src);
+        assert_eq!(p.symbols.len(), MAX_SYMBOLS);
+        assert!(p.calls.iter().all(|c| c.owner.map_or(true, |o| o < p.symbols.len())));
+    }
 }

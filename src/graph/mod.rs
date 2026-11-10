@@ -1262,4 +1262,91 @@ mod tests {
         assert_eq!(kept.iter().map(|g| g.path.as_str()).collect::<Vec<_>>(), ["a.rs"]);
         assert!(kept[0].edges.is_empty(), "b.rs is out, so is the edge into it");
     }
+
+    #[test]
+    fn like_patterns_escape_wildcards_and_the_escape_itself() {
+        assert_eq!(like_escape("a_b%c\\d"), "a\\_b\\%c\\\\d");
+        assert_eq!(like_escape("plain"), "plain");
+    }
+
+    #[test]
+    fn budgets_are_clamped_and_a_cut_says_how_many_lines_are_left() {
+        assert_eq!((budget_of(0), budget_of(8000), budget_of(usize::MAX)), (500, 8000, 200_000));
+        let lines: Vec<String> = (0..5).map(|i| format!("line {i}")).collect();
+        assert_eq!(fit(&lines, 100), "line 0\nline 1\nline 2\nline 3\nline 4\n");
+        assert_eq!(fit(&lines, 14), "line 0\nline 1\n… cut at 14 characters, 3 more lines\n");
+        assert_eq!(fit(&[], 10), "");
+    }
+
+    #[test]
+    fn an_unregistered_project_with_rows_is_an_orphan_and_bad_counts_are_zero() {
+        let listed = vec![vec!["/a".to_string(), "/a".to_string(), "50".to_string()], vec!["/bad".to_string(), "/bad".to_string(), "x".to_string()], vec!["short".to_string()]];
+        let nodes = vec![vec!["/a".to_string(), "3".to_string()], vec!["/orphan".to_string(), "7".to_string()]];
+        let edges = vec![vec!["/a".to_string(), "4".to_string()], vec!["/orphan".to_string(), "oops".to_string()]];
+        let all = stored_projects(&listed, &nodes, &edges);
+        let find = |p: &str| all.iter().find(|s| s.project == p).unwrap();
+        assert_eq!((find("/a").rows, find("/a").used_at, find("/a").root.as_str()), (7, 50, "/a"));
+        assert_eq!((find("/bad").rows, find("/bad").used_at), (0, 0));
+        assert_eq!((find("/orphan").rows, find("/orphan").used_at, find("/orphan").root.as_str()), (7, 0, ""));
+        assert_eq!(all.len(), 3, "a registry row of the wrong width is ignored");
+    }
+
+    #[test]
+    fn orphans_are_swept_first_because_their_root_is_empty_and_never_exists() {
+        let all = vec![Stored { project: "/orphan".into(), root: String::new(), used_at: 0, rows: 5 }, Stored { project: "/ok".into(), root: "/ok".into(), used_at: 10, rows: 5 }];
+        let victims = sweep_victims(&all, 11, &HashSet::new(), |root| !root.is_empty());
+        assert_eq!(victims, ["/orphan"]);
+        let active = HashSet::from(["/orphan".to_string()]);
+        assert_eq!(sweep_victims(&all, 11, &active, |root| !root.is_empty()), ["/orphan"], "an orphan has no root on disk, active or not");
+    }
+
+    #[test]
+    fn the_idle_limit_is_strictly_more_than_fourteen_days_and_the_caps_are_inclusive() {
+        let now = 100 * 24 * 3600;
+        let s = |p: &str, used: i64, rows: usize| Stored { project: p.into(), root: p.into(), used_at: used, rows };
+        let exact = [s("/p", now - IDLE_SECS, 1)];
+        assert!(sweep_victims(&exact, now, &HashSet::new(), |_| true).is_empty());
+        let over = [s("/p", now - IDLE_SECS - 1, 1)];
+        assert_eq!(sweep_victims(&over, now, &HashSet::new(), |_| true), ["/p"]);
+        let full: Vec<Stored> = (0..MAX_PROJECTS as i64).map(|i| s(&format!("/p{i}"), now - i, 1)).collect();
+        assert!(sweep_victims(&full, now, &HashSet::new(), |_| true).is_empty(), "exactly MAX_PROJECTS fits");
+        let at_rows = [s("/a", now, MAX_ROWS_TOTAL)];
+        assert!(sweep_victims(&at_rows, now, &HashSet::new(), |_| true).is_empty(), "exactly MAX_ROWS_TOTAL fits");
+        let over_rows = [s("/a", now - 1, MAX_ROWS_TOTAL), s("/b", now, 1)];
+        assert_eq!(sweep_victims(&over_rows, now, &HashSet::new(), |_| true), ["/a"]);
+    }
+
+    #[test]
+    fn registering_the_twelfth_project_fits_and_the_thirteenth_evicts_the_oldest() {
+        let twelve: Vec<Stored> = (0..MAX_PROJECTS as i64).map(|i| Stored { project: format!("/p{i}"), root: format!("/p{i}"), used_at: 100 + i, rows: 1 }).collect();
+        assert!(evict_for(&twelve[..MAX_PROJECTS - 1], "/new", 1, MAX_PROJECTS, MAX_ROWS_TOTAL).is_empty());
+        assert_eq!(evict_for(&twelve, "/new", 1, MAX_PROJECTS, MAX_ROWS_TOTAL), ["/p0"]);
+        assert!(evict_for(&twelve, "/p5", 1, MAX_PROJECTS, MAX_ROWS_TOTAL).is_empty(), "a rewrite never evicts for the project count");
+        assert!(evict_for(&[], "/new", MAX_ROWS_TOTAL, MAX_PROJECTS, MAX_ROWS_TOTAL).is_empty(), "alone, at the cap, it fits");
+        assert!(evict_for(&[], "/new", MAX_ROWS_TOTAL + 1, MAX_PROJECTS, MAX_ROWS_TOTAL).is_empty(), "nothing to evict when it is the only project");
+    }
+
+    #[test]
+    fn a_files_edge_range_covers_its_own_symbols_and_nothing_else() {
+        let stmts = delete_rows("/p", "src/a.rs");
+        assert_eq!(stmts[0].sql, DELETE_EDGES);
+        let args: Vec<&str> = stmts[0].args.iter().map(|a| a["value"].as_str().unwrap()).collect();
+        assert_eq!(args, ["/p", "src/a.rs", "src/a.rs::", "src/a.rs:;"]);
+        assert!(args[2] < "src/a.rs::run" && "src/a.rs::run" < args[3], "a symbol of the file is inside the range");
+        assert!(!("src/a.rs.bak::x" >= args[2] && "src/a.rs.bak::x" < args[3]), "a longer path is outside it");
+        assert!(!("src/a.rsx" >= args[2] && "src/a.rsx" < args[3]));
+    }
+
+    #[test]
+    fn a_vanished_file_loses_its_edges_nodes_and_files_row_in_that_order() {
+        let sql: Vec<&str> = gone_statements("/p", "a.rs").iter().map(|s| s.sql).collect();
+        assert_eq!(sql, [DELETE_EDGES, DELETE_NODES, DELETE_FILE]);
+    }
+
+    #[test]
+    fn a_project_key_is_the_canonical_path_or_the_given_one_when_gone() {
+        assert_eq!(key_of("/definitely/not/here"), "/definitely/not/here");
+        let dir = std::env::temp_dir();
+        assert_eq!(key_of(&format!("{}/.", dir.display())), std::fs::canonicalize(&dir).unwrap().to_string_lossy());
+    }
 }

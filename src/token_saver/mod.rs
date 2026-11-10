@@ -56,7 +56,8 @@ fn settings_path(cfg: &Config) -> PathBuf {
 }
 
 /// The `--settings` contents: PreToolUse command hooks, the secret guard
-/// (unless `PASEO_SECRET_GUARD=0`) and RTK on Bash (Token Saver on).
+/// (unless `PASEO_SECRET_GUARD=0`), RTK on Bash (Token Saver on) and the
+/// advisory code graph hint on Grep and Read.
 fn claude_settings_json(exe: &Path, rtk: bool, guard: bool) -> Option<Value> {
     let exe = shell_quote(exe.to_str()?);
     let hook = |matcher: &str, cmd: &str| json!({ "matcher": matcher, "hooks": [{ "type": "command", "command": format!("{exe} {cmd}"), "timeout": 5 }] });
@@ -67,7 +68,8 @@ fn claude_settings_json(exe: &Path, rtk: bool, guard: bool) -> Option<Value> {
     if rtk {
         hooks.push(hook("Bash", HOOK_CMD));
     }
-    (!hooks.is_empty()).then(|| json!({ "hooks": { "PreToolUse": hooks } }))
+    hooks.push(hook("Grep|Read", crate::graph::HOOK_CMD));
+    Some(json!({ "hooks": { "PreToolUse": hooks } }))
 }
 
 /// Writes Claude's `--settings` file at startup, or removes a stale one when
@@ -374,15 +376,18 @@ mod tests {
     }
 
     #[test]
-    fn settings_hold_the_guard_and_the_bash_hook() {
+    fn settings_hold_the_guard_the_bash_hook_and_the_graph_hook() {
         let exe = Path::new("/usr/bin/feiyi");
         let s = claude_settings_json(exe, true, true).unwrap();
         assert_eq!(s["hooks"]["PreToolUse"][0]["matcher"], crate::guard::MATCHER);
         assert_eq!(s["hooks"]["PreToolUse"][0]["hooks"][0]["command"], "'/usr/bin/feiyi' guard-hook");
         assert_eq!(s["hooks"]["PreToolUse"][1]["matcher"], "Bash");
         assert_eq!(s["hooks"]["PreToolUse"][1]["hooks"][0]["command"], "'/usr/bin/feiyi' rtk-hook");
-        assert_eq!(claude_settings_json(exe, false, true).unwrap()["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
-        assert!(claude_settings_json(exe, false, false).is_none());
+        assert_eq!(s["hooks"]["PreToolUse"][2]["matcher"], "Grep|Read");
+        assert_eq!(s["hooks"]["PreToolUse"][2]["hooks"][0]["command"], "'/usr/bin/feiyi' graph-hook");
+        assert_eq!(s["hooks"]["PreToolUse"][2]["hooks"][0]["timeout"], 5);
+        assert_eq!(claude_settings_json(exe, false, true).unwrap()["hooks"]["PreToolUse"].as_array().unwrap().len(), 2);
+        assert_eq!(claude_settings_json(exe, false, false).unwrap()["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
     }
 
     #[test]

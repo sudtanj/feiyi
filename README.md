@@ -310,6 +310,26 @@ Ported from zilong-router's Token Saver (9router's page of the same name). zilon
 
 `daemon_status` shows the active settings under `config.tokenSaver`.
 
+## Code graph
+
+feiyi keeps a graph of each project's code: files and symbols as nodes, calls and imports as edges. It is built per project directory and stored as plain rows in the backup Turso database, so it needs `backup.tursoUrl` and `backup.tursoToken`. Without them every graph tool answers "code graph needs backup.tursoUrl and backup.tursoToken". The graph is built on first use and refreshed when files change.
+
+The `feiyi` MCP server (see [MCP: feiyi](#mcp-feiyi)) has five tools for it, each taking the project directory as `dir`:
+
+| Tool | What it returns |
+|---|---|
+| `graph_query` | `{q, depth, budget}`: the symbols or files whose name or path contain `q`, with their callers, callees and imports up to `depth` edges |
+| `graph_impact` | `{symbol, budget}`: everything that calls the symbol, directly or through other callers, grouped by file |
+| `graph_path` | `{from, to}`: the shortest chain of calls and imports between two symbols or files |
+| `graph_report` | file, symbol and edge counts, communities, the most depended-on nodes and the last scan |
+| `graph_rebuild` | rescans the project and rewrites every row, ignoring the stored hashes |
+
+`graph_rebuild` is only needed when the graph looks wrong.
+
+For Claude Code, the daemon also adds a `PreToolUse` hook (`feiyi graph-hook`, 5 s timeout, in the same `claude-settings.json` as the RTK hook) on Grep and Read. Before a Grep it looks up the longest plain word of the pattern; before a Read of a file over 300 lines with no `offset` or `limit` it looks up the file's path. It calls `graph_query` with depth 1 and a 1500 character budget, and gives the answer to Claude as extra context. The hook is advisory: the tool always runs. If Turso is not configured, the daemon does not answer within 3 s, or nothing matches, the hook prints nothing. It reads the daemon's bearer token from the private MCP config file in the state directory, never from the command line.
+
+Limits: 12 projects, 80,000 rows per project and 400,000 rows in total. A project nobody queried for 14 days is removed, and a project's rows are deleted when the last workspace on its directory is archived.
+
 ## Layout
 
 ```

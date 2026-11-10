@@ -11,7 +11,10 @@
 //! ponytail: communities are the first two directories of a path, not
 //! Leiden; resolution is by unique name and path suffix, not by scope.
 
+mod hook;
 mod parse;
+
+pub use hook::{hook_main, HOOK_CMD};
 
 use crate::backup::{fingerprint, int, text, Stmt, Turso};
 use crate::manager::{Cmd, Manager};

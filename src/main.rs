@@ -94,6 +94,7 @@ fn main() {
     match args.first().map(String::as_str) {
         Some(token_saver::HOOK_CMD) => return token_saver::hook_main(),
         Some(guard::HOOK_CMD) => return guard::hook_main(),
+        Some(graph::HOOK_CMD) => return graph::hook_main(),
         Some(token_saver::RUN_CMD) => token_saver::run_main(&args[1..]),
         _ => {}
     }

@@ -183,7 +183,7 @@ async fn request_via(port: u16, tls_config: std::sync::Arc<rustls::ClientConfig>
     tokio::time::timeout(timeout, work).await.map_err(|_| "timed out".to_string())?
 }
 
-fn parse_response(raw: &[u8]) -> Result<(u16, String), String> {
+pub(crate) fn parse_response(raw: &[u8]) -> Result<(u16, String), String> {
     let text = String::from_utf8_lossy(raw);
     let (head, body) = text.split_once("\r\n\r\n").ok_or("malformed HTTP response")?;
     let status = head.split_whitespace().nth(1).and_then(|s| s.parse().ok()).ok_or("malformed status line")?;

@@ -385,7 +385,7 @@ async fn daemon_config_custom_models_round_trip() {
 async fn project_add_and_list() {
     let d = start("project", None);
     let proj = d.dir.join("myproject");
-    std::fs::create_dir_all(proj.join(".git")).unwrap();
+    std::fs::create_dir_all(&proj).unwrap();
     let mut ws = connect(d.port).await;
     hello(&mut ws, None).await;
     send(&mut ws, session(json!({ "type": "project.add.request", "requestId": "p1", "cwd": proj.to_string_lossy() }))).await;
@@ -1489,7 +1489,7 @@ async fn terminal_payload(ws: &mut Ws, kind: &str) -> Value {
 async fn terminal_runs_a_shell_streams_output_and_reattaches() {
     let d = start_with(unique_dir("term"), None, "ok", &[("SHELL", "/bin/sh")]);
     let proj = d.dir.join("proj");
-    std::fs::create_dir_all(proj.join(".git")).unwrap();
+    std::fs::create_dir_all(&proj).unwrap();
     let cwd = proj.to_string_lossy().into_owned();
     let mut ws = connect(d.port).await;
     hello(&mut ws, None).await;
@@ -1857,7 +1857,7 @@ async fn pull_request_checkout_rejects_bad_input_cleanly_and_archive_keeps_the_b
 async fn archiving_a_workspace_ends_its_terminals() {
     let d = start_with(unique_dir("termarch"), None, "ok", &[("SHELL", "/bin/sh")]);
     let proj = d.dir.join("proj");
-    std::fs::create_dir_all(proj.join(".git")).unwrap();
+    std::fs::create_dir_all(&proj).unwrap();
     let cwd = proj.to_string_lossy().into_owned();
     let mut ws = connect(d.port).await;
     hello(&mut ws, None).await;

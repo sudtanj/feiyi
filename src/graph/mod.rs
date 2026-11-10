@@ -1128,7 +1128,7 @@ mod tests {
         let stored = vec![s("/gone", now, 10), s("/idle", now - 15 * day, 10), s("/idle-but-open", now - 15 * day, 10), s("/big-old", now - 3 * day, 300_000), s("/big-new", now - day, 300_000), s("/ok", now, 10)];
         let active = HashSet::from(["/idle-but-open".to_string()]);
         let victims = sweep_victims(&stored, now, &active, |root| root != "/gone");
-        assert_eq!(victims, ["/gone", "/idle", "/idle-but-open", "/big-old"].iter().filter(|v| **v != "/idle-but-open").map(|v| v.to_string()).collect::<Vec<_>>());
+        assert_eq!(victims, ["/gone", "/idle", "/idle-but-open", "/big-old"], "an open workspace saves a project from the idle rule, not from the cap");
         let crowded: Vec<Stored> = (0..14).map(|i| s(&format!("/p{i}"), now - i, 1)).collect();
         let victims = sweep_victims(&crowded, now, &HashSet::new(), |_| true);
         assert_eq!(victims, ["/p13", "/p12"]);

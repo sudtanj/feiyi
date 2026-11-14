@@ -250,4 +250,72 @@ mod tests {
         ds.stamp(Kind::Workspaces, "w", &mut other);
         assert_eq!(other["seq"], 1);
     }
+
+    #[test]
+    fn empty_sync_object_equals_a_plain_snapshot() {
+        let ds = DirectorySync::new();
+        let entries = [entry("a", 1), entry("b", 1)];
+        let mut empty = ds.fetch(Kind::Agents, &json!({}), &entries, "/id");
+        let mut visible = entries.to_vec();
+        empty.narrow(&mut visible, "/id");
+        assert_eq!(visible, entries);
+        assert_eq!(empty.sync["removals"], json!([]));
+        let again = ds.fetch(Kind::Agents, &json!({}), &entries, "/id");
+        assert_eq!(again.sync["mode"], "snapshot");
+        assert_eq!(again.sync["headSeq"], empty.sync["headSeq"]);
+    }
+
+    #[test]
+    fn cursor_ahead_of_the_head_gets_a_snapshot() {
+        let ds = DirectorySync::new();
+        ds.fetch(Kind::Agents, &json!({}), &[entry("a", 1)], "/id");
+        let changes = ds.fetch(Kind::Agents, &cursor(&ds, 99), &[entry("a", 1)], "/id");
+        assert_eq!(changes.sync["mode"], "snapshot");
+    }
+
+    #[test]
+    fn cursor_without_a_seq_gets_a_snapshot() {
+        let ds = DirectorySync::new();
+        let changes = ds.fetch(Kind::Agents, &json!({ "generation": ds.generation }), &[entry("a", 1)], "/id");
+        assert_eq!(changes.sync["mode"], "snapshot");
+    }
+
+    #[test]
+    fn archived_agent_hidden_by_the_filter_is_a_removal() {
+        let ds = DirectorySync::new();
+        let head = ds.fetch(Kind::Agents, &json!({}), &[entry("a", 1), entry("b", 1)], "/id").sync["headSeq"].as_u64().unwrap();
+        let all = [entry("a", 1), entry("b", 2)];
+        let mut changes = ds.fetch(Kind::Agents, &cursor(&ds, head), &all, "/id");
+        let mut visible = vec![entry("a", 1)];
+        changes.narrow(&mut visible, "/id");
+        assert!(visible.is_empty());
+        assert_eq!(changes.sync["removals"], json!([{ "id": "b", "seq": head + 1 }]));
+    }
+
+    #[test]
+    fn entries_without_an_id_are_ignored() {
+        let ds = DirectorySync::new();
+        let changes = ds.fetch(Kind::Agents, &json!({}), &[json!({ "rev": 1 }), entry("a", 1)], "/id");
+        assert_eq!(changes.sync["headSeq"], 1);
+    }
+
+    #[test]
+    fn removal_log_is_capped_per_kind() {
+        let ds = DirectorySync::new();
+        for i in 0..REMOVAL_LOG + 5 {
+            ds.stamp(Kind::Agents, &format!("a{i}"), &mut json!({ "kind": "remove" }));
+        }
+        assert_eq!(ds.lock()[Kind::Agents as usize].removed.len(), REMOVAL_LOG);
+        assert_eq!(ds.lock()[Kind::Agents as usize].trimmed, 5);
+        assert!(ds.lock()[Kind::Workspaces as usize].removed.is_empty());
+    }
+
+    #[test]
+    fn live_upsert_then_fetch_reports_the_entry_once() {
+        let ds = DirectorySync::new();
+        ds.stamp(Kind::Agents, "a", &mut json!({ "kind": "upsert" }));
+        let changes = ds.fetch(Kind::Agents, &cursor(&ds, 0), &[entry("a", 1)], "/id");
+        assert_eq!(changes.sync["mode"], "changes");
+        assert_eq!(ids(&changes.only), ["a"]);
+    }
 }

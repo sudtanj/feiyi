@@ -2677,3 +2677,80 @@ fn graph_hook_gives_up_on_a_daemon_that_never_replies() {
     holder.join().unwrap();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[tokio::test]
+async fn handshake_announces_directory_sync() {
+    let d = start("sync-hello", None);
+    let mut ws = connect(d.port).await;
+    let info = hello(&mut ws, None).await;
+    assert_eq!(info["message"]["payload"]["features"]["directorySync"], true);
+}
+
+/// A fetch with `sync: {}` is a snapshot; after an agent changes, a fetch with
+/// the returned cursor carries only that agent, and an archived one comes back
+/// as a removal.
+#[tokio::test]
+async fn directory_sync_fetches_only_changes_after_the_cursor() {
+    let d = start("sync-agents", None);
+    let cwd = d.dir.join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let mut ws = connect(d.port).await;
+    hello(&mut ws, None).await;
+    let agent_id = {
+        send(&mut ws, session(json!({ "type": "create_agent_request", "requestId": "a1", "config": { "provider": "claude", "cwd": cwd.to_string_lossy(), "modeId": "bypassPermissions" }, "initialPrompt": "say hi" }))).await;
+        recv_until(&mut ws, |v| {
+            let p = &v["message"]["payload"];
+            (v["message"]["type"] == "status" && p["status"] == "agent_created").then(|| p["agentId"].as_str().unwrap().to_string())
+        })
+        .await
+    };
+    recv_until(&mut ws, |v| (v["message"]["type"] == "agent_stream" && v["message"]["payload"]["event"]["type"] == "turn_completed").then_some(())).await;
+
+    let first = rpc(&mut ws, json!({ "type": "fetch_agents_request", "requestId": "s1", "sync": {} }), "fetch_agents_response").await;
+    assert_eq!(first["sync"]["mode"], "snapshot", "{first}");
+    assert_eq!(first["entries"].as_array().map(|e| e.len()), Some(1), "{first}");
+    let cursor = json!({ "generation": first["sync"]["generation"], "afterSeq": first["sync"]["headSeq"] });
+
+    let quiet = rpc(&mut ws, json!({ "type": "fetch_agents_request", "requestId": "s2", "sync": cursor }), "fetch_agents_response").await;
+    assert_eq!(quiet["sync"]["mode"], "changes", "{quiet}");
+
+    send(&mut ws, session(json!({ "type": "archive_agent_request", "requestId": "ar", "agentId": agent_id }))).await;
+    let update = recv_until(&mut ws, |v| {
+        let p = &v["message"]["payload"];
+        (v["message"]["type"] == "agent_update" && p["agent"]["id"] == json!(agent_id) && !p["agent"]["archivedAt"].is_null()).then(|| p.clone())
+    })
+    .await;
+    assert_eq!(update["generation"], first["sync"]["generation"], "{update}");
+    assert!(update["seq"].as_u64().unwrap() > first["sync"]["headSeq"].as_u64().unwrap(), "{update}");
+
+    let changed = rpc(&mut ws, json!({ "type": "fetch_agents_request", "requestId": "s3", "sync": cursor }), "fetch_agents_response").await;
+    assert_eq!(changed["sync"]["mode"], "changes", "{changed}");
+    assert_eq!(changed["entries"], json!([]), "archived agent is hidden: {changed}");
+    assert_eq!(changed["sync"]["removals"][0]["id"], json!(agent_id), "{changed}");
+
+    let all = rpc(&mut ws, json!({ "type": "fetch_agents_request", "requestId": "s4", "filter": { "includeArchived": true }, "sync": cursor }), "fetch_agents_response").await;
+    assert_eq!(all["entries"].as_array().map(|e| e.len()), Some(1), "{all}");
+    assert_eq!(all["sync"]["removals"], json!([]), "{all}");
+
+    let other = rpc(&mut ws, json!({ "type": "fetch_agents_request", "requestId": "s5", "sync": { "generation": "old", "afterSeq": 1 } }), "fetch_agents_response").await;
+    assert_eq!(other["sync"]["mode"], "snapshot", "{other}");
+
+    let plain = rpc(&mut ws, json!({ "type": "fetch_agents_request", "requestId": "s6" }), "fetch_agents_response").await;
+    assert!(plain.get("sync").is_none(), "{plain}");
+}
+
+#[tokio::test]
+async fn directory_sync_projects_report_adds_and_removals() {
+    let d = start("sync-projects", None);
+    let proj = d.dir.join("syncproj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let mut ws = connect(d.port).await;
+    hello(&mut ws, None).await;
+    let first = rpc(&mut ws, json!({ "type": "project.list.request", "requestId": "p1", "sync": {} }), "project.list.response").await;
+    assert_eq!(first["sync"]["mode"], "snapshot", "{first}");
+    let cursor = json!({ "generation": first["sync"]["generation"], "afterSeq": first["sync"]["headSeq"] });
+    rpc(&mut ws, json!({ "type": "project.add.request", "requestId": "p2", "cwd": proj.to_string_lossy() }), "project.add.response").await;
+    let next = rpc(&mut ws, json!({ "type": "project.list.request", "requestId": "p3", "sync": cursor }), "project.list.response").await;
+    assert_eq!(next["sync"]["mode"], "changes", "{next}");
+    assert_eq!(next["projects"].as_array().map(|p| p.len()), Some(1), "{next}");
+}

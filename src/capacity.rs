@@ -784,4 +784,24 @@ mod tests {
         c.apply(Sample { avail_mb: None, ..calm() }, 0, 0, t0);
         assert!(!c.warm_room(), "unknown free memory is not room");
     }
+
+    #[test]
+    fn the_raised_budget_holds_back_growth_and_widens_exhaustion() {
+        let mut c = cap(8);
+        let t0 = Instant::now();
+        assert_eq!(c.observe(340, t0), Change::None, "under 50 MB over: ignored");
+        assert_eq!(c.agent_mb(), 300);
+        assert_eq!(c.observe(700, t0), Change::None, "limit 1 is already under the new ceiling 5");
+        assert_eq!((c.ceiling, c.limit()), (5, 1));
+        let tight = Sample { avail_mb: Some(650), ..calm() };
+        c.apply(tight, 1, 2, t0);
+        assert_eq!(c.apply(tight, 1, 2, t0 + Duration::from_secs(60)), Change::None, "650 MB free does not fit a 700 MB agent");
+        assert_eq!(c.limit(), 1);
+        assert!(c.room_short());
+        c.apply(Sample { avail_mb: Some(80), ..calm() }, 1, 2, t0 + Duration::from_secs(61));
+        assert!(c.exhausted(), "80 MB is under 700 / 8");
+        let roomy = Sample { avail_mb: Some(800), ..calm() };
+        c.apply(roomy, 1, 2, t0 + Duration::from_secs(120));
+        assert_eq!(c.apply(roomy, 1, 2, t0 + Duration::from_secs(160)), Change::Grew);
+    }
 }

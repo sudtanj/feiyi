@@ -133,7 +133,7 @@ pub(crate) fn host_allowed(headers: &HeaderMap, extra: &[String]) -> bool {
     })
 }
 
-async fn ws_upgrade(State(state): State<AppState>, headers: HeaderMap, ws: WebSocketUpgrade) -> Response {
+async fn ws_upgrade(State(state): State<AppState>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, ws: WebSocketUpgrade) -> Response {
     if !host_allowed(&headers, &state.hostnames) {
         return (StatusCode::FORBIDDEN, "Host not allowed").into_response();
     }
@@ -145,7 +145,7 @@ async fn ws_upgrade(State(state): State<AppState>, headers: HeaderMap, ws: WebSo
         Some(protocol) => ws.protocols([protocol]),
         None => ws,
     };
-    ws.max_message_size(16 * 1024 * 1024).on_upgrade(move |socket| handle_socket(ctx, socket))
+    ws.max_message_size(16 * 1024 * 1024).on_upgrade(move |socket| handle_socket(ctx, socket, peer))
 }
 
 fn bearer_protocol(headers: &HeaderMap) -> Option<String> {
@@ -153,37 +153,39 @@ fn bearer_protocol(headers: &HeaderMap) -> Option<String> {
     offered.split(',').map(str::trim).find(|p| p.starts_with("paseo.bearer.") && p.len() > "paseo.bearer.".len()).map(str::to_string)
 }
 
-async fn handle_socket(ctx: Arc<Ctx>, socket: WebSocket) {
+async fn handle_socket(ctx: Arc<Ctx>, socket: WebSocket, peer: SocketAddr) {
     use std::time::{Duration, Instant};
     let (mut sink, mut stream) = socket.split();
     let (in_tx, in_rx) = tokio::sync::mpsc::channel::<session::Inbound>(64);
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<session::Outbound>(256);
     let session = tokio::spawn(session::run(ctx, in_rx, out_tx, false));
+    let opened = Instant::now();
+    crate::log!("ws {peer} opened");
     // Phones drop off the network without closing the socket: ping, and give up
     // on a connection that neither answers nor writes, so a stale one never
     // lingers (and the app's reconnect starts clean).
     let mut last_seen = Instant::now();
     let mut keepalive = tokio::time::interval(Duration::from_secs(15));
     keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    loop {
+    let why = loop {
         tokio::select! {
             out = out_rx.recv() => {
-                let Some(out) = out else { break };
+                let Some(out) = out else { break "session ended".to_string() };
                 let message = match out {
                     session::Outbound::Text(text) => Message::Text(text.to_string()),
                     session::Outbound::Binary(bytes) => Message::Binary(bytes),
                 };
                 match tokio::time::timeout(Duration::from_secs(20), sink.send(message)).await {
                     Ok(Ok(())) => {}
-                    _ => break,
+                    _ => break "send stalled".to_string(),
                 }
             }
             _ = keepalive.tick() => {
                 if last_seen.elapsed() > Duration::from_secs(75) {
-                    break;
+                    break "stale (no frame for 75 s)".to_string();
                 }
                 if tokio::time::timeout(Duration::from_secs(10), sink.send(Message::Ping(Vec::new()))).await.is_err() {
-                    break;
+                    break "ping stalled".to_string();
                 }
             }
             frame = stream.next() => {
@@ -196,14 +198,20 @@ async fn handle_socket(ctx: Arc<Ctx>, socket: WebSocket) {
                         Ok(t) => session::Inbound::Text(t),
                         Err(_) => continue,
                     },
-                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                    Some(Ok(Message::Close(frame))) => break match frame {
+                        Some(f) => format!("closed by client ({} {})", u16::from(f.code), f.reason),
+                        None => "closed by client".to_string(),
+                    },
+                    None => break "connection dropped".to_string(),
+                    Some(Err(e)) => break format!("failed: {e}"),
                     Some(Ok(_)) => continue,
                 };
                 if in_tx.send(inbound).await.is_err() {
-                    break;
+                    break "session ended".to_string();
                 }
             }
         }
-    }
+    };
+    crate::log!("ws {peer} {why} after {} s", opened.elapsed().as_secs());
     session.abort();
 }

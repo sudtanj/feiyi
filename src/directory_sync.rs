@@ -35,7 +35,9 @@ struct Feed {
 impl Feed {
     fn bump(&mut self, id: &str, hash: u64) -> u64 {
         self.head += 1;
-        self.removed.retain(|(_, gone)| gone != id);
+        if !self.removed.is_empty() {
+            self.removed.retain(|(_, gone)| gone != id);
+        }
         self.items.insert(id.to_string(), (self.head, hash));
         self.head
     }
@@ -43,7 +45,9 @@ impl Feed {
     fn remove(&mut self, id: &str) -> u64 {
         self.head += 1;
         self.items.remove(id);
-        self.removed.retain(|(_, gone)| gone != id);
+        if !self.removed.is_empty() {
+            self.removed.retain(|(_, gone)| gone != id);
+        }
         self.removed.push_back((self.head, id.to_string()));
         if self.removed.len() > REMOVAL_LOG {
             if let Some((seq, _)) = self.removed.pop_front() {
@@ -96,15 +100,21 @@ impl DirectorySync {
     }
 
     /// Number a live update (`kind: "remove"` or an upsert of `id`) and tag it
-    /// with the generation, so the app can advance its cursor.
+    /// with the generation, so the app can advance its cursor. An upsert records
+    /// the fingerprint of the entry a fetch would build, so the next fetch does
+    /// not count it as changed again.
     pub fn stamp(&self, kind: Kind, id: &str, payload: &mut Value) {
         let mut feeds = self.lock();
         let feed = &mut feeds[kind as usize];
         let seq = if payload["kind"] == "remove" {
             feed.remove(id)
         } else {
-            let hash = feed.items.get(id).map_or(0, |item| item.1);
-            feed.bump(id, hash)
+            let entry = match kind {
+                Kind::Agents => json!({ "agent": payload["agent"], "project": payload["project"] }),
+                Kind::Workspaces => payload["workspace"].clone(),
+                Kind::Projects => payload["project"].clone(),
+            };
+            feed.bump(id, fingerprint(&entry))
         };
         payload["generation"] = json!(self.generation);
         payload["seq"] = json!(seq);
@@ -237,6 +247,18 @@ mod tests {
         let kept = ds.fetch(Kind::Agents, &cursor(&ds, 1), &[], "/id");
         assert_eq!(kept.sync["mode"], "changes");
         assert_eq!(kept.sync["removals"].as_array().unwrap().len(), REMOVAL_LOG);
+    }
+
+    #[test]
+    fn stamped_update_is_not_a_change_on_the_next_fetch() {
+        let ds = DirectorySync::new();
+        let workspace = json!({ "id": "w", "rev": 1 });
+        let mut payload = json!({ "kind": "upsert", "workspace": workspace });
+        ds.stamp(Kind::Workspaces, "w", &mut payload);
+        let head = payload["seq"].as_u64().unwrap();
+        let changes = ds.fetch(Kind::Workspaces, &cursor(&ds, head), &[workspace], "/id");
+        assert_eq!(changes.sync["headSeq"], head);
+        assert!(ids(&changes.only).is_empty());
     }
 
     #[test]

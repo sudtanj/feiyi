@@ -3,6 +3,7 @@
 //! agent, and the sidebar lists them via `fetch_workspaces` + `workspace_update`.
 //! A workspace is a plain directory or a worktree feiyi created (worktrees.rs).
 
+use crate::directory_sync::Kind;
 use crate::manager::Manager;
 use crate::snapshot::{project_descriptor, workspace_descriptor};
 use crate::store::{ProjectRecord, WorkspaceRecord};
@@ -92,7 +93,9 @@ impl Manager {
             return;
         }
         if let Some(desc) = self.workspace_json(id) {
-            self.broadcast(json!({ "type": "workspace_update", "payload": { "kind": "upsert", "workspace": desc } }));
+            let mut payload = json!({ "kind": "upsert", "workspace": desc });
+            self.sync.stamp(Kind::Workspaces, id, &mut payload);
+            self.broadcast(json!({ "type": "workspace_update", "payload": payload }));
         }
     }
 
@@ -137,7 +140,9 @@ impl Manager {
                 a.rec.attention_reason = None;
             }
             self.touch(agent_id);
-            self.broadcast(json!({ "type": "agent_update", "payload": { "kind": "upsert", "agent": self.agents[agent_id].snapshot(), "project": self.agents[agent_id].project() } }));
+            let mut payload = json!({ "kind": "upsert", "agent": self.agents[agent_id].snapshot(), "project": self.agents[agent_id].project() });
+            self.sync.stamp(Kind::Agents, agent_id, &mut payload);
+            self.broadcast(json!({ "type": "agent_update", "payload": payload }));
         }
         self.workspaces[idx].archived_at = Some(now.clone());
         let root = self.workspaces[idx].project_root.clone();
@@ -150,6 +155,7 @@ impl Manager {
         if !self.workspaces.iter().any(|w| w.archived_at.is_none() && w.project_root == root) {
             payload["emptyProject"] = project_descriptor(&root);
         }
+        self.sync.stamp(Kind::Workspaces, id, &mut payload);
         self.broadcast(json!({ "type": "workspace_update", "payload": payload }));
         Ok(now)
     }

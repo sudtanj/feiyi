@@ -1,5 +1,6 @@
 //! Session RPC handlers for the Paseo core protocol subset.
 
+use crate::directory_sync::Kind;
 use crate::manager::{reply, wrap, Agent, Cmd, Manager, Out};
 use crate::providers::{binary_available, claude_models, is_supported, modes_for};
 use crate::snapshot::{cursor, project_descriptor, timeline_entry};
@@ -65,9 +66,17 @@ impl Manager {
         match kind.as_str() {
             "fetch_agents_request" | "fetch_agent_history_request" => {
                 let include_archived = kind == "fetch_agent_history_request" || msg.pointer("/filter/includeArchived").and_then(|v| v.as_bool()).unwrap_or(false);
-                let entries = self.directory_entries(include_archived);
+                let mut entries = self.directory_entries(include_archived);
                 let response_type = kind.replace("_request", "_response");
+                let sync = msg.get("sync").filter(|v| v.is_object() && kind == "fetch_agents_request").map(|request| {
+                    let mut changes = self.sync.fetch(Kind::Agents, request, &self.directory_entries(true), "/agent/id");
+                    changes.narrow(&mut entries, "/agent/id");
+                    changes.sync
+                });
                 let mut payload = json!({ "requestId": rid, "entries": entries, "pageInfo": { "nextCursor": null, "prevCursor": null, "hasMore": false } });
+                if let Some(sync) = sync {
+                    payload["sync"] = sync;
+                }
                 if msg.get("subscribe").map(|v| !v.is_null()).unwrap_or(false) {
                     // Every session already receives all agent updates.
                     payload["subscriptionId"] = json!(msg.pointer("/subscribe/subscriptionId").and_then(|v| v.as_str()).map(String::from).unwrap_or_else(new_id));
@@ -143,7 +152,9 @@ impl Manager {
                 // Its spend stays in the provider totals.
                 self.usage.forget_agent(&id);
                 self.agents_dirty = true;
-                self.broadcast(json!({ "type": "agent_update", "payload": { "kind": "remove", "agentId": id } }));
+                let mut removal = json!({ "kind": "remove", "agentId": id });
+                self.sync.stamp(Kind::Agents, &id, &mut removal);
+                self.broadcast(json!({ "type": "agent_update", "payload": removal }));
                 self.broadcast(json!({ "type": "agent_deleted", "payload": { "agentId": id, "requestId": rid } }));
                 if let Some(ws) = workspace {
                     self.publish_workspace(&ws);
@@ -273,8 +284,16 @@ impl Manager {
             }
             "fetch_workspaces_request" => {
                 let project = msg.pointer("/filter/projectId").and_then(|v| v.as_str()).map(String::from);
-                let entries = self.workspace_entries(project.as_deref());
+                let mut entries = self.workspace_entries(project.as_deref());
+                let sync = msg.get("sync").filter(|v| v.is_object() && project.is_none()).map(|request| {
+                    let mut changes = self.sync.fetch(Kind::Workspaces, request, &entries, "/id");
+                    changes.narrow(&mut entries, "/id");
+                    changes.sync
+                });
                 let mut payload = json!({ "requestId": rid, "entries": entries, "emptyProjects": self.empty_projects(), "pageInfo": { "nextCursor": null, "prevCursor": null, "hasMore": false } });
+                if let Some(sync) = sync {
+                    payload["sync"] = sync;
+                }
                 // Every session already receives every workspace_update.
                 if let Some(sub) = msg.get("subscribe").filter(|v| !v.is_null()) {
                     payload["subscriptionId"] = json!(sub.get("subscriptionId").and_then(|v| v.as_str()).map(String::from).unwrap_or_else(new_id));
@@ -361,8 +380,17 @@ impl Manager {
                         paths.push(a.rec.cwd.clone());
                     }
                 }
-                let projects: Vec<Value> = paths.iter().map(|p| project_descriptor(p)).collect();
-                reply(out, json!({ "type": "project.list.response", "payload": { "requestId": rid, "projects": projects } }));
+                let mut projects: Vec<Value> = paths.iter().map(|p| project_descriptor(p)).collect();
+                let sync = msg.get("sync").filter(|v| v.is_object()).map(|request| {
+                    let mut changes = self.sync.fetch(Kind::Projects, request, &projects, "/projectId");
+                    changes.narrow(&mut projects, "/projectId");
+                    changes.sync
+                });
+                let mut payload = json!({ "requestId": rid, "projects": projects });
+                if let Some(sync) = sync {
+                    payload["sync"] = sync;
+                }
+                reply(out, json!({ "type": "project.list.response", "payload": payload }));
             }
             "project.add.request" => {
                 let requested = s(&msg, "cwd").unwrap_or_default();

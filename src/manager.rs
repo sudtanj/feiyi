@@ -3,6 +3,7 @@
 //! awaits while handling a message.
 
 use crate::config::Config;
+use crate::directory_sync::Kind;
 use crate::providers::claude::{ClaudePool, SendOutcome};
 use crate::providers::codex::Codex;
 use crate::providers::{binary_available, modes_for, AgentSpec, ProviderEvent};
@@ -200,6 +201,8 @@ pub struct Manager {
     /// Tokens and cost per provider and model.
     pub usage: crate::usage::Ledger,
     pub schedules: crate::schedules::Schedules,
+    /// Change feeds for directory sync (directory_sync.rs).
+    pub sync: crate::directory_sync::DirectorySync,
     /// Streamed text not sent yet, per agent: (kind, text). Deltas arrive a few
     /// tokens at a time; sending them in ~150 ms batches cuts the messages (and
     /// their envelopes) sent to the app by an order of magnitude.
@@ -258,7 +261,7 @@ impl Manager {
         if let crate::capacity::Mode::Fixed(n) = cfg.claude_max_live {
             claude.set_max_live(n);
         }
-        let mut manager = Manager { cfg, server_id, store, agents, claude, codex, active_cli: None, running: HashSet::new(), cli_queue: VecDeque::new(), capacity, claude_warm_at: None, codex_warm_at: None, bcast, events_tx, agents_dirty: false, pairing_url, projects, workspaces, cmds_tx, checkout: crate::checkout::Watcher::start(), started_at: now_iso(), waiters: Vec::new(), push_tokens, clients: Vec::new(), daemon_config, usage, schedules, chunks: HashMap::new(), chunk_deadline: None, last_trim: Instant::now() };
+        let mut manager = Manager { cfg, server_id, store, agents, claude, codex, active_cli: None, running: HashSet::new(), cli_queue: VecDeque::new(), capacity, claude_warm_at: None, codex_warm_at: None, bcast, events_tx, agents_dirty: false, pairing_url, projects, workspaces, cmds_tx, checkout: crate::checkout::Watcher::start(), started_at: now_iso(), waiters: Vec::new(), push_tokens, clients: Vec::new(), daemon_config, usage, schedules, sync: crate::directory_sync::DirectorySync::new(), chunks: HashMap::new(), chunk_deadline: None, last_trim: Instant::now() };
         manager.migrate_agent_workspaces();
         (manager, events_rx)
     }
@@ -280,7 +283,9 @@ impl Manager {
             }
         }
         let project = crate::snapshot::project_descriptor(path);
-        self.broadcast(json!({ "type": "project.update", "payload": { "kind": "upsert", "project": project } }));
+        let mut payload = json!({ "kind": "upsert", "project": project });
+        self.sync.stamp(Kind::Projects, path, &mut payload);
+        self.broadcast(json!({ "type": "project.update", "payload": payload }));
         project
     }
 
@@ -467,10 +472,9 @@ impl Manager {
 
     pub fn publish_agent(&self, agent_id: &str) {
         if let Some(a) = self.agents.get(agent_id) {
-            self.broadcast(json!({
-                "type": "agent_update",
-                "payload": { "kind": "upsert", "agent": a.snapshot(), "project": a.project() },
-            }));
+            let mut payload = json!({ "kind": "upsert", "agent": a.snapshot(), "project": a.project() });
+            self.sync.stamp(Kind::Agents, agent_id, &mut payload);
+            self.broadcast(json!({ "type": "agent_update", "payload": payload }));
             // Workspace status/activity is derived from its agents.
             if let Some(ws) = &a.rec.workspace_id {
                 self.publish_workspace(ws);

@@ -6,6 +6,7 @@ mod company;
 mod config;
 mod cron;
 mod daemon_config;
+mod directory_sync;
 mod e2ee;
 mod egress;
 mod files;

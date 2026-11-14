@@ -3,6 +3,7 @@
 //! prompt list) and daemon/project management (status, config, diagnostics,
 //! project rename/remove with folder cleanup).
 
+use crate::directory_sync::Kind;
 use crate::manager::{reply, Agent, Manager, Out, Waiter, EPOCH};
 use crate::providers::{binary_available, is_supported};
 use crate::rpc::{normalize_dir, rpc_error, s};
@@ -488,7 +489,9 @@ impl Manager {
         self.project_record(&project_id).custom_name = custom.clone();
         self.store.save_projects(&self.projects);
         crate::snapshot::set_project_name(&project_id, custom.as_deref());
-        self.broadcast(json!({ "type": "project.update", "payload": { "kind": "upsert", "project": project_descriptor(&project_id) } }));
+        let mut payload = json!({ "kind": "upsert", "project": project_descriptor(&project_id) });
+        self.sync.stamp(Kind::Projects, &project_id, &mut payload);
+        self.broadcast(json!({ "type": "project.update", "payload": payload }));
         for ws in self.active_workspaces_of(&project_id) {
             self.publish_workspace(&ws);
         }
@@ -508,7 +511,9 @@ impl Manager {
         self.projects.retain(|p| p.root_path != path);
         self.store.save_projects(&self.projects);
         crate::snapshot::set_project_name(path, None);
-        self.broadcast(json!({ "type": "project.update", "payload": { "kind": "remove", "projectId": path } }));
+        let mut payload = json!({ "kind": "remove", "projectId": path });
+        self.sync.stamp(Kind::Projects, path, &mut payload);
+        self.broadcast(json!({ "type": "project.update", "payload": payload }));
         crate::log!("project removed: {path} ({} workspaces archived)", archived.len());
         (owned, archived)
     }

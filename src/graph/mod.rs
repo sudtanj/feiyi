@@ -50,8 +50,19 @@ const NO_DB: &str = "code graph is off: set backup.codeGraph=true with backup.tu
 
 /// `Turso::run` with the failure reduced to a category: a response body never reaches a log or an agent.
 async fn db(turso: &Turso, stmts: Vec<Stmt>) -> Result<Vec<Vec<Vec<String>>>, String> {
-    turso.run(stmts).await.map_err(|e| format!("code graph database: {}", crate::backup::category(&e)))
+    let started = Instant::now();
+    let n = stmts.len();
+    let result = turso.run(stmts).await.map_err(|e| format!("code graph database: {}", crate::backup::category(&e)));
+    let ms = started.elapsed().as_millis();
+    if ms >= SLOW_DB_MS {
+        crate::log!("code graph: a Turso round trip of {n} statement(s) took {ms} ms");
+    }
+    result
 }
+
+/// Round trips at or over this are logged, so a slow region or a strained
+/// VM shows up in the daemon log instead of only as a long build.
+const SLOW_DB_MS: u128 = 1000;
 
 const CREATE: [&str; 7] = [
     "CREATE TABLE IF NOT EXISTS feiyi_graph_projects(project TEXT PRIMARY KEY, root TEXT NOT NULL, updated_at INTEGER NOT NULL, used_at INTEGER NOT NULL)",
@@ -533,7 +544,8 @@ async fn build(turso: &Turso, key: &str, st: &mut Project, force: bool) -> Resul
         }
         st.scanned = Some(Instant::now());
         let previous = INFOS.lock().ok().and_then(|i| i.get(key).cloned());
-        let info = Info { at: SystemTime::now(), millis: started.elapsed().as_millis() as u64, files: st.files.len(), symbols: previous.as_ref().and_then(|i| i.symbols), edges: previous.and_then(|i| i.edges), truncated };
+        // An unchanged rescan keeps the last real build's duration, so `buildMs` reports what a build costs.
+        let info = Info { at: SystemTime::now(), millis: previous.as_ref().map_or(0, |i| i.millis), files: st.files.len(), symbols: previous.as_ref().and_then(|i| i.symbols), edges: previous.and_then(|i| i.edges), truncated };
         record(key, info);
         return Ok(());
     }

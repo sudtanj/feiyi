@@ -116,12 +116,14 @@ pub struct ClaudePool {
     strained: bool,
     /// Since when the readings have been strained (before the hold applies).
     strained_since: Option<Instant>,
+    /// Largest resident size any child has reached, for the capacity budget.
+    peak_rss_mb: u64,
 }
 
 impl ClaudePool {
     pub fn new(cfg: Config, events: EventTx) -> Self {
         let sub_cap = Arc::new(AtomicUsize::new(cfg.claude_max_subagents));
-        ClaudePool { cfg, events, procs: HashMap::new(), waiting: VecDeque::new(), generation: 0, max_live: 1, sub_cap, strained: false, strained_since: None }
+        ClaudePool { cfg, events, procs: HashMap::new(), waiting: VecDeque::new(), generation: 0, max_live: 1, sub_cap, strained: false, strained_since: None, peak_rss_mb: 0 }
     }
 
     /// How many sub-agents a process may start now: the configured cap, or
@@ -154,6 +156,14 @@ impl ClaudePool {
     /// prompt needs their slot.
     pub fn idle_mb(&self) -> u64 {
         self.procs.values().filter(|p| !p.busy() && !p.holding()).map(Proc::rss_mb).sum()
+    }
+
+    /// The largest child seen so far, sampled now: what one agent really
+    /// costs, for the capacity's budget.
+    pub fn peak_rss_mb(&mut self) -> u64 {
+        let now = self.procs.values().map(Proc::rss_mb).max().unwrap_or(0);
+        self.peak_rss_mb = self.peak_rss_mb.max(now);
+        self.peak_rss_mb
     }
 
     /// Children that take a slot. One between turns whose background
@@ -244,12 +254,14 @@ impl ClaudePool {
 
     /// Stop processes that aren't running a turn, to free memory. Plain idle
     /// ones go first; those holding background sub-agents are only stopped
-    /// (killing them; their cards say so) when there was nothing else to free.
+    /// (killing them; their cards say so) when there was nothing else to free
+    /// and `exhausted` says the container is about to run out, not merely
+    /// stalling on swap.
     /// Returns how many were stopped and the agents whose background work died.
-    pub fn release_idle(&mut self) -> (usize, Vec<String>) {
+    pub fn release_idle(&mut self, exhausted: bool) -> (usize, Vec<String>) {
         let mut idle: Vec<String> = self.procs.iter().filter(|(_, p)| !p.busy() && !p.holding()).map(|(id, _)| id.clone()).collect();
         let mut lost = Vec::new();
-        if idle.is_empty() {
+        if idle.is_empty() && exhausted {
             idle = self.procs.iter().filter(|(_, p)| !p.busy()).map(|(id, _)| id.clone()).collect();
             lost = idle.clone();
         }

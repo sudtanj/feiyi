@@ -175,8 +175,10 @@ fn ensure_data_socket(ctx: &Arc<Ctx>, cfg: &Config, identity: &Arc<DaemonIdentit
     }
     let (ctx, cfg, identity, data2, id) = (ctx.clone(), cfg.clone(), identity.clone(), data.clone(), connection_id.clone());
     let handle = tokio::spawn(async move {
-        if let Err(e) = data_socket(ctx, &cfg, identity, &id).await {
-            crate::warn!("relay data socket {id} ended: {e}");
+        let opened = Instant::now();
+        match data_socket(ctx, &cfg, identity, &id).await {
+            Ok(()) => crate::log!("relay data socket {id} closed after {} s", opened.elapsed().as_secs()),
+            Err(e) => crate::warn!("relay data socket {id} ended after {} s: {e}", opened.elapsed().as_secs()),
         }
         data2.lock().unwrap().remove(&id);
     });

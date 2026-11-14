@@ -403,7 +403,7 @@ impl Manager {
                 }
             }
             Some("claude") => {
-                if self.cfg.claude_keep_warm && !self.strained() && self.claude.live_count() == 0 && !self.codex.is_running() && self.running.is_empty() && self.cli_queue.is_empty() && due(self.claude_warm_at) && binary_available(&self.cfg.claude_bin) {
+                if self.cfg.claude_keep_warm && self.capacity.warm_room() && self.claude.live_count() == 0 && !self.codex.is_running() && self.running.is_empty() && self.cli_queue.is_empty() && due(self.claude_warm_at) && binary_available(&self.cfg.claude_bin) {
                     // The process is tied to one session and cwd, so warm the Claude
                     // agent most likely to get the next prompt: the last one used.
                     let candidate = self
@@ -766,9 +766,10 @@ impl Manager {
     fn update_capacity(&mut self) {
         let queued = self.cli_queue.len() + self.claude.waiting_count();
         let running = self.running.len();
-        let change = self.capacity.update(running, queued, self.claude.idle_mb());
+        let (idle_mb, peak_mb) = (self.claude.idle_mb(), self.claude.peak_rss_mb());
+        let change = self.capacity.update(running, queued, idle_mb, peak_mb);
         if change == crate::capacity::Change::Critical {
-            let (freed, lost) = self.claude.release_idle();
+            let (freed, lost) = self.claude.release_idle(self.capacity.exhausted());
             if freed > 0 {
                 crate::warn!("capacity: released {freed} idle claude process(es) to free memory");
             }

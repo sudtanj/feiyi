@@ -241,6 +241,7 @@ async fn run(ctx: &GitCtx, kind: &str, msg: &Value, rid: &str) -> Value {
 
 /// Pass the response through after refreshing diffs and status.
 async fn mutated(ctx: &GitCtx, cwd: &str, payload: Value) -> Value {
+    crate::checkout::forget(cwd);
     ctx.after_mutation(cwd).await;
     payload
 }

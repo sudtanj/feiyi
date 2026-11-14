@@ -37,6 +37,8 @@ const LIMITS_REFRESH: Duration = Duration::from_secs(60);
 /// against the pids limit, and the pids kept free for the daemon.
 const PIDS_PER_AGENT: u64 = 64;
 const PIDS_RESERVE: u64 = 32;
+/// Smallest overshoot of the budget worth re-budgeting for (also 10% of it).
+const OBSERVE_STEP_MB: u64 = 50;
 
 /// Pressure (PSI `some avg10`, percent) at or above which the limit shrinks.
 const MEM_PRESSURE_HIGH: f64 = 10.0;
@@ -116,6 +118,11 @@ pub struct Capacity {
     /// (strain, critical) but the limit never moves.
     auto: bool,
     agent_mb: u64,
+    /// Largest resident size an agent process has reached, when above
+    /// `agent_mb`: the configured guess is replaced by what the CLI really
+    /// takes, so the ceiling and room checks stop promising space that
+    /// isn't there.
+    observed_mb: u64,
     max: usize,
     stable: Duration,
     limits: Limits,
@@ -127,6 +134,9 @@ pub struct Capacity {
     last: Sample,
     strained: bool,
     critical: bool,
+    /// Memory or pids nearly used up (not just stalling): the only case
+    /// where processes holding background work are worth killing.
+    exhausted: bool,
     /// Previous throttled-time reading (µs) for the throttle share.
     throttled: Option<(Instant, u64)>,
     /// Throttle share smoothed over ~10 s, like the kernel's avg10.
@@ -145,7 +155,7 @@ impl Capacity {
             crate::log!("capacity: fixed caps, watching {}", describe_limits(&limits));
         }
         let now = Instant::now();
-        Capacity { auto, agent_mb, max, stable, limits, limits_at: now, ceiling, limit: if auto { ceiling } else { 1 }, calm_since: None, last_change: now, last: Sample::default(), strained: false, critical: false, throttled: throttled_usec().map(|t| (now, t)), throttle_avg: None, last_decision: None }
+        Capacity { auto, agent_mb, observed_mb: 0, max, stable, limits, limits_at: now, ceiling, limit: if auto { ceiling } else { 1 }, calm_since: None, last_change: now, last: Sample::default(), strained: false, critical: false, exhausted: false, throttled: throttled_usec().map(|t| (now, t)), throttle_avg: None, last_decision: None }
     }
 
     pub fn limit(&self) -> usize {
@@ -155,7 +165,7 @@ impl Capacity {
     /// The last reading had less free memory than one agent needs: the room
     /// for it is held by warm idle processes.
     pub fn room_short(&self) -> bool {
-        self.last.avail_mb.map(|a| a < self.agent_mb).unwrap_or(false)
+        self.last.avail_mb.map(|a| a < self.agent_mb()).unwrap_or(false)
     }
 
     /// The last reading showed pressure: don't start optional work (warm-ups).
@@ -168,14 +178,35 @@ impl Capacity {
         self.critical
     }
 
+    /// Memory or pids are nearly used up, as opposed to merely stalling.
+    pub fn exhausted(&self) -> bool {
+        self.exhausted
+    }
+
+    /// Calm with free memory for two agents: a warm-up started now won't be
+    /// the next thing the critical path kills.
+    pub fn warm_room(&self) -> bool {
+        !self.strained && self.last.avail_mb.map(|a| a >= 2 * self.agent_mb()).unwrap_or(false)
+    }
+
+    /// Memory budgeted per agent: the configured value, or more once a
+    /// process has been seen above it.
+    fn agent_mb(&self) -> u64 {
+        self.agent_mb.max(self.observed_mb)
+    }
+
     /// Read the machine and adjust the limit. `reclaim_mb`: memory held by
-    /// warm idle processes the pool would stop to make room.
-    pub fn update(&mut self, running: usize, queued: usize, reclaim_mb: u64) -> Change {
+    /// warm idle processes the pool would stop to make room; `peak_rss_mb`:
+    /// the largest agent process seen so far.
+    pub fn update(&mut self, running: usize, queued: usize, reclaim_mb: u64, peak_rss_mb: u64) -> Change {
         let now = Instant::now();
         let mut change = Change::None;
         if now.duration_since(self.limits_at) >= LIMITS_REFRESH {
             self.limits_at = now;
             change = self.set_limits(read_limits(), now);
+        }
+        if let Change::Shrank = self.observe(peak_rss_mb, now) {
+            change = Change::Shrank;
         }
         let mut sample = read_sample(self.limits.mem_mb);
         sample.throttle = self.throttle_share(now);
@@ -186,6 +217,19 @@ impl Capacity {
         }
     }
 
+    /// A process grew well past the budget: budget what it really takes, and
+    /// recompute the ceiling like a lowered container limit. Small overshoots
+    /// are ignored so a slowly growing process does not re-cut every tick.
+    fn observe(&mut self, peak_rss_mb: u64, now: Instant) -> Change {
+        let budget = self.agent_mb();
+        if peak_rss_mb < budget + (budget / 10).max(OBSERVE_STEP_MB) {
+            return Change::None;
+        }
+        self.observed_mb = peak_rss_mb;
+        crate::log!("capacity: agent processes reach {peak_rss_mb} MB, over the {} MB budget; budgeting {peak_rss_mb} MB per agent", self.agent_mb);
+        self.reset_ceiling(format!("agent processes reach {peak_rss_mb} MB"), now)
+    }
+
     /// New container limits: recompute the ceiling, and pull the limit
     /// down to it at once when it shrank.
     fn set_limits(&mut self, limits: Limits, now: Instant) -> Change {
@@ -193,13 +237,17 @@ impl Capacity {
             return Change::None;
         }
         self.limits = limits;
-        self.ceiling = ceiling(&limits, self.agent_mb, self.max);
-        crate::log!("capacity: limits changed ({}), up to {} agent(s) at once", describe_limits(&limits), self.ceiling);
-        self.note(format!("limits changed ({}), ceiling {}", describe_limits(&limits), self.ceiling));
+        self.reset_ceiling(format!("limits changed ({})", describe_limits(&limits)), now)
+    }
+
+    fn reset_ceiling(&mut self, why: String, now: Instant) -> Change {
+        self.ceiling = ceiling(&self.limits, self.agent_mb(), self.max);
+        crate::log!("capacity: {why}, up to {} agent(s) at once", self.ceiling);
+        self.note(format!("{why}, ceiling {}", self.ceiling));
         if self.auto && self.limit > self.ceiling {
             self.limit = self.ceiling;
             self.last_change = now;
-            self.note(format!("limits changed ({}), limit cut to the new ceiling {}", describe_limits(&limits), self.ceiling));
+            self.note(format!("{why}, limit cut to the new ceiling {}", self.ceiling));
             return Change::Shrank;
         }
         Change::None
@@ -228,8 +276,10 @@ impl Capacity {
         };
         let pids_below = |n: u64| pids_left.map(|l| l < n).unwrap_or(false);
         let mem_below = |mb: u64| s.avail_mb.map(|a| a < mb).unwrap_or(false);
-        self.critical = over(s.mem_pressure, MEM_PRESSURE_CRITICAL) || mem_below(self.agent_mb / 8) || pids_below(PIDS_RESERVE);
-        self.strained = self.critical || over(s.mem_pressure, MEM_PRESSURE_HIGH) || over(s.cpu_pressure, CPU_PRESSURE_HIGH) || over(s.throttle, THROTTLE_HIGH) || mem_below(self.agent_mb / 4) || pids_below(PIDS_PER_AGENT / 2);
+        let agent_mb = self.agent_mb();
+        self.exhausted = mem_below(agent_mb / 8) || pids_below(PIDS_RESERVE);
+        self.critical = self.exhausted || over(s.mem_pressure, MEM_PRESSURE_CRITICAL);
+        self.strained = self.critical || over(s.mem_pressure, MEM_PRESSURE_HIGH) || over(s.cpu_pressure, CPU_PRESSURE_HIGH) || over(s.throttle, THROTTLE_HIGH) || mem_below(agent_mb / 4) || pids_below(PIDS_PER_AGENT / 2);
         if !self.auto {
             return if self.critical { Change::Critical } else { Change::None };
         }
@@ -249,7 +299,7 @@ impl Capacity {
         // Without a memory reading the room check can't pass: stay put. Warm
         // idle processes count as room: the next turn stops one if it must,
         // and otherwise they would hold the limit down for good.
-        let calm = under(s.mem_pressure, MEM_PRESSURE_CALM) && under(s.cpu_pressure, CPU_PRESSURE_CALM) && under(s.throttle, THROTTLE_CALM) && !pids_below(PIDS_PER_AGENT) && s.avail_mb.map(|a| a + s.reclaim_mb >= self.agent_mb).unwrap_or(false);
+        let calm = under(s.mem_pressure, MEM_PRESSURE_CALM) && under(s.cpu_pressure, CPU_PRESSURE_CALM) && under(s.throttle, THROTTLE_CALM) && !pids_below(PIDS_PER_AGENT) && s.avail_mb.map(|a| a + s.reclaim_mb >= agent_mb).unwrap_or(false);
         if !calm {
             self.calm_since = None;
             return Change::None;
@@ -278,7 +328,7 @@ impl Capacity {
         let mut v = self.status();
         let l = &self.limits;
         v["ceilingBy"] = json!({
-            "memory": l.mem_mb.map(|m| m.saturating_sub(RESERVE_MB) / self.agent_mb.max(1)),
+            "memory": l.mem_mb.map(|m| m.saturating_sub(RESERVE_MB) / self.agent_mb().max(1)),
             "cpu": l.cpus.max(1) * 2,
             "pids": l.pids_max.map(|p| p.saturating_sub(PIDS_RESERVE) / PIDS_PER_AGENT),
             "max": self.max,
@@ -299,7 +349,9 @@ impl Capacity {
             "auto": self.auto,
             "limit": self.limit,
             "ceiling": self.ceiling,
-            "agentMb": self.agent_mb,
+            "agentMb": self.agent_mb(),
+            "agentMbConfigured": self.agent_mb,
+            "agentMbObserved": self.observed_mb,
             "memLimitMb": self.limits.mem_mb,
             "cpus": self.limits.cpus,
             "pidsMax": self.limits.pids_max,
@@ -311,6 +363,7 @@ impl Capacity {
             "cpuThrottle": self.last.throttle,
             "strained": self.strained,
             "critical": self.critical,
+            "exhausted": self.exhausted,
         })
     }
 }
@@ -491,7 +544,7 @@ mod tests {
 
     fn cap(ceiling: usize) -> Capacity {
         let now = Instant::now();
-        Capacity { auto: true, agent_mb: 300, max: 8, stable: Duration::from_secs(30), limits: limits(Some(4096), 4, None), limits_at: now, ceiling, limit: 1, calm_since: None, last_change: now, last: Sample::default(), strained: false, critical: false, throttled: None, throttle_avg: None, last_decision: None }
+        Capacity { auto: true, agent_mb: 300, observed_mb: 0, max: 8, stable: Duration::from_secs(30), limits: limits(Some(4096), 4, None), limits_at: now, ceiling, limit: 1, calm_since: None, last_change: now, last: Sample::default(), strained: false, critical: false, exhausted: false, throttled: None, throttle_avg: None, last_decision: None }
     }
 
     fn calm() -> Sample {
@@ -678,5 +731,77 @@ mod tests {
         assert_eq!(field("MemTotal:        990208 kB\nMemAvailable:   631808 kB\n", "MemAvailable"), Some(631808));
         assert_eq!(field("anon 1\ninactive_file 4096\n", "inactive_file"), Some(4096));
         assert_eq!(field("nr_throttled 38\nthrottled_usec 1934124\n", "throttled_usec"), Some(1_934_124));
+    }
+
+    #[test]
+    fn a_process_over_budget_raises_the_budget_and_cuts_the_ceiling() {
+        // 4096 MB, 300 MB budget: ceiling 8. Processes really at 700 MB: (4096 - 96) / 700 = 5.
+        let mut c = cap(8);
+        let t0 = Instant::now();
+        c.limit = 8;
+        assert_eq!(c.observe(250, t0), Change::None, "under budget: nothing to learn");
+        assert_eq!(c.observe(700, t0), Change::Shrank);
+        assert_eq!((c.ceiling, c.limit(), c.agent_mb()), (5, 5, 700));
+        assert_eq!(c.observe(650, t0), Change::None, "a smaller reading never lowers the budget");
+        assert_eq!(c.observe(740, t0), Change::None, "a small overshoot (under 10%) does not re-cut");
+        assert_eq!(c.observe(780, t0), Change::None, "a 10% overshoot re-budgets (the ceiling stays 5: 4000 / 780)");
+        assert_eq!(c.agent_mb(), 780);
+        let tight = Sample { avail_mb: Some(650), ..calm() };
+        c.apply(tight, 1, 2, t0);
+        assert_eq!(c.apply(tight, 1, 2, t0 + Duration::from_secs(60)), Change::None, "room is measured against the raised budget");
+        assert_eq!(c.status()["agentMb"], 780);
+        assert_eq!(c.status()["agentMbConfigured"], 300);
+    }
+
+    #[test]
+    fn stalls_are_critical_but_only_running_out_is_exhausted() {
+        let mut c = cap(4);
+        let t0 = Instant::now();
+        let stalls = Sample { mem_pressure: Some(55.0), ..calm() };
+        assert_eq!(c.apply(stalls, 1, 0, t0), Change::Critical);
+        assert!(c.critical() && !c.exhausted());
+        let out = Sample { avail_mb: Some(20), ..calm() };
+        assert_eq!(c.apply(out, 1, 0, t0 + Duration::from_secs(1)), Change::Critical);
+        assert!(c.exhausted());
+        c.limits.pids_max = Some(256);
+        let full = Sample { pids: Some(240), ..calm() };
+        c.apply(full, 1, 0, t0 + Duration::from_secs(2));
+        assert!(c.exhausted());
+        c.apply(calm(), 1, 0, t0 + Duration::from_secs(3));
+        assert!(!c.exhausted());
+    }
+
+    #[test]
+    fn warm_ups_need_room_for_two_agents() {
+        let mut c = cap(4);
+        let t0 = Instant::now();
+        c.apply(calm(), 0, 0, t0);
+        assert!(c.warm_room(), "2000 MB free fits two 300 MB agents");
+        c.apply(Sample { avail_mb: Some(500), ..calm() }, 0, 0, t0);
+        assert!(!c.warm_room(), "500 MB free fits one agent, not a warm one plus the next turn");
+        c.apply(Sample { avail_mb: Some(2000), mem_pressure: Some(25.0), ..calm() }, 0, 0, t0);
+        assert!(!c.warm_room(), "pressure blocks warm-ups whatever the free memory");
+        c.apply(Sample { avail_mb: None, ..calm() }, 0, 0, t0);
+        assert!(!c.warm_room(), "unknown free memory is not room");
+    }
+
+    #[test]
+    fn the_raised_budget_holds_back_growth_and_widens_exhaustion() {
+        let mut c = cap(8);
+        let t0 = Instant::now();
+        assert_eq!(c.observe(340, t0), Change::None, "under 50 MB over: ignored");
+        assert_eq!(c.agent_mb(), 300);
+        assert_eq!(c.observe(700, t0), Change::None, "limit 1 is already under the new ceiling 5");
+        assert_eq!((c.ceiling, c.limit()), (5, 1));
+        let tight = Sample { avail_mb: Some(650), ..calm() };
+        c.apply(tight, 1, 2, t0);
+        assert_eq!(c.apply(tight, 1, 2, t0 + Duration::from_secs(60)), Change::None, "650 MB free does not fit a 700 MB agent");
+        assert_eq!(c.limit(), 1);
+        assert!(c.room_short());
+        c.apply(Sample { avail_mb: Some(80), ..calm() }, 1, 2, t0 + Duration::from_secs(61));
+        assert!(c.exhausted(), "80 MB is under 700 / 8");
+        let roomy = Sample { avail_mb: Some(800), ..calm() };
+        c.apply(roomy, 1, 2, t0 + Duration::from_secs(120));
+        assert_eq!(c.apply(roomy, 1, 2, t0 + Duration::from_secs(160)), Change::Grew);
     }
 }

@@ -49,22 +49,38 @@ pub(crate) fn checkout_error(message: impl Into<String>, code: &str) -> Value {
 /// Cheap filesystem-only probe used by project/workspace descriptors (no git spawn).
 /// Cached per cwd for `PROBE_TTL`: `fetch_agents` calls it for every agent
 /// on every connect, which on a slow disk under memory pressure stalled the
-/// manager for a second at a time. A branch switch shows up to `PROBE_TTL` late.
+/// manager for a second at a time. Git actions call `forget`; a switch made
+/// outside the app shows up to `PROBE_TTL` late.
 pub fn probe(cwd: &str) -> Option<(PathBuf, Option<String>)> {
-    static CACHE: std::sync::OnceLock<Mutex<HashMap<String, (std::time::Instant, Option<(PathBuf, Option<String>)>)>>> = std::sync::OnceLock::new();
-    let mut cache = CACHE.get_or_init(Default::default).lock().unwrap();
     let now = std::time::Instant::now();
-    if let Some((at, hit)) = cache.get(cwd) {
-        if now.duration_since(*at) < PROBE_TTL {
-            return hit.clone();
+    {
+        let cache = probe_cache().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((at, hit)) = cache.get(cwd) {
+            if now.duration_since(*at) < PROBE_TTL {
+                return hit.clone();
+            }
         }
     }
+    // Disk reads outside the lock: concurrent probes of other cwds do not queue.
+    let fresh = probe_uncached(cwd);
+    let mut cache = probe_cache().lock().unwrap_or_else(|e| e.into_inner());
     if cache.len() >= PROBE_CACHE_MAX {
         cache.retain(|_, (at, _)| now.duration_since(*at) < PROBE_TTL);
     }
-    let fresh = probe_uncached(cwd);
     cache.insert(cwd.to_string(), (now, fresh.clone()));
     fresh
+}
+
+/// Drop the cached probe for a cwd whose branch may have just changed.
+pub fn forget(cwd: &str) {
+    probe_cache().lock().unwrap_or_else(|e| e.into_inner()).remove(cwd);
+}
+
+type ProbeCache = Mutex<HashMap<String, (std::time::Instant, Option<(PathBuf, Option<String>)>)>>;
+
+fn probe_cache() -> &'static ProbeCache {
+    static CACHE: std::sync::OnceLock<ProbeCache> = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
 }
 
 const PROBE_TTL: Duration = Duration::from_secs(30);
@@ -480,6 +496,8 @@ mod tests {
         std::fs::write(dir.join(".git/HEAD"), "ref: refs/heads/topic\n").unwrap();
         assert_eq!(probe(&cwd), None, "the cached answer stands within the TTL");
         assert_eq!(probe_uncached(&cwd), Some((dir.clone(), Some("topic".to_string()))));
+        forget(&cwd);
+        assert_eq!(probe(&cwd), Some((dir.clone(), Some("topic".to_string()))), "a git action forgets the entry");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

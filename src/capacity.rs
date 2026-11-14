@@ -37,6 +37,8 @@ const LIMITS_REFRESH: Duration = Duration::from_secs(60);
 /// against the pids limit, and the pids kept free for the daemon.
 const PIDS_PER_AGENT: u64 = 64;
 const PIDS_RESERVE: u64 = 32;
+/// Smallest overshoot of the budget worth re-budgeting for (also 10% of it).
+const OBSERVE_STEP_MB: u64 = 50;
 
 /// Pressure (PSI `some avg10`, percent) at or above which the limit shrinks.
 const MEM_PRESSURE_HIGH: f64 = 10.0;
@@ -215,10 +217,12 @@ impl Capacity {
         }
     }
 
-    /// A process grew past the budget: budget what it really takes, and
-    /// recompute the ceiling like a lowered container limit.
+    /// A process grew well past the budget: budget what it really takes, and
+    /// recompute the ceiling like a lowered container limit. Small overshoots
+    /// are ignored so a slowly growing process does not re-cut every tick.
     fn observe(&mut self, peak_rss_mb: u64, now: Instant) -> Change {
-        if peak_rss_mb <= self.agent_mb() {
+        let budget = self.agent_mb();
+        if peak_rss_mb < budget + (budget / 10).max(OBSERVE_STEP_MB) {
             return Change::None;
         }
         self.observed_mb = peak_rss_mb;
@@ -739,11 +743,13 @@ mod tests {
         assert_eq!(c.observe(700, t0), Change::Shrank);
         assert_eq!((c.ceiling, c.limit(), c.agent_mb()), (5, 5, 700));
         assert_eq!(c.observe(650, t0), Change::None, "a smaller reading never lowers the budget");
-        assert_eq!(c.agent_mb(), 700);
+        assert_eq!(c.observe(740, t0), Change::None, "a small overshoot (under 10%) does not re-cut");
+        assert_eq!(c.observe(780, t0), Change::None, "a 10% overshoot re-budgets (the ceiling stays 5: 4000 / 780)");
+        assert_eq!(c.agent_mb(), 780);
         let tight = Sample { avail_mb: Some(650), ..calm() };
         c.apply(tight, 1, 2, t0);
         assert_eq!(c.apply(tight, 1, 2, t0 + Duration::from_secs(60)), Change::None, "room is measured against the raised budget");
-        assert_eq!(c.status()["agentMb"], 700);
+        assert_eq!(c.status()["agentMb"], 780);
         assert_eq!(c.status()["agentMbConfigured"], 300);
     }
 

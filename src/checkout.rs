@@ -47,7 +47,30 @@ pub(crate) fn checkout_error(message: impl Into<String>, code: &str) -> Value {
 }
 
 /// Cheap filesystem-only probe used by project/workspace descriptors (no git spawn).
+/// Cached per cwd for `PROBE_TTL`: `fetch_agents` calls it for every agent
+/// on every connect, which on a slow disk under memory pressure stalled the
+/// manager for a second at a time. A branch switch shows up to `PROBE_TTL` late.
 pub fn probe(cwd: &str) -> Option<(PathBuf, Option<String>)> {
+    static CACHE: std::sync::OnceLock<Mutex<HashMap<String, (std::time::Instant, Option<(PathBuf, Option<String>)>)>>> = std::sync::OnceLock::new();
+    let mut cache = CACHE.get_or_init(Default::default).lock().unwrap();
+    let now = std::time::Instant::now();
+    if let Some((at, hit)) = cache.get(cwd) {
+        if now.duration_since(*at) < PROBE_TTL {
+            return hit.clone();
+        }
+    }
+    if cache.len() >= PROBE_CACHE_MAX {
+        cache.retain(|_, (at, _)| now.duration_since(*at) < PROBE_TTL);
+    }
+    let fresh = probe_uncached(cwd);
+    cache.insert(cwd.to_string(), (now, fresh.clone()));
+    fresh
+}
+
+const PROBE_TTL: Duration = Duration::from_secs(30);
+const PROBE_CACHE_MAX: usize = 1024;
+
+fn probe_uncached(cwd: &str) -> Option<(PathBuf, Option<String>)> {
     let mut dir = Some(Path::new(cwd));
     while let Some(d) = dir {
         let dot = d.join(".git");
@@ -444,5 +467,19 @@ mod tests {
         std::env::set_var("HOME", "/home/tester");
         assert_eq!(expand("~/x"), PathBuf::from("/home/tester/x"));
         assert_eq!(expand("/abs"), PathBuf::from("/abs"));
+    }
+
+    #[test]
+    fn probe_is_cached_per_cwd_for_a_while() {
+        let dir = std::env::temp_dir().join(format!("feiyi-probe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cwd = dir.to_string_lossy().into_owned();
+        assert_eq!(probe(&cwd), None, "plain directory");
+        std::fs::create_dir(dir.join(".git")).unwrap();
+        std::fs::write(dir.join(".git/HEAD"), "ref: refs/heads/topic\n").unwrap();
+        assert_eq!(probe(&cwd), None, "the cached answer stands within the TTL");
+        assert_eq!(probe_uncached(&cwd), Some((dir.clone(), Some("topic".to_string()))));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -364,7 +364,13 @@ impl Manager {
         }
         self.keep_warm();
         self.run_retries_and_watchdog();
-        self.flush_all();
+        // The agents.json fsync runs off the manager task; shutdown still saves in line.
+        self.flush_timelines();
+        if self.agents_dirty {
+            self.agents_dirty = false;
+            self.store.save_agents_in_background(self.agents.values().map(|a| &a.rec));
+        }
+        self.usage.save_if_dirty();
         let unload = self.cfg.timeline_unload;
         for agent in self.agents.values_mut() {
             if agent.timeline.is_some() && agent.status != "running" && agent.dirty_rows.is_empty() && agent.last_touch.elapsed() >= unload {
@@ -450,11 +456,16 @@ impl Manager {
         });
     }
 
-    pub fn flush_all(&mut self) {
+    /// Timeline rows to disk (appends, no fsync).
+    fn flush_timelines(&mut self) {
         self.flush_chunks();
         for agent in self.agents.values_mut() {
             agent.flush(&self.store);
         }
+    }
+
+    pub fn flush_all(&mut self) {
+        self.flush_timelines();
         if self.agents_dirty {
             self.agents_dirty = false;
             self.store.save_agents(self.agents.values().map(|a| &a.rec));
@@ -787,6 +798,7 @@ impl Manager {
             }
         }
         // Sub-agents share their agent's process: under pressure no new ones start.
+        crate::capacity::set_machine_strained(self.capacity.strained());
         self.claude.set_strained(self.capacity.strained(), self.capacity.critical());
         let max = self.slots("claude");
         if max != self.claude.max_live() {

@@ -180,7 +180,7 @@ impl Config {
             app_base_url: env("PASEO_APP_BASE_URL").unwrap_or_else(|| "https://app.paseo.sh".into()),
             claude_bin: env("PASEO_CLAUDE_BIN").unwrap_or_else(|| "claude".into()),
             codex_bin: env("PASEO_CODEX_BIN").unwrap_or_else(|| "codex".into()),
-            claude_idle: env_secs("PASEO_CLAUDE_IDLE_SECS", 90),
+            claude_idle: env_secs("PASEO_CLAUDE_IDLE_SECS", 300),
             claude_max_live: crate::capacity::Mode::parse(env("PASEO_CLAUDE_MAX_LIVE").as_deref()),
             claude_keep_warm: env_bool("PASEO_CLAUDE_KEEP_WARM").unwrap_or(true),
             codex_idle: env_secs("PASEO_CODEX_IDLE_SECS", 300),

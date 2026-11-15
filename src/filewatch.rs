@@ -1,6 +1,6 @@
 //! `fs.file.subscribe` / `fs.file.unsubscribe`: the app's open file pane gets an
 //! `fs.file.update` whenever the file's version (size, mtime, inode) changes.
-//! Upstream uses `fs.watch`; feiyi polls the metadata once a second instead, only
+//! Upstream uses `fs.watch`; feiyi polls the metadata every 2 s (5 s once it has stayed the same) instead, only
 //! while subscribed. Subscriptions belong to one connection and die with it.
 
 use crate::manager::{reply, Out};
@@ -9,7 +9,10 @@ use std::collections::HashMap;
 use std::time::Duration;
 use tokio::task::JoinHandle;
 
-const POLL: Duration = Duration::from_secs(1);
+const POLL: Duration = Duration::from_secs(2);
+/// The wait after `SLOW_AFTER` polls found no change; a change resets it.
+const SLOW_POLL: Duration = Duration::from_secs(5);
+const SLOW_AFTER: u32 = 10;
 const MAX_PER_CONNECTION: usize = 32;
 
 #[derive(Default)]
@@ -21,6 +24,10 @@ impl Drop for Watches {
             task.abort();
         }
     }
+}
+
+fn poll_wait(unchanged: u32) -> Duration {
+    if unchanged >= SLOW_AFTER { SLOW_POLL } else { POLL }
 }
 
 async fn version(cwd: &str, path: &str) -> Value {
@@ -55,9 +62,9 @@ impl Watches {
                 let task = tokio::spawn(async move {
                     let mut last = version(&cwd, &path).await;
                     reply(&out, subscribed(&task_id, last.clone(), &rid));
-                    let mut tick = tokio::time::interval(POLL);
+                    let mut unchanged = 0u32;
                     loop {
-                        tick.tick().await;
+                        tokio::time::sleep(poll_wait(unchanged)).await;
                         if out.is_closed() {
                             return;
                         }
@@ -65,6 +72,9 @@ impl Watches {
                         if now != last {
                             reply(&out, json!({ "type": "fs.file.update", "payload": { "subscriptionId": task_id, "version": now } }));
                             last = now;
+                            unchanged = 0;
+                        } else {
+                            unchanged = unchanged.saturating_add(1);
                         }
                     }
                 });
@@ -125,5 +135,12 @@ mod tests {
         assert!(!watches.handle("fs.entry.create.request", &json!({}), &tx));
         drop(watches);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn polling_slows_after_unchanged_polls() {
+        assert_eq!(poll_wait(0), POLL);
+        assert_eq!(poll_wait(SLOW_AFTER - 1), POLL);
+        assert_eq!(poll_wait(SLOW_AFTER), SLOW_POLL);
     }
 }

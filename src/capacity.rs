@@ -23,7 +23,20 @@
 //! warm idle processes so the daemon keeps enough room to stay in control.
 
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+
+static STRAINED: AtomicBool = AtomicBool::new(false);
+
+/// The manager's last reading, for background sweeps outside it (backup, code graph).
+pub fn set_machine_strained(strained: bool) {
+    STRAINED.store(strained, Ordering::Relaxed);
+}
+
+/// Background sweeps skip their cycle while this holds.
+pub fn machine_strained() -> bool {
+    STRAINED.load(Ordering::Relaxed)
+}
 
 /// Memory kept for the daemon and the commands agents run, outside the
 /// per-agent budget.

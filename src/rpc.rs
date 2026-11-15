@@ -66,13 +66,18 @@ impl Manager {
         match kind.as_str() {
             "fetch_agents_request" | "fetch_agent_history_request" => {
                 let include_archived = kind == "fetch_agent_history_request" || msg.pointer("/filter/includeArchived").and_then(|v| v.as_bool()).unwrap_or(false);
-                let mut entries = self.directory_entries(include_archived);
                 let response_type = kind.replace("_request", "_response");
-                let sync = msg.get("sync").filter(|v| v.is_object() && kind == "fetch_agents_request").map(|request| {
-                    let mut changes = self.sync.fetch(Kind::Agents, request, &self.directory_entries(true), "/agent/id");
-                    changes.narrow(&mut entries, "/agent/id");
-                    changes.sync
-                });
+                let (entries, sync) = match msg.get("sync").filter(|v| v.is_object() && kind == "fetch_agents_request") {
+                    Some(request) => {
+                        // One snapshot pass serves both the change feed and the response.
+                        let all = self.directory_entries(true);
+                        let mut changes = self.sync.fetch(Kind::Agents, request, &all, "/agent/id");
+                        let mut entries: Vec<Value> = if include_archived { all } else { all.into_iter().filter(|e| e.pointer("/agent/archivedAt").map_or(true, Value::is_null)).collect() };
+                        changes.narrow(&mut entries, "/agent/id");
+                        (entries, Some(changes.sync))
+                    }
+                    None => (self.directory_entries(include_archived), None),
+                };
                 let mut payload = json!({ "requestId": rid, "entries": entries, "pageInfo": { "nextCursor": null, "prevCursor": null, "hasMore": false } });
                 if let Some(sync) = sync {
                     payload["sync"] = sync;

@@ -14,6 +14,8 @@ use std::io::{Read, Write};
 pub const HOOK_CMD: &str = "guard-hook";
 /// Tools whose input the hook reads (the `--settings` matcher).
 pub const MATCHER: &str = "Read|Edit|MultiEdit|Write|Grep|Glob|Bash|NotebookEdit";
+/// `MATCHER` without Bash, when Bash goes through the merged `pre-tool-hook`.
+pub const MATCHER_NO_BASH: &str = "Read|Edit|MultiEdit|Write|Grep|Glob|NotebookEdit";
 
 /// Variables holding secrets, by name (GH_TOKEN is left out: agents push with it).
 const SECRET_VARS: &[&str] = &["PASEO_ZILONG_API_KEY", "PASEO_LITE_MCP_TOKEN", "PASEO_PASSWORD", "FEIYI_BACKUP_PASSPHRASE", "FEIYI_BACKUP_TURSO_TOKEN", "FEIYI_BACKUP_TURSO_URL", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_MESSAGING_TOKEN", "CODEX_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"];
@@ -35,14 +37,19 @@ pub fn hook_main() {
         return;
     }
     let Ok(event) = serde_json::from_str::<Value>(&input) else { return };
-    let Some(home) = std::env::var("HOME").ok().filter(|h| !h.is_empty()) else { return };
-    let state = std::env::var("PASEO_LITE_HOME").ok().filter(|s| !s.trim_end_matches('/').is_empty()).unwrap_or_else(|| format!("{home}/.paseo-lite"));
-    if let Some(reason) = denied(&event, &home, &state) {
-        let out = json!({ "hookSpecificOutput": { "hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason } });
+    if let Some(out) = hook_output(&event) {
         let mut stdout = std::io::stdout();
         let _ = stdout.write_all(out.to_string().as_bytes());
         let _ = stdout.flush();
     }
+}
+
+/// The deny output for this event, None to leave it to the normal flow.
+pub fn hook_output(event: &Value) -> Option<Value> {
+    let home = std::env::var("HOME").ok().filter(|h| !h.is_empty())?;
+    let state = std::env::var("PASEO_LITE_HOME").ok().filter(|s| !s.trim_end_matches('/').is_empty()).unwrap_or_else(|| format!("{home}/.paseo-lite"));
+    let reason = denied(event, &home, &state)?;
+    Some(json!({ "hookSpecificOutput": { "hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason } }))
 }
 
 /// The reason to deny this tool call, None to leave it to the normal flow.

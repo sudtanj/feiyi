@@ -59,7 +59,7 @@ ENVIRONMENT (selection):
     PASEO_LOG_CONSOLE_LEVEL  debug|info|warn|error
     PASEO_RELAY_ENDPOINT     default relay.paseo.sh:443
     PASEO_CLAUDE_MAX_LIVE    max concurrent claude processes, or auto (default: grows with the machine)
-    PASEO_CLAUDE_IDLE_SECS   keep-warm time for an idle claude process (default 90)
+    PASEO_CLAUDE_IDLE_SECS   keep-warm time for an idle claude process (default 300)
     PASEO_CODEX_IDLE_SECS    idle time before the shared codex app-server exits (default 300)
     PASEO_DEFAULT_SYSTEM_PROMPT  instructions for every agent (default: do not run/test the app locally, ask questions up front then work unattended; set empty to disable)
     PASEO_CLAUDE_SUBAGENT_PROMPT  extra instructions for Claude Code agents (default: hand work to background sub-agents and stay free; set empty to disable)
@@ -94,6 +94,7 @@ fn main() {
     // First, so the wrapped command's own `-h` is not taken for ours.
     match args.first().map(String::as_str) {
         Some(token_saver::HOOK_CMD) => return token_saver::hook_main(),
+        Some(token_saver::PRE_TOOL_CMD) => return token_saver::pre_tool_main(),
         Some(guard::HOOK_CMD) => return guard::hook_main(),
         Some(graph::HOOK_CMD) => return graph::hook_main(),
         Some(token_saver::RUN_CMD) => token_saver::run_main(&args[1..]),

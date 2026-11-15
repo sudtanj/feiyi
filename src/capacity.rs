@@ -2,9 +2,9 @@
 //!
 //! With `auto` (the default) the limit adapts to the machine: it starts at
 //! the ceiling, so a fresh daemon uses the whole machine at once, shrinks by
-//! one when pressure builds up, and grows back by one while turns are queued
-//! and the machine has stayed calm for `stable` (low memory/CPU pressure, no
-//! CPU throttling, room for another agent, warm idle processes counting as
+//! one when real shortage builds up, and grows back by one once
+//! the machine has stayed calm for `stable` (low memory/CPU pressure, no
+//! CPU throttling, room for every unused slot plus one more agent, warm idle processes counting as
 //! room). It never exceeds the
 //! ceiling: what the memory limit fits at `agent_mb` per agent, the CPU count
 //! times two, what the pids limit fits, and `max`. Running turns are never
@@ -55,6 +55,8 @@ const OBSERVE_STEP_MB: u64 = 50;
 
 /// Pressure (PSI `some avg10`, percent) at or above which the limit shrinks.
 const MEM_PRESSURE_HIGH: f64 = 10.0;
+/// Memory PSI with free memory to spare is page-in or cache reclaim, not a reason to drop a slot.
+const MEM_PRESSURE_SHRINK: f64 = 25.0;
 const CPU_PRESSURE_HIGH: f64 = 80.0;
 /// Memory stalls at or above this are critical.
 const MEM_PRESSURE_CRITICAL: f64 = 40.0;
@@ -279,7 +281,7 @@ impl Capacity {
         self.throttle_avg
     }
 
-    fn apply(&mut self, s: Sample, running: usize, queued: usize, now: Instant) -> Change {
+    fn apply(&mut self, s: Sample, running: usize, _queued: usize, now: Instant) -> Change {
         self.last = s;
         let over = |v: Option<f64>, max: f64| v.map(|v| v >= max).unwrap_or(false);
         let under = |v: Option<f64>, max: f64| v.map(|v| v < max).unwrap_or(true);
@@ -299,7 +301,8 @@ impl Capacity {
         if self.strained {
             self.calm_since = None;
             let mut shrank = false;
-            if self.limit > 1 && (self.critical || now.duration_since(self.last_change) >= SHRINK_GAP) {
+            let short = self.critical || mem_below(agent_mb + RESERVE_MB) || over(s.cpu_pressure, CPU_PRESSURE_HIGH) || over(s.throttle, THROTTLE_HIGH) || pids_below(PIDS_PER_AGENT / 2) || over(s.mem_pressure, MEM_PRESSURE_SHRINK);
+            if short && self.limit > 1 && (self.critical || now.duration_since(self.last_change) >= SHRINK_GAP) {
                 self.limit -= 1;
                 self.last_change = now;
                 shrank = true;
@@ -309,17 +312,18 @@ impl Capacity {
             }
             return if self.critical { Change::Critical } else if shrank { Change::Shrank } else { Change::None };
         }
-        // Without a memory reading the room check can't pass: stay put. Warm
-        // idle processes count as room: the next turn stops one if it must,
-        // and otherwise they would hold the limit down for good.
-        let calm = under(s.mem_pressure, MEM_PRESSURE_CALM) && under(s.cpu_pressure, CPU_PRESSURE_CALM) && under(s.throttle, THROTTLE_CALM) && !pids_below(PIDS_PER_AGENT) && s.avail_mb.map(|a| a + s.reclaim_mb >= agent_mb + RESERVE_MB).unwrap_or(false);
+        // Without a memory reading the room check can't pass: stay put. Room
+        // is needed for every unused slot plus the new one. Warm idle
+        // processes count as room: the next turn stops one if it must, and
+        // otherwise they would hold the limit down for good.
+        let room_mb = (self.limit.saturating_sub(running) as u64 + 1) * agent_mb + RESERVE_MB;
+        let calm = under(s.mem_pressure, MEM_PRESSURE_CALM) && under(s.cpu_pressure, CPU_PRESSURE_CALM) && under(s.throttle, THROTTLE_CALM) && !pids_below(PIDS_PER_AGENT) && s.avail_mb.map(|a| a + s.reclaim_mb >= room_mb).unwrap_or(false);
         if !calm {
             self.calm_since = None;
             return Change::None;
         }
         let since = *self.calm_since.get_or_insert(now);
-        // Grow only when the current limit is the bottleneck.
-        if queued == 0 || running < self.limit || self.limit >= self.ceiling || now.duration_since(since) < self.stable {
+        if self.limit >= self.ceiling || now.duration_since(since) < self.stable {
             return Change::None;
         }
         self.limit += 1;
@@ -327,7 +331,7 @@ impl Capacity {
         // The new agent's load has to prove calm again before the next step.
         self.calm_since = None;
         crate::log!("capacity: machine stable, {} agent(s) at once now ({})", self.limit, describe(&s));
-        self.note(format!("grew to {}: machine stable with turns queued ({})", self.limit, describe(&s)));
+        self.note(format!("grew to {}: machine stable with room to spare ({})", self.limit, describe(&s)));
         Change::Grew
     }
 
@@ -587,29 +591,32 @@ mod tests {
     }
 
     #[test]
-    fn grows_only_after_a_stable_window_with_work_queued() {
+    fn grows_only_after_a_stable_window() {
         let mut c = cap(4);
         let t0 = Instant::now();
         assert_eq!(c.apply(calm(), 1, 2, t0), Change::None);
         assert_eq!(c.apply(calm(), 1, 2, t0 + Duration::from_secs(29)), Change::None);
         assert_eq!(c.apply(calm(), 1, 2, t0 + Duration::from_secs(30)), Change::Grew);
         assert_eq!(c.limit(), 2);
-        // Needs a new stable window before the next step.
-        assert_eq!(c.apply(calm(), 2, 1, t0 + Duration::from_secs(31)), Change::None);
-        assert_eq!(c.apply(calm(), 2, 1, t0 + Duration::from_secs(61)), Change::Grew);
+        // Needs a new stable window before the next step; no queue needed.
+        assert_eq!(c.apply(calm(), 2, 0, t0 + Duration::from_secs(31)), Change::None);
+        assert_eq!(c.apply(calm(), 2, 0, t0 + Duration::from_secs(61)), Change::Grew);
         assert_eq!(c.limit(), 3);
     }
 
     #[test]
-    fn does_not_grow_without_a_queue_or_past_the_ceiling() {
+    fn does_not_grow_past_the_ceiling_or_without_room_for_the_unused_slots() {
         let mut c = cap(1);
         let t0 = Instant::now();
         c.apply(calm(), 1, 3, t0);
         assert_eq!(c.apply(calm(), 1, 3, t0 + Duration::from_secs(60)), Change::None);
         let mut c = cap(4);
-        c.apply(calm(), 1, 0, t0);
-        assert_eq!(c.apply(calm(), 1, 0, t0 + Duration::from_secs(60)), Change::None);
-        assert_eq!(c.limit(), 1);
+        c.limit = 2;
+        // 3 slots plus the reserve need 1028 MB; 700 MB fits one agent, not three.
+        let thin = Sample { avail_mb: Some(700), ..calm() };
+        c.apply(thin, 0, 0, t0);
+        assert_eq!(c.apply(thin, 0, 0, t0 + Duration::from_secs(60)), Change::None);
+        assert_eq!(c.limit(), 2);
     }
 
     #[test]
@@ -629,6 +636,14 @@ mod tests {
         c.apply(hot, 3, 1, t0 + Duration::from_secs(20));
         c.apply(hot, 3, 1, t0 + Duration::from_secs(30));
         assert_eq!(c.limit(), 1, "never below one");
+        // Pressure between HIGH and SHRINK with room for an agent: strained, but the slot stays.
+        let blip = Sample { avail_mb: Some(300 + 128 + 100), mem_pressure: Some(15.0), ..calm() };
+        c.limit = 2;
+        c.calm_since = Some(t0);
+        assert_eq!(c.apply(blip, 2, 1, t0 + Duration::from_secs(50)), Change::None);
+        assert!(c.strained());
+        assert_eq!(c.limit(), 2, "page-in pressure with free memory does not drop a slot");
+        assert!(c.calm_since.is_none(), "the strain still resets the calm window");
         let low = Sample { avail_mb: Some(70), ..calm() };
         c.limit = 2;
         c.apply(low, 2, 1, t0 + Duration::from_secs(60));
@@ -726,6 +741,30 @@ mod tests {
         let unknown = Sample { avail_mb: None, ..calm() };
         c.apply(unknown, 1, 2, t0);
         assert_eq!(c.apply(unknown, 1, 2, t0 + Duration::from_secs(60)), Change::None);
+        let mut c = cap(4);
+        c.limit = 2;
+        // One unused slot plus the new one plus the reserve: 628 MB.
+        let short = Sample { avail_mb: Some(600), ..calm() };
+        c.apply(short, 1, 0, t0);
+        assert_eq!(c.apply(short, 1, 0, t0 + Duration::from_secs(60)), Change::None);
+        assert_eq!(c.limit(), 2);
+    }
+
+    #[test]
+    fn grows_one_slot_at_a_time_as_room_allows() {
+        let mut c = cap(3);
+        let t0 = Instant::now();
+        // Two agents plus the reserve: 728 MB.
+        let two = Sample { avail_mb: Some(730), ..calm() };
+        c.apply(two, 1, 0, t0);
+        assert_eq!(c.apply(two, 1, 0, t0 + Duration::from_secs(30)), Change::Grew);
+        assert_eq!(c.limit(), 2);
+        // Running 1 of 2 leaves a slot unused: a third needs two agents plus
+        // the reserve (728 MB); 430 MB only fits one.
+        let one = Sample { avail_mb: Some(430), ..calm() };
+        c.apply(one, 1, 0, t0 + Duration::from_secs(31));
+        assert_eq!(c.apply(one, 1, 0, t0 + Duration::from_secs(90)), Change::None);
+        assert_eq!(c.limit(), 2);
     }
 
     #[test]

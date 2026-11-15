@@ -437,7 +437,7 @@ impl ClaudePool {
         let output_seen = last_output.clone();
         state.sub_cap = self.sub_cap.clone();
         if self.cfg.claude_max_subagents == 0 {
-            state.sub_wait = Duration::ZERO;
+            state.sub_wait = std::time::Duration::ZERO;
         }
         state.turn_open = busy.clone();
         let events = self.events.clone();

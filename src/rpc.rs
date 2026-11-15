@@ -484,7 +484,7 @@ impl Manager {
             // The PWA's connection log, sent once it is connected again (web/app/src/runtime/connection-log.ts).
             "feiyi.client_log" => {
                 for line in msg.get("lines").and_then(|v| v.as_array()).into_iter().flatten().filter_map(|v| v.as_str()).take(200) {
-                    crate::log!("pwa {}", line.replace(['\r', '\n'], " "));
+                    crate::util::emit_client_log(format!("pwa {}", line.replace(['\r', '\n'], " ")));
                 }
             }
             "register_push_token" => {

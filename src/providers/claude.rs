@@ -76,7 +76,7 @@ impl Proc {
 }
 
 /// How long a strain reading must last before new sub-agents are refused.
-const STRAIN_HOLD: std::time::Duration = std::time::Duration::from_secs(10);
+const STRAIN_HOLD: std::time::Duration = std::time::Duration::from_secs(30);
 /// Quiet background shells are checked for leftover processes after this.
 const SHELLS_CHECK_AFTER: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
@@ -109,7 +109,7 @@ pub struct ClaudePool {
     generation: u64,
     max_live: usize,
     /// Sub-agents each process may run at once, shared with every stream
-    /// reader's gate (0 while the machine is strained).
+    /// reader's gate (1 while the machine is strained, 0 when critical).
     sub_cap: Arc<AtomicUsize>,
     /// The machine is under pressure: children holding sub-agents count
     /// against the cap again.
@@ -127,7 +127,7 @@ impl ClaudePool {
     }
 
     /// How many sub-agents a process may start now: the configured cap, or
-    /// none while the machine is strained (running ones carry on). A strain
+    /// one while the machine is strained, none when critical (running ones carry on). A strain
     /// reading must last `STRAIN_HOLD` before it closes the gate (unless it
     /// is critical): a 2-second pressure blip, such as a CLI starting, used
     /// to refuse background agents launched at that moment.
@@ -138,7 +138,7 @@ impl ClaudePool {
             now
         };
         self.strained = critical || (strained && now.duration_since(since) >= STRAIN_HOLD);
-        let cap = if self.strained { 0 } else { self.cfg.claude_max_subagents };
+        let cap = if critical { 0 } else if self.strained { self.cfg.claude_max_subagents.min(1) } else { self.cfg.claude_max_subagents };
         if self.sub_cap.swap(cap, Ordering::Relaxed) != cap {
             crate::log!("claude: up to {cap} sub-agent(s) per agent");
         }
@@ -342,6 +342,14 @@ impl ClaudePool {
         if std::env::var_os("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC").is_none() {
             cmd.env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
         }
+        // Node's heap would otherwise grow until the OOM killer takes the
+        // process: cap it under the agent's budget so it collects first.
+        let heap = format!("--max-old-space-size={}", self.cfg.agent_mb.saturating_sub(40).max(64));
+        let node_options = match std::env::var("NODE_OPTIONS") {
+            Ok(existing) if !existing.trim().is_empty() => format!("{existing} {heap}"),
+            _ => heap,
+        };
+        cmd.env("NODE_OPTIONS", node_options);
         // Sub-agents on Sonnet: most of their work doesn't need Opus. Set it
         // in the daemon's environment to override.
         if std::env::var_os("CLAUDE_CODE_SUBAGENT_MODEL").is_none() {

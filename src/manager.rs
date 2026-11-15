@@ -25,6 +25,8 @@ pub static EPOCH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| form
 /// Minimum gap between attempts to (re)start a keep-warm process, so a
 /// broken binary or a vanished session can't spin in a restart loop.
 const WARM_RETRY: Duration = Duration::from_secs(60);
+/// No warm-up this long after idle processes were released for memory.
+const RELEASE_QUIET: Duration = Duration::from_secs(300);
 
 /// Prompt text that compacts the conversation (native in Claude Code; mapped
 /// to `thread/compact/start` for Codex).
@@ -174,6 +176,8 @@ pub struct Manager {
     /// the container's limits that frees memory before it runs out.
     pub capacity: crate::capacity::Capacity,
     claude_warm_at: Option<Instant>,
+    /// When idle processes were last released for memory: no warm-up right after.
+    released_at: Option<Instant>,
     codex_warm_at: Option<Instant>,
     pub bcast: broadcast::Sender<Arc<str>>,
     pub events_tx: mpsc::UnboundedSender<ProviderEvent>,
@@ -261,7 +265,7 @@ impl Manager {
         if let crate::capacity::Mode::Fixed(n) = cfg.claude_max_live {
             claude.set_max_live(n);
         }
-        let mut manager = Manager { cfg, server_id, store, agents, claude, codex, active_cli: None, running: HashSet::new(), cli_queue: VecDeque::new(), capacity, claude_warm_at: None, codex_warm_at: None, bcast, events_tx, agents_dirty: false, pairing_url, projects, workspaces, cmds_tx, checkout: crate::checkout::Watcher::start(), started_at: now_iso(), waiters: Vec::new(), push_tokens, clients: Vec::new(), daemon_config, usage, schedules, sync: crate::directory_sync::DirectorySync::new(), chunks: HashMap::new(), chunk_deadline: None, last_trim: Instant::now() };
+        let mut manager = Manager { cfg, server_id, store, agents, claude, codex, active_cli: None, running: HashSet::new(), cli_queue: VecDeque::new(), capacity, claude_warm_at: None, released_at: None, codex_warm_at: None, bcast, events_tx, agents_dirty: false, pairing_url, projects, workspaces, cmds_tx, checkout: crate::checkout::Watcher::start(), started_at: now_iso(), waiters: Vec::new(), push_tokens, clients: Vec::new(), daemon_config, usage, schedules, sync: crate::directory_sync::DirectorySync::new(), chunks: HashMap::new(), chunk_deadline: None, last_trim: Instant::now() };
         manager.migrate_agent_workspaces();
         (manager, events_rx)
     }
@@ -408,7 +412,7 @@ impl Manager {
                 }
             }
             Some("claude") => {
-                if self.cfg.claude_keep_warm && self.capacity.warm_room() && self.claude.live_count() == 0 && !self.codex.is_running() && self.running.is_empty() && self.cli_queue.is_empty() && due(self.claude_warm_at) && binary_available(&self.cfg.claude_bin) {
+                if self.cfg.claude_keep_warm && self.capacity.warm_room() && self.released_at.map(|t| t.elapsed() >= RELEASE_QUIET).unwrap_or(true) && self.claude.live_count() == 0 && !self.codex.is_running() && self.running.is_empty() && self.cli_queue.is_empty() && due(self.claude_warm_at) && binary_available(&self.cfg.claude_bin) {
                     // The process is tied to one session and cwd, so warm the Claude
                     // agent most likely to get the next prompt: the last one used.
                     let candidate = self
@@ -774,6 +778,7 @@ impl Manager {
         let change = self.capacity.update(running, queued, idle_mb, peak_mb);
         if change == crate::capacity::Change::Critical {
             let (freed, lost) = self.claude.release_idle(self.capacity.exhausted());
+            self.released_at = Some(Instant::now());
             if freed > 0 {
                 crate::warn!("capacity: released {freed} idle claude process(es) to free memory");
             }

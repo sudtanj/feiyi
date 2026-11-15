@@ -653,6 +653,10 @@ impl State {
             }
             let hash = fingerprint(&bytes);
             if self.hashes.get(item) == Some(&hash) {
+                // Nothing to upload; the empty change only records the stamp so the file is not re-read.
+                if stamp.is_some() && !sink(Change { item: item.clone(), hash: Some(hash), stamp, put: Vec::new(), delete: Vec::new() }) {
+                    return Ok(());
+                }
                 continue;
             }
             let put = split_chunks(item, seal(key, item, &bytes)?);
@@ -1292,6 +1296,21 @@ mod tests {
     }
 
     #[test]
+    fn a_file_the_remote_already_holds_is_stamped_without_an_upload() {
+        let (_, key) = make_meta("pw", &FAST).unwrap();
+        let path = temp_home().join("t.jsonl");
+        std::fs::write(&path, "one\n").unwrap();
+        let items = BTreeMap::from([("timeline/t".to_string(), Item::File(path))]);
+        let mut state = State::new(BTreeMap::from([("timeline/t".to_string(), fingerprint(b"one\n"))]), BTreeSet::from(["timeline/t".to_string()]));
+        let first = state.plan(&key, &items).unwrap();
+        assert!(first.iter().all(|c| c.put.is_empty() && c.delete.is_empty()));
+        first.iter().for_each(|c| state.commit(c));
+        // A wrong hash would force an upload if the file were read again.
+        state.hashes.insert("timeline/t".into(), 0);
+        assert!(state.plan(&key, &items).unwrap().is_empty());
+    }
+
+    #[test]
     fn shrinking_an_item_deletes_its_stale_chunks() {
         let (_, key) = make_meta("pw", &FAST).unwrap();
         let state = State::new(BTreeMap::from([("timeline/t".to_string(), 1)]), BTreeSet::from(["timeline/t#0".to_string(), "timeline/t#1".to_string()]));
@@ -1367,7 +1386,7 @@ mod tests {
         let cfg = BackupConfig::from_value(Some(&section), Some("pw"));
         assert_eq!(cfg.ready().unwrap().unwrap().turso.host, "db-org.turso.io");
         assert_eq!(cfg.interval, Duration::from_secs(60), "floor");
-        assert_eq!(BackupConfig::from_value(None, None).interval, Duration::from_secs(900));
+        assert_eq!(BackupConfig::from_value(None, None).interval, Duration::from_secs(1800));
         let shown = cfg.redacted().to_string();
         assert!(shown.contains("\"tokenSet\":true") && !shown.contains("tok\"") && !shown.contains("pw"));
         assert_eq!(host_of("https://h.turso.io/").unwrap(), "h.turso.io");

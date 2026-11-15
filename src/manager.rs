@@ -466,10 +466,9 @@ impl Manager {
 
     pub fn flush_all(&mut self) {
         self.flush_timelines();
-        if self.agents_dirty {
-            self.agents_dirty = false;
-            self.store.save_agents(self.agents.values().map(|a| &a.rec));
-        }
+        // Not gated on agents_dirty: a background write may still be queued, and the lock in write_agents waits for it.
+        self.agents_dirty = false;
+        self.store.save_agents(self.agents.values().map(|a| &a.rec));
         self.usage.save_if_dirty();
     }
 
@@ -1375,8 +1374,8 @@ impl Manager {
             .filter(|a| a.status == "running" && a.retry_at.is_none() && self.running.contains(&a.rec.id) && a.permissions.is_empty() && a.last_event.elapsed() >= limit)
             // Waiting for a Claude slot (another chat's turn or background sub-agents) is not a stall.
             .filter(|a| !self.claude.is_waiting(&a.rec.id))
-            // The child still writes (keep-alives, deltas), or sub-agents or a compaction keep it busy.
-            .filter(|a| !a.compacting && !self.claude.working_in_background(&a.rec.id) && self.claude.quiet_for(&a.rec.id).map_or(true, |q| q >= limit))
+            // The child still writes, or sub-agents or a compaction keep it busy; the last two only for 3x the limit.
+            .filter(|a| (a.last_event.elapsed() >= limit * 3 || (!a.compacting && !self.claude.working_in_background(&a.rec.id))) && self.claude.quiet_for(&a.rec.id).map_or(true, |q| q >= limit))
             // A long-running tool call is quiet by nature.
             .filter(|a| !a.timeline.as_ref().and_then(|t| t.last()).map(|r| r.item.get("type").and_then(|t| t.as_str()) == Some("tool_call") && r.item.get("status").and_then(|s| s.as_str()) == Some("running")).unwrap_or(false))
             .map(|a| a.rec.id.clone())

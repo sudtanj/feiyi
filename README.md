@@ -223,7 +223,7 @@ PASEO_LISTEN=0.0.0.0:6768 PASEO_PASSWORD=secret feiyi
 | `PASEO_CLAUDE_IDLE_SECS` | `300` | keep-warm time after a Claude turn (when keep-warm is off). A process with background work still running (sub-agents, including ones resumed with `SendMessage`, `run_in_background` shell commands, workflows) is kept until it reports back (or goes 30 minutes without activity; 2 hours for shells and workflows, which show none until they finish); it is not evicted, but it takes no slot, so a prompt from another chat starts alongside it (while the machine is strained the prompt waits for it instead). Background shells that went quiet stop holding the process once the CLI has no child processes left (their report was lost). On resume Claude Code replays "stopped before the previous session ended" notices as an empty turn ahead of the prompt; that turn is not taken for a "no response" failure, so no retry kills the process |
 | `PASEO_CODEX_IDLE_SECS` | `300` | idle time before the shared app-server exits (when keep-warm is off) |
 | `PASEO_CODEX_MAX_ACTIVE` | `auto` | max concurrent Codex turns, or `auto`; extra prompts queue |
-| `PASEO_AGENT_MB` | `300` | `auto`: memory budgeted per agent, for the ceiling and the room check |
+| `PASEO_AGENT_MB` | `300` | `auto`: memory budgeted per agent, for the ceiling and the room check; also the cap on each Claude process's node heap (this less 40 MB) |
 | `PASEO_AUTO_MAX_AGENTS` | `8` | `auto`: never more agents at once than this |
 | `PASEO_AUTO_STABLE_SECS` | `150` | `auto`: how long the machine must stay calm, with turns waiting, before adding a worker |
 | `PASEO_CODEX_KEEP_WARM` | `true` | start the app-server with the daemon and keep it up |

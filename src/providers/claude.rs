@@ -346,6 +346,7 @@ impl ClaudePool {
         }
         // Node's heap would otherwise grow until the OOM killer takes the
         // process: cap it under the agent's budget so it collects first.
+        // PASEO_AGENT_MB (the static budget, not the auto-grown one) sets this cap too.
         let heap = format!("--max-old-space-size={}", self.cfg.agent_mb.saturating_sub(40).max(64));
         let node_options = match std::env::var("NODE_OPTIONS") {
             Ok(existing) if !existing.trim().is_empty() => format!("{existing} {heap}"),
@@ -435,6 +436,9 @@ impl ClaudePool {
         let last_output = Arc::new(std::sync::Mutex::new(Instant::now()));
         let output_seen = last_output.clone();
         state.sub_cap = self.sub_cap.clone();
+        if self.cfg.claude_max_subagents == 0 {
+            state.sub_wait = Duration::ZERO;
+        }
         state.turn_open = busy.clone();
         let events = self.events.clone();
         let agent_id = spec.id.clone();
@@ -442,15 +446,20 @@ impl ClaudePool {
             let mut lines = BufReader::new(stdout).lines();
             let mut kill_rx = kill_rx;
             let mut killed = false;
+            let mut gate_tick = tokio::time::interval(super::claude_stream::SUBAGENT_POLL);
             loop {
                 tokio::select! {
                     line = lines.next_line() => match line {
                         Ok(Some(line)) => {
-                            *output_seen.lock().unwrap() = Instant::now();
+                            // Keep-alives must not feed the watchdog: a hung CLI could still emit them.
+                            if !line.contains("\"type\":\"keep_alive\"") {
+                                *output_seen.lock().unwrap() = Instant::now();
+                            }
                             state.handle_line(&line);
                         }
                         _ => break,
                     },
+                    _ = gate_tick.tick(), if state.has_gate_waiters() => state.release_gate_waiters(),
                     _ = &mut kill_rx => {
                         let _ = child.start_kill();
                         killed = true;

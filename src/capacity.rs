@@ -686,9 +686,9 @@ mod tests {
         c.limit = 5;
         assert_eq!(c.set_limits(limits(Some(4096), 4, None), t0), Change::None, "same limits");
         assert_eq!(c.set_limits(limits(Some(1024), 4, None), t0), Change::Shrank);
-        assert_eq!((c.ceiling, c.limit()), (3, 3));
+        assert_eq!((c.ceiling, c.limit()), (2, 2));
         assert_eq!(c.set_limits(limits(Some(8192), 4, None), t0), Change::None, "raising only lifts the ceiling");
-        assert_eq!((c.ceiling, c.limit()), (8, 3));
+        assert_eq!((c.ceiling, c.limit()), (8, 2));
     }
 
     #[test]

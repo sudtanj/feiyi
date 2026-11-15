@@ -195,7 +195,7 @@ impl Config {
             auto_compact_pct: env("PASEO_AUTO_COMPACT_PCT").and_then(|v| v.parse().ok()).unwrap_or(40).min(99),
             auto_compact_tokens: env("PASEO_AUTO_COMPACT_TOKENS").and_then(|v| v.parse().ok()).unwrap_or(120_000),
             claude_context_window: env("PASEO_CLAUDE_CONTEXT_WINDOW").and_then(|v| v.parse().ok()).unwrap_or(200_000),
-            retry_max: env("PASEO_RETRY_MAX").and_then(|v| v.parse().ok()).unwrap_or(2),
+            retry_max: env("PASEO_RETRY_MAX").and_then(|v| v.parse().ok()).unwrap_or(3),
             retry_base: env_secs("PASEO_RETRY_BASE_SECS", 5),
             stall_timeout: env_secs("PASEO_STALL_SECS", 1200),
             resume_after_limit: env_bool("PASEO_RESUME_AFTER_LIMIT").unwrap_or(true),

@@ -43,6 +43,8 @@ pub struct StreamState {
     admitted: HashMap<String, Instant>,
     /// How long a launch waits for a closed gate (cap 0) to reopen.
     pub sub_wait: Duration,
+    /// Launches waiting on a closed gate: request id, the hook request, the deadline.
+    gate_waiters: Vec<(String, Value, Instant)>,
     /// Whether a turn is open on the daemon's side, shared with the pool
     /// (set when it sends a prompt, cleared when the turn ends). Output
     /// while it is clear is a turn the CLI runs of its own.
@@ -73,7 +75,7 @@ const ADMIT_GRACE: Duration = Duration::from_secs(30);
 /// A launch refused because the gate is closed (cap 0) waits this long, polling
 /// at `SUBAGENT_POLL`, for the machine to recover before it is denied.
 const SUBAGENT_WAIT: Duration = Duration::from_secs(45);
-const SUBAGENT_POLL: Duration = Duration::from_secs(3);
+pub const SUBAGENT_POLL: Duration = Duration::from_secs(3);
 const SUBAGENT_STRAINED: &str = "Sub-agent not started: the machine is low on memory right now. This is temporary, not a failure: do not drop the work. Do this part yourself if it is small; otherwise start a background shell `sleep 90` (run_in_background: true), end the turn, and when it reports back launch the sub-agent again. Repeat until it starts, and keep going with any other parts meanwhile.";
 
 /// Lines kept in a running sub-agent's log (the oldest are dropped).
@@ -177,7 +179,7 @@ fn s(v: &Value, key: &str) -> Option<String> {
 
 impl StreamState {
     pub fn new(agent_id: String, events: EventTx, stdin: mpsc::UnboundedSender<String>, interrupted: Arc<AtomicBool>, session_id: Option<String>) -> Self {
-        StreamState { agent_id, events, stdin, interrupted, session_id, tools: HashMap::new(), streamed: HashSet::new(), current_message: None, context_tokens: None, limit_info: None, limit_refused: None, sub_limited: false, sub_logs: HashMap::new(), background: HashMap::new(), sub_active: Arc::default(), sub_cap: Arc::new(AtomicUsize::new(usize::MAX)), admitted: HashMap::new(), sub_wait: SUBAGENT_WAIT, turn_open: Arc::default(), assistant_seen: false, notification_ahead: false, result_seen: false, background_agents: HashMap::new() }
+        StreamState { agent_id, events, stdin, interrupted, session_id, tools: HashMap::new(), streamed: HashSet::new(), current_message: None, context_tokens: None, limit_info: None, limit_refused: None, sub_limited: false, sub_logs: HashMap::new(), background: HashMap::new(), sub_active: Arc::default(), sub_cap: Arc::new(AtomicUsize::new(usize::MAX)), admitted: HashMap::new(), sub_wait: SUBAGENT_WAIT, gate_waiters: Vec::new(), turn_open: Arc::default(), assistant_seen: false, notification_ahead: false, result_seen: false, background_agents: HashMap::new() }
     }
 
     fn emit(&self, ev: ProviderEvent) {
@@ -597,20 +599,11 @@ impl StreamState {
     /// background shells and workflows never take a sub-agent's place.
     /// None when the gate is closed (cap 0): the caller waits for it to reopen.
     fn gate_subagent(&mut self, req: &Value) -> Option<Value> {
-        let now = Instant::now();
-        let (tools, background) = (&self.tools, &self.background);
-        // Background work silent past the sub-agent limit is taken for lost
-        // (its notification never matched): it stops counting, or one lost
-        // report would hold a seat until the process ends, hours later.
-        let lost = self.sub_active.lock().unwrap().quiet() >= SUBAGENT_QUIET_MAX;
-        self.admitted.retain(|id, at| tools.contains_key(id) || (!lost && background.contains_key(id)) || now.duration_since(*at) < ADMIT_GRACE);
+        let running = match self.try_admit(req) {
+            Ok(()) => return Some(json!({})),
+            Err(running) => running,
+        };
         let cap = self.sub_cap.load(Ordering::Relaxed);
-        let running = self.admitted.len();
-        if running < cap {
-            let id = s(req, "tool_use_id").or_else(|| req.get("input").and_then(|i| s(i, "tool_use_id"))).unwrap_or_else(crate::util::new_id);
-            self.admitted.insert(id, now);
-            return Some(json!({}));
-        }
         if cap == 0 {
             return None;
         }
@@ -619,29 +612,55 @@ impl StreamState {
         Some(subagent_deny(&reason))
     }
 
-    /// Answer a launch that met a closed gate once the cap rises or the wait
-    /// ends. It only reads the cap atomic, so it holds no lock the capacity
-    /// sampler needs.
-    // ponytail: a launch let through here isn't entered in `admitted`; its Task
-    // call counts as running once it shows up in the stream.
-    fn wait_for_subagent_gate(&self, request_id: String) {
-        let (stdin, cap, agent_id, wait) = (self.stdin.clone(), self.sub_cap.clone(), self.agent_id.clone(), self.sub_wait);
-        tokio::spawn(async move {
-            let deadline = tokio::time::Instant::now() + wait;
-            let answer = loop {
-                if cap.load(Ordering::Relaxed) > 0 {
-                    break json!({});
-                }
-                let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-                if left.is_zero() {
-                    crate::log!("claude {agent_id}: sub-agent launch refused (gate closed for {}s)", wait.as_secs());
-                    break subagent_deny(SUBAGENT_STRAINED);
-                }
-                tokio::time::sleep(SUBAGENT_POLL.min(left)).await;
+    /// Enters the launch in `admitted` when fewer than `sub_cap` are running;
+    /// otherwise the number running.
+    fn try_admit(&mut self, req: &Value) -> Result<(), usize> {
+        let now = Instant::now();
+        let (tools, background) = (&self.tools, &self.background);
+        // Background work silent past the sub-agent limit is taken for lost
+        // (its notification never matched): it stops counting, or one lost
+        // report would hold a seat until the process ends, hours later.
+        let lost = self.sub_active.lock().unwrap().quiet() >= SUBAGENT_QUIET_MAX;
+        self.admitted.retain(|id, at| tools.contains_key(id) || (!lost && background.contains_key(id)) || now.duration_since(*at) < ADMIT_GRACE);
+        let running = self.admitted.len();
+        if running >= self.sub_cap.load(Ordering::Relaxed) {
+            return Err(running);
+        }
+        let id = s(req, "tool_use_id").or_else(|| req.get("input").and_then(|i| s(i, "tool_use_id"))).unwrap_or_else(crate::util::new_id);
+        self.admitted.insert(id, now);
+        Ok(())
+    }
+
+    /// Park a launch that met a closed gate (cap 0). The stream loop calls
+    /// `release_gate_waiters` every `SUBAGENT_POLL` while any wait; a zero
+    /// wait (no sub-agents configured) is denied at once.
+    fn wait_for_subagent_gate(&mut self, request_id: String, req: Value) {
+        self.gate_waiters.push((request_id, req, Instant::now() + self.sub_wait));
+        self.release_gate_waiters();
+    }
+
+    pub fn has_gate_waiters(&self) -> bool {
+        !self.gate_waiters.is_empty()
+    }
+
+    /// Let a waiting launch through once fewer than `sub_cap` are running
+    /// (entered in `admitted`, so parallel waiters cannot overshoot), or deny
+    /// it when its wait ends.
+    pub fn release_gate_waiters(&mut self) {
+        let now = Instant::now();
+        for (request_id, req, deadline) in std::mem::take(&mut self.gate_waiters) {
+            let answer = if self.try_admit(&req).is_ok() {
+                json!({})
+            } else if now >= deadline {
+                crate::log!("claude {}: sub-agent launch refused (gate closed for {}s)", self.agent_id, self.sub_wait.as_secs());
+                subagent_deny(SUBAGENT_STRAINED)
+            } else {
+                self.gate_waiters.push((request_id, req, deadline));
+                continue;
             };
             let resp = json!({ "type": "control_response", "response": { "subtype": "success", "request_id": request_id, "response": answer } });
-            let _ = stdin.send(resp.to_string());
-        });
+            let _ = self.stdin.send(resp.to_string());
+        }
     }
 
     fn handle_control_request(&mut self, msg: &Value) {
@@ -653,7 +672,7 @@ impl StreamState {
                     let resp = json!({ "type": "control_response", "response": { "subtype": "success", "request_id": request_id, "response": answer } });
                     let _ = self.stdin.send(resp.to_string());
                 }
-                None => self.wait_for_subagent_gate(request_id),
+                None => self.wait_for_subagent_gate(request_id, req),
             }
             return;
         }
@@ -1267,23 +1286,31 @@ mod tests {
         assert!(!denied(&gate(&mut st, "t4")));
     }
 
-    #[tokio::test]
-    async fn closed_gate_waits_for_the_cap_to_rise_then_denies() {
+    #[test]
+    fn closed_gate_waits_for_the_cap_to_rise_then_denies() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let (stdin, mut out) = mpsc::unbounded_channel();
         let mut st = StreamState::new("a1".into(), tx, stdin, Arc::new(AtomicBool::new(false)), Some("s1".into()));
-        let hook = json!({ "type": "control_request", "request_id": "r1", "request": { "subtype": "hook_callback", "callback_id": SUBAGENT_HOOK, "input": { "hook_event_name": "PreToolUse", "tool_name": "Agent" }, "tool_use_id": "t1" } });
+        let hook = |id: &str| json!({ "type": "control_request", "request_id": format!("r-{id}"), "request": { "subtype": "hook_callback", "callback_id": SUBAGENT_HOOK, "input": { "hook_event_name": "PreToolUse", "tool_name": "Agent" }, "tool_use_id": id } }).to_string();
+        let answer = |out: &mut mpsc::UnboundedReceiver<String>| serde_json::from_str::<Value>(&out.try_recv().expect("an answer")).unwrap();
         st.sub_cap.store(0, Ordering::Relaxed);
-        st.handle_line(&hook.to_string());
-        assert!(out.try_recv().is_err(), "the answer waits for the cap");
+        st.handle_line(&hook("t1"));
+        st.handle_line(&hook("t2"));
+        st.release_gate_waiters();
+        assert!(out.try_recv().is_err(), "the answers wait for the cap");
         st.sub_cap.store(1, Ordering::Relaxed);
-        let resp: Value = serde_json::from_str(&out.recv().await.unwrap()).unwrap();
+        st.release_gate_waiters();
+        let resp = answer(&mut out);
+        assert_eq!(resp["response"]["request_id"], "r-t1");
         assert!(resp.pointer("/response/response/hookSpecificOutput").is_none(), "cap rose: let through");
+        assert!(out.try_recv().is_err(), "the second waiter does not overshoot the cap");
+        assert!(st.has_gate_waiters());
         st.sub_cap.store(0, Ordering::Relaxed);
         st.sub_wait = Duration::ZERO;
-        st.handle_line(&hook.to_string());
-        let resp: Value = serde_json::from_str(&out.recv().await.unwrap()).unwrap();
-        assert_eq!(resp.pointer("/response/response/hookSpecificOutput/permissionDecision").and_then(|d| d.as_str()), Some("deny"));
+        st.handle_line(&hook("t3"));
+        let resp = answer(&mut out);
+        assert_eq!(resp["response"]["request_id"], "r-t3");
+        assert_eq!(resp.pointer("/response/response/hookSpecificOutput/permissionDecision").and_then(|d| d.as_str()), Some("deny"), "no wait without a cap");
     }
 
     #[test]

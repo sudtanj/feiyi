@@ -743,7 +743,7 @@ mod tests {
         assert_eq!(c.apply(unknown, 1, 2, t0 + Duration::from_secs(60)), Change::None);
         let mut c = cap(4);
         c.limit = 2;
-        // One unused slot plus the new one plus the reserve: 628 MB.
+        // One unused slot plus the new one plus the reserve: 728 MB.
         let short = Sample { avail_mb: Some(600), ..calm() };
         c.apply(short, 1, 0, t0);
         assert_eq!(c.apply(short, 1, 0, t0 + Duration::from_secs(60)), Change::None);
@@ -876,5 +876,66 @@ mod tests {
         let roomy = Sample { avail_mb: Some(900), ..calm() };
         c.apply(roomy, 1, 2, t0 + Duration::from_secs(120));
         assert_eq!(c.apply(roomy, 1, 2, t0 + Duration::from_secs(160)), Change::Grew);
+    }
+
+    #[test]
+    fn growth_is_not_undone_by_the_next_reading_with_page_in_pressure() {
+        let mut c = cap(4);
+        let t0 = Instant::now();
+        let roomy = Sample { avail_mb: Some(600), ..calm() };
+        c.apply(roomy, 1, 0, t0);
+        assert_eq!(c.apply(roomy, 1, 0, t0 + Duration::from_secs(30)), Change::Grew);
+        let blip = Sample { mem_pressure: Some(15.0), ..roomy };
+        for secs in [31, 45, 60] {
+            assert_eq!(c.apply(blip, 2, 0, t0 + Duration::from_secs(secs)), Change::None);
+            assert_eq!(c.limit(), 2, "600 MB still covers an agent and the reserve");
+            assert!(c.strained());
+        }
+    }
+
+    #[test]
+    fn more_running_than_the_limit_leaves_room_for_one_agent_only() {
+        let mut c = cap(4);
+        let t0 = Instant::now();
+        let short = Sample { avail_mb: Some(427), ..calm() };
+        c.apply(short, 2, 0, t0);
+        assert_eq!(c.apply(short, 2, 0, t0 + Duration::from_secs(60)), Change::None);
+        assert_eq!(c.limit(), 1);
+        let fits = Sample { avail_mb: Some(428), ..calm() };
+        c.apply(fits, 2, 0, t0 + Duration::from_secs(61));
+        assert_eq!(c.apply(fits, 2, 0, t0 + Duration::from_secs(91)), Change::Grew);
+        assert_eq!(c.limit(), 2);
+    }
+
+    #[test]
+    fn warm_idle_memory_keeps_a_slot_under_mild_pressure_only() {
+        let mut c = cap(4);
+        let t0 = Instant::now();
+        c.limit = 3;
+        c.last_change = t0;
+        // 200 MB free plus 300 MB reclaimable covers the 428 MB an agent needs.
+        let hot = Sample { avail_mb: Some(200), reclaim_mb: 300, mem_pressure: Some(30.0), ..calm() };
+        assert_eq!(c.apply(hot, 3, 1, t0 + Duration::from_secs(10)), Change::Shrank);
+        assert_eq!(c.limit(), 2, "30% stalls drop a slot whatever the reclaimable memory");
+        let blip = Sample { mem_pressure: Some(15.0), ..hot };
+        assert_eq!(c.apply(blip, 2, 1, t0 + Duration::from_secs(20)), Change::None);
+        assert_eq!(c.limit(), 2, "15% with reclaimable room keeps the slot");
+        assert!(c.strained());
+        let no_warm = Sample { reclaim_mb: 0, ..blip };
+        assert_eq!(c.apply(no_warm, 2, 1, t0 + Duration::from_secs(30)), Change::Shrank);
+        assert_eq!(c.limit(), 1, "the same reading without reclaimable memory is a real shortage");
+    }
+
+    #[test]
+    fn critical_stalls_drop_a_slot_at_once_even_with_free_memory() {
+        let mut c = cap(4);
+        let t0 = Instant::now();
+        c.limit = 3;
+        c.last_change = t0;
+        let stalls = Sample { mem_pressure: Some(40.0), ..calm() };
+        assert_eq!(c.apply(stalls, 3, 1, t0 + Duration::from_secs(1)), Change::Critical);
+        assert_eq!(c.limit(), 2, "no SHRINK_GAP when critical");
+        assert_eq!(c.apply(stalls, 2, 1, t0 + Duration::from_secs(2)), Change::Critical);
+        assert_eq!(c.limit(), 1);
     }
 }

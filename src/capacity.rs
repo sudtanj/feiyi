@@ -301,7 +301,7 @@ impl Capacity {
         if self.strained {
             self.calm_since = None;
             let mut shrank = false;
-            let short = self.critical || mem_below(agent_mb + RESERVE_MB) || over(s.cpu_pressure, CPU_PRESSURE_HIGH) || over(s.throttle, THROTTLE_HIGH) || pids_below(PIDS_PER_AGENT / 2) || over(s.mem_pressure, MEM_PRESSURE_SHRINK);
+            let short = self.critical || s.avail_mb.map(|a| a + s.reclaim_mb < agent_mb + RESERVE_MB).unwrap_or(false) || over(s.cpu_pressure, CPU_PRESSURE_HIGH) || over(s.throttle, THROTTLE_HIGH) || pids_below(PIDS_PER_AGENT / 2) || over(s.mem_pressure, MEM_PRESSURE_SHRINK);
             if short && self.limit > 1 && (self.critical || now.duration_since(self.last_change) >= SHRINK_GAP) {
                 self.limit -= 1;
                 self.last_change = now;

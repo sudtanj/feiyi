@@ -231,10 +231,10 @@ PASEO_LISTEN=0.0.0.0:6768 PASEO_PASSWORD=secret feiyi
 | `PASEO_AGENT_OOM_SCORE_ADJ` | `500` | added to the daemon's own OOM score for agent processes (up to 1000), so the kernel kills them before the daemon (0 = off) |
 | `PASEO_AGENT_LOW_IO` | `true` | lowest best-effort I/O priority for agent processes |
 | `PASEO_AUTO_COMPACT_PCT` | `40` | after a turn, compact the context (`/compact`, Codex `thread/compact/start`) once it fills this % of the window (0 = off) |
-| `PASEO_AUTO_COMPACT_TOKENS` | `80000` | also compact once the context reaches this many tokens, whatever the window (0 = no cap). Every model call uploads the whole context, so this caps the upload per call (~320 KB at 80K tokens) as well as cache-read cost on 1M-window models |
+| `PASEO_AUTO_COMPACT_TOKENS` | `120000` | also compact once the context reaches this many tokens, whatever the window (0 = no cap). Every model call uploads the whole context, so this caps the upload per call (~480 KB at 120K tokens) as well as cache-read cost on 1M-window models |
 | `PASEO_RETRY_MAX` | `3` | automatic retries of a turn that fails with a transient error, returns nothing, or stops in the middle of a tool call; a retry after partial output asks the model to continue, otherwise the prompt is resent (0 = off) |
 | `PASEO_RETRY_BASE_SECS` | `5` | delay before the first retry; doubles each attempt, max 60s |
-| `PASEO_STALL_SECS` | `600` | a running turn with no output for this long (and no tool call in progress, no pending permission) is treated as stuck and retried (0 = off) |
+| `PASEO_STALL_SECS` | `1200` | a running turn with no output from the `claude` process for this long (and no tool call in progress, no pending permission, no sub-agents working, no compaction) is treated as stuck and retried (0 = off) |
 | `PASEO_RESUME_AFTER_LIMIT` | `true` | when the Claude or Codex usage limit stops a turn, keep the turn open, wait until the limit resets (plus a minute) and continue automatically; messages sent meanwhile try again at once and then run after it; stop cancels the wait. Gives up if the reset is more than 8 days away |
 | `PASEO_LIMIT_POLL_SECS` | `1800` | how often to try again when the provider doesn't say when the limit resets |
 | `PASEO_CLAUDE_CONTEXT_WINDOW` | `200000` | Claude context window used for that check (`[1m]` models use 1M) |

@@ -42,6 +42,8 @@ struct Proc {
     interrupted: Arc<AtomicBool>,
     /// Its background sub-agents, updated by the stream reader.
     sub_active: Arc<std::sync::Mutex<SubAgents>>,
+    /// When the process last wrote a line to stdout, of any kind; the stall watchdog reads it.
+    last_output: Arc<std::sync::Mutex<Instant>>,
     /// Spawn flags (model, effort) changed mid-turn: restart once the turn ends.
     restart: bool,
     pid: Option<u32>,
@@ -355,6 +357,11 @@ impl ClaudePool {
         if std::env::var_os("CLAUDE_CODE_SUBAGENT_MODEL").is_none() {
             cmd.env("CLAUDE_CODE_SUBAGENT_MODEL", "sonnet");
         }
+        // Longer replies before the CLI cuts a response off. Set it in the
+        // daemon's environment to override.
+        if std::env::var_os("CLAUDE_CODE_MAX_OUTPUT_TOKENS").is_none() {
+            cmd.env("CLAUDE_CODE_MAX_OUTPUT_TOKENS", "64000");
+        }
         // Claude reads the router key from the --mcp-config file; it and the
         // daemon's other secrets stay out of its environment; the guard hook
         // (guard.rs) denies reading the rest. CLAUDE_CODE_SUBPROCESS_ENV_SCRUB
@@ -425,6 +432,8 @@ impl ClaudePool {
 
         let mut state = StreamState::new(spec.id.clone(), self.events.clone(), in_tx.clone(), interrupted.clone(), Some(session_id));
         let sub_active = state.sub_active.clone();
+        let last_output = Arc::new(std::sync::Mutex::new(Instant::now()));
+        let output_seen = last_output.clone();
         state.sub_cap = self.sub_cap.clone();
         state.turn_open = busy.clone();
         let events = self.events.clone();
@@ -436,7 +445,10 @@ impl ClaudePool {
             loop {
                 tokio::select! {
                     line = lines.next_line() => match line {
-                        Ok(Some(line)) => state.handle_line(&line),
+                        Ok(Some(line)) => {
+                            *output_seen.lock().unwrap() = Instant::now();
+                            state.handle_line(&line);
+                        }
                         _ => break,
                     },
                     _ = &mut kill_rx => {
@@ -455,7 +467,7 @@ impl ClaudePool {
             let _ = events.send(ProviderEvent::ProcessExited { agent_id, generation });
         });
 
-        self.procs.insert(spec.id.clone(), Proc { stdin: in_tx, kill: Some(kill_tx), busy, last_used: Instant::now(), generation, interrupted, sub_active, restart: false, pid, spawned_at: Instant::now() });
+        self.procs.insert(spec.id.clone(), Proc { stdin: in_tx, kill: Some(kill_tx), busy, last_used: Instant::now(), generation, interrupted, sub_active, last_output, restart: false, pid, spawned_at: Instant::now() });
         Ok(())
     }
 
@@ -492,6 +504,11 @@ impl ClaudePool {
         }
         let take = free.min(self.waiting.len());
         self.waiting.drain(..take).collect()
+    }
+
+    /// Time since the process last wrote to stdout; None without a process.
+    pub fn quiet_for(&self, agent_id: &str) -> Option<std::time::Duration> {
+        self.procs.get(agent_id).map(|p| p.last_output.lock().unwrap().elapsed())
     }
 
     pub fn is_waiting(&self, agent_id: &str) -> bool {

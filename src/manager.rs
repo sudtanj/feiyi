@@ -932,6 +932,13 @@ impl Manager {
             Some(a) if a.status == "running" && a.retry_at.is_none() => std::mem::take(&mut a.compacting),
             _ => return,
         };
+        // `--resume` of a session the CLI no longer has fails every time: start a fresh one on the next turn.
+        if matches!(&outcome, Err(e) if e.contains("No conversation found")) {
+            if let Some(a) = self.agents.get_mut(agent_id) {
+                a.rec.session_id = None;
+                self.agents_dirty = true;
+            }
+        }
         // A failed auto-compaction is not the user's failure: note it and
         // carry on with the uncompacted context (the CLI's own limit still applies).
         let outcome = match outcome {
@@ -1368,6 +1375,8 @@ impl Manager {
             .filter(|a| a.status == "running" && a.retry_at.is_none() && self.running.contains(&a.rec.id) && a.permissions.is_empty() && a.last_event.elapsed() >= limit)
             // Waiting for a Claude slot (another chat's turn or background sub-agents) is not a stall.
             .filter(|a| !self.claude.is_waiting(&a.rec.id))
+            // The child still writes (keep-alives, deltas), or sub-agents or a compaction keep it busy.
+            .filter(|a| !a.compacting && !self.claude.working_in_background(&a.rec.id) && self.claude.quiet_for(&a.rec.id).map_or(true, |q| q >= limit))
             // A long-running tool call is quiet by nature.
             .filter(|a| !a.timeline.as_ref().and_then(|t| t.last()).map(|r| r.item.get("type").and_then(|t| t.as_str()) == Some("tool_call") && r.item.get("status").and_then(|s| s.as_str()) == Some("running")).unwrap_or(false))
             .map(|a| a.rec.id.clone())

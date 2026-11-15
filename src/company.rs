@@ -137,6 +137,15 @@ const MEMORY_MAX_BYTES: usize = 2 * 1024;
 /// Serializes `remember`'s read-modify-write so concurrent notes are not lost.
 static MEMORY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Tool-use turns a sub-agent role may take before the CLI cuts it off.
+fn max_turns(role: &str) -> u32 {
+    match role {
+        "engineer" | "devops" | "qa" => 120,
+        "reviewer" | "researcher" | "designer" | "security" | "analyst" => 80,
+        _ => 50,
+    }
+}
+
 /// The roles for a chat: built-ins merged with the user's `roles`, each with
 /// its memory and the `remember` tool, or None when turned off or empty.
 pub fn roles(stored: &Map<String, Value>, home: &Path) -> Option<Map<String, Value>> {
@@ -161,7 +170,7 @@ pub fn roles(stored: &Map<String, Value>, home: &Path) -> Option<Map<String, Val
         ));
         // Roles without a tool list inherit everything, including the `rpc` that could spawn more agents.
         role["disallowedTools"] = json!(["mcp__feiyi__rpc"]);
-        role["maxTurns"] = json!(if matches!(name.as_str(), "engineer" | "devops") { 50 } else { 25 });
+        role["maxTurns"] = json!(max_turns(name));
         if let Some(tools) = role.get_mut("tools").and_then(Value::as_array_mut) {
             tools.extend([json!("mcp__feiyi__remember"), json!("Skill")]);
         }
@@ -308,8 +317,9 @@ mod tests {
         assert!(r["qa"]["tools"].as_array().unwrap().contains(&json!("Skill")));
         for (name, role) in &r {
             assert_eq!(role["disallowedTools"], json!(["mcp__feiyi__rpc"]), "{name}");
-            assert!(role["maxTurns"].as_u64().unwrap() <= 50, "{name}");
+            assert!(role["maxTurns"].as_u64().unwrap() >= 50, "{name}");
         }
+        assert_eq!((max_turns("qa"), max_turns("security"), max_turns("legal")), (120, 80, 50));
         assert_eq!(r["writer"]["model"], "haiku");
         assert_eq!(r["engineer"]["model"], "sonnet");
         assert!(builtin().values().all(|role| role["model"] == "haiku" || role["model"] == "sonnet"));

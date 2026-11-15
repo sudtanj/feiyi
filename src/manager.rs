@@ -806,9 +806,9 @@ impl Manager {
         }
         if change == crate::capacity::Change::Grew {
             // Growth may have counted warm idle memory as room: free it now,
-            // before the extra turn starts, instead of letting the kernel
+            // before a waiting turn starts, instead of letting the kernel
             // swap or the next spawn find the container full.
-            if self.capacity.room_short() {
+            if self.capacity.room_short() && (!self.cli_queue.is_empty() || self.claude.waiting_count() > 0) {
                 let keep: Vec<&str> = self.cli_queue.iter().map(|(id, _)| id.as_str()).collect();
                 self.claude.release_one_idle(&keep);
             }

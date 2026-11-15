@@ -101,7 +101,28 @@ while IFS= read -r line; do
   esac
 done
 "#;
+    // First prompt answered, the second refused like a `--resume` of a vanished session, the rest answered.
+    let noconv = r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"type":"user"'*)
+      if [ ! -e 'MARKER_ONE' ]; then
+        : > 'MARKER_ONE'
+      elif [ ! -e 'MARKER_TWO' ]; then
+        : > 'MARKER_TWO'
+        printf '%s\n' '{"type":"result","subtype":"error_during_execution","is_error":true,"result":"No conversation found with session ID: gone"}'
+        continue
+      fi
+      printf '%s\n' '{"type":"assistant","message":{"id":"m1","role":"assistant","content":[{"type":"text","text":"recovered"}]}}'
+      printf '%s\n' '{"type":"result","subtype":"success","is_error":false}'
+      ;;
+  esac
+done
+"#
+    .replace("MARKER_ONE", &dir.join("noconv-first").display().to_string())
+    .replace("MARKER_TWO", &dir.join("noconv-failed").display().to_string());
     let body = match mode {
+        "noconv" => noconv,
         "resume" => resume.to_string(),
         "hang" => hanging.to_string(),
         "tool" => tool.to_string(),
@@ -1348,6 +1369,46 @@ async fn claude_child_gets_no_daemon_secrets_and_a_working_guard_hook() {
     };
     assert_denied(wired(&hook_event("Bash", "command", "printenv")), "wired hook, printenv");
     assert_allowed(wired(&hook_event("Bash", "command", "ls -la")), "wired hook, ls");
+}
+
+/// The claude child gets a heap cap sized from PASEO_AGENT_MB (appended to a
+/// NODE_OPTIONS already set) and the 64k output-token default.
+#[tokio::test]
+async fn claude_child_gets_a_heap_cap_and_the_output_token_default() {
+    let vars = [("PASEO_AGENT_MB", "200"), ("NODE_OPTIONS", "--no-warnings")];
+    let d = start_with(unique_dir("heapcap"), None, "env", &vars);
+    let mut ws = connect(d.port).await;
+    hello(&mut ws, None).await;
+    run_chat(&mut ws, &d.dir.join("w1"), "a1").await;
+    let saved = std::fs::read_to_string(d.dir.join("claude-env")).unwrap();
+    assert!(saved.lines().any(|l| l == "NODE_OPTIONS=--no-warnings --max-old-space-size=160"), "{saved}");
+    assert!(saved.lines().any(|l| l == "CLAUDE_CODE_MAX_OUTPUT_TOKENS=64000"), "{saved}");
+}
+
+/// A resume the CLI refuses ("No conversation found") drops the saved session
+/// id, and the agent still answers the next prompt.
+#[tokio::test]
+async fn a_vanished_session_is_dropped_and_the_agent_recovers() {
+    let d = start_at(unique_dir("noconv"), None, "noconv");
+    let cwd = d.dir.join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let mut ws = connect(d.port).await;
+    hello(&mut ws, None).await;
+    let agent_id = create_agent_with(&mut ws, json!({ "provider": "claude", "cwd": cwd.to_string_lossy(), "modeId": "bypassPermissions" }), "hi").await;
+    let agents_file = d.dir.join("home").join("agents.json");
+    let before = wait_for_saved_agent(&agents_file, "session never saved", |a| a["sessionId"].is_string()).await;
+
+    send(&mut ws, session(json!({ "type": "send_agent_message_request", "requestId": "m2", "agentId": agent_id, "text": "again" }))).await;
+    recv_until(&mut ws, |v| (v["message"]["type"] == "agent_stream" && v["message"]["payload"]["event"]["type"] == "turn_failed").then_some(())).await;
+    assert!(d.dir.join("noconv-failed").exists());
+    wait_for_saved_agent(&agents_file, "stale session id kept", |a| a["sessionId"] != before["sessionId"]).await;
+
+    send(&mut ws, session(json!({ "type": "send_agent_message_request", "requestId": "m3", "agentId": agent_id, "text": "third" }))).await;
+    recv_until(&mut ws, |v| {
+        let ev = &v["message"]["payload"]["event"];
+        (v["message"]["type"] == "agent_stream" && ev["type"] == "timeline" && ev["item"]["text"].as_str().unwrap_or("").contains("recovered")).then_some(())
+    })
+    .await;
 }
 
 /// The codex app-server gets the shell exclude policy. The fake codex records

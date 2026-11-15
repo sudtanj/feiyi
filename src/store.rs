@@ -13,6 +13,8 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -125,12 +127,15 @@ pub struct WorkspaceRecord {
 #[derive(Clone)]
 pub struct Store {
     root: PathBuf,
+    /// Snapshots of agents.json taken so far, and the last one written.
+    agents_seq: Arc<AtomicU64>,
+    agents_written: Arc<Mutex<u64>>,
 }
 
 impl Store {
     pub fn new(root: PathBuf) -> Store {
         let _ = std::fs::create_dir_all(root.join("timelines"));
-        Store { root }
+        Store { root, agents_seq: Arc::default(), agents_written: Arc::default() }
     }
 
     pub fn load_agents(&self) -> Vec<AgentRecord> {
@@ -145,14 +150,39 @@ impl Store {
     }
 
     pub fn save_agents<'a>(&self, agents: impl Iterator<Item = &'a AgentRecord>) {
+        if let Some((bytes, seq)) = self.encode_agents(agents) {
+            self.write_agents(&bytes, seq);
+        }
+    }
+
+    /// Encodes now, writes (with its fsync) on a blocking thread. A write that
+    /// a newer snapshot has overtaken is dropped, so `agents.json` never goes back.
+    pub fn save_agents_in_background<'a>(&self, agents: impl Iterator<Item = &'a AgentRecord>) {
+        if let Some((bytes, seq)) = self.encode_agents(agents) {
+            let store = self.clone();
+            tokio::task::spawn_blocking(move || store.write_agents(&bytes, seq));
+        }
+    }
+
+    fn encode_agents<'a>(&self, agents: impl Iterator<Item = &'a AgentRecord>) -> Option<(Vec<u8>, u64)> {
         let list: Vec<&AgentRecord> = agents.collect();
         match serde_json::to_vec(&list) {
-            Ok(bytes) => {
-                if let Err(e) = crate::util::write_atomic(&self.root.join("agents.json"), &bytes, true) {
-                    crate::warn!("failed to save agents: {e}");
-                }
+            Ok(bytes) => Some((bytes, self.agents_seq.fetch_add(1, Ordering::Relaxed) + 1)),
+            Err(e) => {
+                crate::warn!("failed to encode agents: {e}");
+                None
             }
-            Err(e) => crate::warn!("failed to encode agents: {e}"),
+        }
+    }
+
+    fn write_agents(&self, bytes: &[u8], seq: u64) {
+        let mut written = self.agents_written.lock().unwrap_or_else(|e| e.into_inner());
+        if seq <= *written {
+            return;
+        }
+        match crate::util::write_atomic(&self.root.join("agents.json"), bytes, true) {
+            Ok(()) => *written = seq,
+            Err(e) => crate::warn!("failed to save agents: {e}"),
         }
     }
 
@@ -293,5 +323,26 @@ mod tests {
         let json = serde_json::to_string(&rec).unwrap();
         assert!(json.contains("\"finishDeferred\":true"), "{json}");
         assert!(serde_json::from_str::<AgentRecord>(&json).unwrap().finish_deferred);
+    }
+
+    #[test]
+    fn an_older_agents_snapshot_never_overwrites_a_newer_one() {
+        let dir = std::env::temp_dir().join(format!("feiyi-store-{}", crate::util::new_id()));
+        let store = Store::new(dir.clone());
+        let mut rec: AgentRecord = serde_json::from_str(OLD_RECORD).unwrap();
+        rec.id = "old".into();
+        let (old_bytes, old_seq) = store.encode_agents(std::iter::once(&rec)).unwrap();
+        rec.id = "new".into();
+        let (new_bytes, new_seq) = store.encode_agents(std::iter::once(&rec)).unwrap();
+        assert!(new_seq > old_seq);
+        store.write_agents(&new_bytes, new_seq);
+        store.write_agents(&old_bytes, old_seq);
+        let loaded = store.load_agents();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, "new", "the late write of the older snapshot is dropped");
+        rec.id = "synced".into();
+        store.save_agents(std::iter::once(&rec));
+        assert_eq!(store.load_agents()[0].id, "synced", "a synchronous save always lands");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

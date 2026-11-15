@@ -26,16 +26,29 @@ macro_rules! warn {
 const LOG_KEEP: usize = 2000;
 const LOG_LINE_MAX: usize = 512;
 static LOG_RING: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
+/// The PWA's connection events get their own ring so a flapping client can't
+/// push the daemon's own lines out of `LOG_RING`.
+const CLIENT_LOG_KEEP: usize = 300;
+static CLIENT_LOG_RING: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
 
 /// Print a log line to stderr (when `print`) and remember it in the ring buffer.
 pub fn emit_log(level: &str, print: bool, msg: String) {
+    keep(&LOG_RING, LOG_KEEP, level, print, msg);
+}
+
+/// Like `info` logging, for a line the PWA sent: kept in the client ring.
+pub fn emit_client_log(msg: String) {
+    keep(&CLIENT_LOG_RING, CLIENT_LOG_KEEP, "", log_enabled(2), msg);
+}
+
+fn keep(ring: &Mutex<VecDeque<String>>, max: usize, level: &str, print: bool, msg: String) {
     let line = format!("[{}] {level}{msg}", now_iso());
     if print {
         eprintln!("{line}");
     }
     let line = if line.len() > LOG_LINE_MAX { truncate(&line, LOG_LINE_MAX) } else { line };
-    if let Ok(mut ring) = LOG_RING.lock() {
-        if ring.len() >= LOG_KEEP {
+    if let Ok(mut ring) = ring.lock() {
+        if ring.len() >= max {
             ring.pop_front();
         }
         ring.push_back(line);
@@ -45,7 +58,16 @@ pub fn emit_log(level: &str, print: bool, msg: String) {
 /// The last `lines` log lines (oldest first), optionally only those
 /// containing `filter` (case-insensitive).
 pub fn recent_logs(lines: usize, filter: Option<&str>) -> Vec<String> {
-    let Ok(ring) = LOG_RING.lock() else { return Vec::new() };
+    tail(&LOG_RING, lines, filter)
+}
+
+/// The same for the PWA's connection events.
+pub fn recent_client_logs(lines: usize, filter: Option<&str>) -> Vec<String> {
+    tail(&CLIENT_LOG_RING, lines, filter)
+}
+
+fn tail(ring: &Mutex<VecDeque<String>>, lines: usize, filter: Option<&str>) -> Vec<String> {
+    let Ok(ring) = ring.lock() else { return Vec::new() };
     let filter = filter.map(str::to_ascii_lowercase).filter(|f| !f.is_empty());
     let mut out: Vec<String> = ring.iter().rev().filter(|l| filter.as_ref().map(|f| l.to_ascii_lowercase().contains(f.as_str())).unwrap_or(true)).take(lines).cloned().collect();
     out.reverse();
@@ -151,5 +173,13 @@ mod tests {
         assert!(lines[0].ends_with("first"));
         assert!(lines[1].contains("WARN ") && lines[1].len() <= LOG_LINE_MAX + "…".len());
         assert_eq!(recent_logs(1, Some(&marker)).len(), 1);
+    }
+
+    #[test]
+    fn client_lines_stay_out_of_the_daemon_ring() {
+        let marker = format!("client-ring-test-{}", new_id());
+        emit_client_log(marker.clone());
+        assert_eq!(recent_client_logs(10, Some(&marker)).len(), 1);
+        assert!(recent_logs(2000, Some(&marker)).is_empty());
     }
 }

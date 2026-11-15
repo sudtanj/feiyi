@@ -23,11 +23,24 @@
 //! warm idle processes so the daemon keeps enough room to stay in control.
 
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+
+static STRAINED: AtomicBool = AtomicBool::new(false);
+
+/// The manager's last reading, for background sweeps outside it (backup, code graph).
+pub fn set_machine_strained(strained: bool) {
+    STRAINED.store(strained, Ordering::Relaxed);
+}
+
+/// Background sweeps skip their cycle while this holds.
+pub fn machine_strained() -> bool {
+    STRAINED.load(Ordering::Relaxed)
+}
 
 /// Memory kept for the daemon and the commands agents run, outside the
 /// per-agent budget.
-const RESERVE_MB: u64 = 96;
+const RESERVE_MB: u64 = 128;
 /// A step down waits at least this long after the last change, so one
 /// pressure spike can't drop the limit to one in a few ticks.
 const SHRINK_GAP: Duration = Duration::from_secs(10);
@@ -299,7 +312,7 @@ impl Capacity {
         // Without a memory reading the room check can't pass: stay put. Warm
         // idle processes count as room: the next turn stops one if it must,
         // and otherwise they would hold the limit down for good.
-        let calm = under(s.mem_pressure, MEM_PRESSURE_CALM) && under(s.cpu_pressure, CPU_PRESSURE_CALM) && under(s.throttle, THROTTLE_CALM) && !pids_below(PIDS_PER_AGENT) && s.avail_mb.map(|a| a + s.reclaim_mb >= agent_mb).unwrap_or(false);
+        let calm = under(s.mem_pressure, MEM_PRESSURE_CALM) && under(s.cpu_pressure, CPU_PRESSURE_CALM) && under(s.throttle, THROTTLE_CALM) && !pids_below(PIDS_PER_AGENT) && s.avail_mb.map(|a| a + s.reclaim_mb >= agent_mb + RESERVE_MB).unwrap_or(false);
         if !calm {
             self.calm_since = None;
             return Change::None;
@@ -673,9 +686,9 @@ mod tests {
         c.limit = 5;
         assert_eq!(c.set_limits(limits(Some(4096), 4, None), t0), Change::None, "same limits");
         assert_eq!(c.set_limits(limits(Some(1024), 4, None), t0), Change::Shrank);
-        assert_eq!((c.ceiling, c.limit()), (3, 3));
+        assert_eq!((c.ceiling, c.limit()), (2, 2));
         assert_eq!(c.set_limits(limits(Some(8192), 4, None), t0), Change::None, "raising only lifts the ceiling");
-        assert_eq!((c.ceiling, c.limit()), (8, 3));
+        assert_eq!((c.ceiling, c.limit()), (8, 2));
     }
 
     #[test]
@@ -716,11 +729,32 @@ mod tests {
     }
 
     #[test]
+    fn growth_needs_the_reserve_held_for_the_whole_window() {
+        let mut c = cap(4);
+        let t0 = Instant::now();
+        // 300 MB agent + 128 MB reserve = 428 MB; 400 MB free is not enough.
+        let thin = Sample { avail_mb: Some(400), ..calm() };
+        c.apply(thin, 1, 2, t0);
+        assert_eq!(c.apply(thin, 1, 2, t0 + Duration::from_secs(60)), Change::None);
+        let roomy = Sample { avail_mb: Some(500), ..calm() };
+        c.apply(roomy, 1, 2, t0 + Duration::from_secs(61));
+        // A dip inside the window restarts it.
+        c.apply(thin, 1, 2, t0 + Duration::from_secs(80));
+        assert_eq!(c.apply(roomy, 1, 2, t0 + Duration::from_secs(91)), Change::None);
+        assert_eq!(c.apply(roomy, 1, 2, t0 + Duration::from_secs(120)), Change::None);
+        assert_eq!(c.apply(roomy, 1, 2, t0 + Duration::from_secs(121)), Change::Grew);
+    }
+
+    #[test]
+    fn a_846_mb_container_fits_three_210_mb_agents() {
+        assert_eq!(ceiling(&limits(Some(846), 4, None), 210, 3), 3);
+    }
+    #[test]
     fn warm_idle_processes_count_as_room() {
         let mut c = cap(4);
         let t0 = Instant::now();
-        // 200 MB free plus a 150 MB warm idle process fits a 300 MB agent.
-        let warm = Sample { avail_mb: Some(200), reclaim_mb: 150, ..calm() };
+        // 200 MB free plus a 250 MB warm idle process fits a 300 MB agent and the reserve.
+        let warm = Sample { avail_mb: Some(200), reclaim_mb: 250, ..calm() };
         c.apply(warm, 1, 2, t0);
         assert_eq!(c.apply(warm, 1, 2, t0 + Duration::from_secs(30)), Change::Grew);
     }
@@ -735,7 +769,7 @@ mod tests {
 
     #[test]
     fn a_process_over_budget_raises_the_budget_and_cuts_the_ceiling() {
-        // 4096 MB, 300 MB budget: ceiling 8. Processes really at 700 MB: (4096 - 96) / 700 = 5.
+        // 4096 MB, 300 MB budget: ceiling 8. Processes really at 700 MB: (4096 - 128) / 700 = 5.
         let mut c = cap(8);
         let t0 = Instant::now();
         c.limit = 8;
@@ -744,7 +778,7 @@ mod tests {
         assert_eq!((c.ceiling, c.limit(), c.agent_mb()), (5, 5, 700));
         assert_eq!(c.observe(650, t0), Change::None, "a smaller reading never lowers the budget");
         assert_eq!(c.observe(740, t0), Change::None, "a small overshoot (under 10%) does not re-cut");
-        assert_eq!(c.observe(780, t0), Change::None, "a 10% overshoot re-budgets (the ceiling stays 5: 4000 / 780)");
+        assert_eq!(c.observe(780, t0), Change::None, "a 10% overshoot re-budgets (the ceiling stays 5: 3968 / 780)");
         assert_eq!(c.agent_mb(), 780);
         let tight = Sample { avail_mb: Some(650), ..calm() };
         c.apply(tight, 1, 2, t0);
@@ -800,7 +834,7 @@ mod tests {
         assert!(c.room_short());
         c.apply(Sample { avail_mb: Some(80), ..calm() }, 1, 2, t0 + Duration::from_secs(61));
         assert!(c.exhausted(), "80 MB is under 700 / 8");
-        let roomy = Sample { avail_mb: Some(800), ..calm() };
+        let roomy = Sample { avail_mb: Some(900), ..calm() };
         c.apply(roomy, 1, 2, t0 + Duration::from_secs(120));
         assert_eq!(c.apply(roomy, 1, 2, t0 + Duration::from_secs(160)), Change::Grew);
     }

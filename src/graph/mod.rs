@@ -840,6 +840,10 @@ async fn sweep(cmds: &tokio::sync::mpsc::UnboundedSender<Cmd>) -> Result<String,
 async fn sweep_loop(cmds: tokio::sync::mpsc::UnboundedSender<Cmd>) {
     tokio::time::sleep(SWEEP_DELAY).await;
     loop {
+        if crate::capacity::machine_strained() {
+            tokio::time::sleep(SWEEP_DELAY).await;
+            continue;
+        }
         match sweep(&cmds).await {
             Ok(summary) => crate::log!("code graph sweep: {summary}"),
             Err(e) => crate::warn!("code graph sweep failed: {e}"),

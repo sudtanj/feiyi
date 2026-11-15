@@ -42,6 +42,8 @@ struct Proc {
     interrupted: Arc<AtomicBool>,
     /// Its background sub-agents, updated by the stream reader.
     sub_active: Arc<std::sync::Mutex<SubAgents>>,
+    /// When the process last wrote a line to stdout, of any kind; the stall watchdog reads it.
+    last_output: Arc<std::sync::Mutex<Instant>>,
     /// Spawn flags (model, effort) changed mid-turn: restart once the turn ends.
     restart: bool,
     pid: Option<u32>,
@@ -76,7 +78,7 @@ impl Proc {
 }
 
 /// How long a strain reading must last before new sub-agents are refused.
-const STRAIN_HOLD: std::time::Duration = std::time::Duration::from_secs(10);
+const STRAIN_HOLD: std::time::Duration = std::time::Duration::from_secs(30);
 /// Quiet background shells are checked for leftover processes after this.
 const SHELLS_CHECK_AFTER: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
@@ -109,7 +111,7 @@ pub struct ClaudePool {
     generation: u64,
     max_live: usize,
     /// Sub-agents each process may run at once, shared with every stream
-    /// reader's gate (0 while the machine is strained).
+    /// reader's gate (1 while the machine is strained, 0 when critical).
     sub_cap: Arc<AtomicUsize>,
     /// The machine is under pressure: children holding sub-agents count
     /// against the cap again.
@@ -127,7 +129,7 @@ impl ClaudePool {
     }
 
     /// How many sub-agents a process may start now: the configured cap, or
-    /// none while the machine is strained (running ones carry on). A strain
+    /// one while the machine is strained, none when critical (running ones carry on). A strain
     /// reading must last `STRAIN_HOLD` before it closes the gate (unless it
     /// is critical): a 2-second pressure blip, such as a CLI starting, used
     /// to refuse background agents launched at that moment.
@@ -138,7 +140,7 @@ impl ClaudePool {
             now
         };
         self.strained = critical || (strained && now.duration_since(since) >= STRAIN_HOLD);
-        let cap = if self.strained { 0 } else { self.cfg.claude_max_subagents };
+        let cap = if critical { 0 } else if self.strained { self.cfg.claude_max_subagents.min(1) } else { self.cfg.claude_max_subagents };
         if self.sub_cap.swap(cap, Ordering::Relaxed) != cap {
             crate::log!("claude: up to {cap} sub-agent(s) per agent");
         }
@@ -342,10 +344,24 @@ impl ClaudePool {
         if std::env::var_os("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC").is_none() {
             cmd.env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
         }
+        // Node's heap would otherwise grow until the OOM killer takes the
+        // process: cap it under the agent's budget so it collects first.
+        // PASEO_AGENT_MB (the static budget, not the auto-grown one) sets this cap too.
+        let heap = format!("--max-old-space-size={}", self.cfg.agent_mb.saturating_sub(40).max(64));
+        let node_options = match std::env::var("NODE_OPTIONS") {
+            Ok(existing) if !existing.trim().is_empty() => format!("{existing} {heap}"),
+            _ => heap,
+        };
+        cmd.env("NODE_OPTIONS", node_options);
         // Sub-agents on Sonnet: most of their work doesn't need Opus. Set it
         // in the daemon's environment to override.
         if std::env::var_os("CLAUDE_CODE_SUBAGENT_MODEL").is_none() {
             cmd.env("CLAUDE_CODE_SUBAGENT_MODEL", "sonnet");
+        }
+        // Longer replies before the CLI cuts a response off. Set it in the
+        // daemon's environment to override.
+        if std::env::var_os("CLAUDE_CODE_MAX_OUTPUT_TOKENS").is_none() {
+            cmd.env("CLAUDE_CODE_MAX_OUTPUT_TOKENS", "64000");
         }
         // Claude reads the router key from the --mcp-config file; it and the
         // daemon's other secrets stay out of its environment; the guard hook
@@ -417,7 +433,12 @@ impl ClaudePool {
 
         let mut state = StreamState::new(spec.id.clone(), self.events.clone(), in_tx.clone(), interrupted.clone(), Some(session_id));
         let sub_active = state.sub_active.clone();
+        let last_output = Arc::new(std::sync::Mutex::new(Instant::now()));
+        let output_seen = last_output.clone();
         state.sub_cap = self.sub_cap.clone();
+        if self.cfg.claude_max_subagents == 0 {
+            state.sub_wait = std::time::Duration::ZERO;
+        }
         state.turn_open = busy.clone();
         let events = self.events.clone();
         let agent_id = spec.id.clone();
@@ -425,12 +446,20 @@ impl ClaudePool {
             let mut lines = BufReader::new(stdout).lines();
             let mut kill_rx = kill_rx;
             let mut killed = false;
+            let mut gate_tick = tokio::time::interval(super::claude_stream::SUBAGENT_POLL);
             loop {
                 tokio::select! {
                     line = lines.next_line() => match line {
-                        Ok(Some(line)) => state.handle_line(&line),
+                        Ok(Some(line)) => {
+                            // Keep-alives must not feed the watchdog: a hung CLI could still emit them.
+                            if !line.contains("\"type\":\"keep_alive\"") {
+                                *output_seen.lock().unwrap() = Instant::now();
+                            }
+                            state.handle_line(&line);
+                        }
                         _ => break,
                     },
+                    _ = gate_tick.tick(), if state.has_gate_waiters() => state.release_gate_waiters(),
                     _ = &mut kill_rx => {
                         let _ = child.start_kill();
                         killed = true;
@@ -447,7 +476,7 @@ impl ClaudePool {
             let _ = events.send(ProviderEvent::ProcessExited { agent_id, generation });
         });
 
-        self.procs.insert(spec.id.clone(), Proc { stdin: in_tx, kill: Some(kill_tx), busy, last_used: Instant::now(), generation, interrupted, sub_active, restart: false, pid, spawned_at: Instant::now() });
+        self.procs.insert(spec.id.clone(), Proc { stdin: in_tx, kill: Some(kill_tx), busy, last_used: Instant::now(), generation, interrupted, sub_active, last_output, restart: false, pid, spawned_at: Instant::now() });
         Ok(())
     }
 
@@ -484,6 +513,11 @@ impl ClaudePool {
         }
         let take = free.min(self.waiting.len());
         self.waiting.drain(..take).collect()
+    }
+
+    /// Time since the process last wrote to stdout; None without a process.
+    pub fn quiet_for(&self, agent_id: &str) -> Option<std::time::Duration> {
+        self.procs.get(agent_id).map(|p| p.last_output.lock().unwrap().elapsed())
     }
 
     pub fn is_waiting(&self, agent_id: &str) -> bool {

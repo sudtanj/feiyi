@@ -3,7 +3,7 @@
 //!
 //! Configured by a `backup` section in `daemon-config.json` (edited by hand,
 //! never served to the app): `tursoUrl`, `tursoToken`, `passphrase` (or env
-//! `FEIYI_BACKUP_PASSPHRASE`) and `intervalSecs` (default 900). Each can also
+//! `FEIYI_BACKUP_PASSPHRASE`) and `intervalSecs` (default 1800). Each can also
 //! come from `FEIYI_BACKUP_TURSO_URL`, `_TURSO_TOKEN`, `_PASSPHRASE` and
 //! `_INTERVAL_SECS`; the file wins.
 //!
@@ -25,6 +25,7 @@ use crypto_secretbox::aead::{Aead, KeyInit};
 use crypto_secretbox::{Key, Nonce, XSalsa20Poly1305};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -41,7 +42,7 @@ const MAX_ITEM_BYTES: usize = 64 * 1024 * 1024;
 const RESTORE_TIMEOUT: Duration = Duration::from_secs(300);
 const META: &str = "meta";
 const VERIFIER: &[u8] = b"feiyi-backup-v1";
-const DEFAULT_INTERVAL_SECS: u64 = 900;
+const DEFAULT_INTERVAL_SECS: u64 = 1800;
 const START_DELAY: Duration = Duration::from_secs(60);
 const MAX_BACKOFF: Duration = Duration::from_secs(3600);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -453,6 +454,9 @@ impl Turso {
 
 // --- what to back up --------------------------------------------------------------
 
+/// (mtime, length) of a file as last uploaded.
+type Stamp = (std::time::SystemTime, u64);
+
 enum Item {
     Bytes(Vec<u8>),
     File(PathBuf),
@@ -460,15 +464,22 @@ enum Item {
 
 impl Item {
     /// None when the file vanished since the directory was listed.
-    fn bytes(&self) -> Result<Option<Vec<u8>>, String> {
+    fn bytes(&self) -> Result<Option<Cow<'_, [u8]>>, String> {
         match self {
-            Item::Bytes(b) => Ok(Some(b.clone())),
+            Item::Bytes(b) => Ok(Some(Cow::Borrowed(b))),
             Item::File(path) => match std::fs::read(path) {
-                Ok(b) => Ok(Some(b)),
+                Ok(b) => Ok(Some(Cow::Owned(b))),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
                 Err(e) => Err(format!("local I/O: {}: {e}", path.display())),
             },
         }
+    }
+
+    /// Modification time and length of a file item, to tell it is unchanged without reading it.
+    fn stamp(&self) -> Option<Stamp> {
+        let Item::File(path) = self else { return None };
+        let meta = std::fs::metadata(path).ok()?;
+        Some((meta.modified().ok()?, meta.len()))
     }
 }
 
@@ -573,6 +584,7 @@ fn belongs(key: &str, item: &str) -> bool {
 struct Change {
     item: String,
     hash: Option<u64>,
+    stamp: Option<Stamp>,
     put: Vec<(String, String)>,
     delete: Vec<String>,
 }
@@ -590,11 +602,13 @@ impl Change {
 }
 
 /// What the remote holds, as far as this process knows: the hash of each
-/// item as last written, and every remote row key.
+/// item as last written, every remote row key, and the (mtime, length) of
+/// each file item as last read (not kept across restarts).
 #[derive(Clone, Default)]
 struct State {
     hashes: BTreeMap<String, u64>,
     remote: BTreeSet<String>,
+    stamps: BTreeMap<String, Stamp>,
 }
 
 impl State {
@@ -602,7 +616,7 @@ impl State {
     fn new(mut hashes: BTreeMap<String, u64>, remote: BTreeSet<String>) -> State {
         let held: BTreeSet<&str> = remote.iter().map(|k| item_of(k)).collect();
         hashes.retain(|item, _| held.contains(item.as_str()));
-        State { hashes, remote }
+        State { hashes, remote, stamps: BTreeMap::new() }
     }
 
     fn plan(&self, key: &SecretKey, items: &BTreeMap<String, Item>) -> Result<Vec<Change>, String> {
@@ -625,6 +639,12 @@ impl State {
         }
         let mut present = BTreeSet::new();
         for (item, source) in items {
+            // The stamp is taken before the read: a write in between leaves it stale, so the next cycle reads again.
+            let stamp = source.stamp();
+            if stamp.is_some() && self.stamps.get(item) == stamp.as_ref() {
+                present.insert(item.as_str());
+                continue;
+            }
             let Some(bytes) = source.bytes()? else { continue };
             present.insert(item.as_str());
             if bytes.len() > MAX_ITEM_BYTES {
@@ -633,11 +653,15 @@ impl State {
             }
             let hash = fingerprint(&bytes);
             if self.hashes.get(item) == Some(&hash) {
+                // Nothing to upload; the empty change only records the stamp so the file is not re-read.
+                if stamp.is_some() && !sink(Change { item: item.clone(), hash: Some(hash), stamp, put: Vec::new(), delete: Vec::new() }) {
+                    return Ok(());
+                }
                 continue;
             }
             let put = split_chunks(item, seal(key, item, &bytes)?);
             let delete = rows_of.get(item.as_str()).into_iter().flatten().filter(|k| !put.iter().any(|(p, _)| p == **k)).map(|k| (*k).clone()).collect();
-            if !sink(Change { item: item.clone(), hash: Some(hash), put, delete }) {
+            if !sink(Change { item: item.clone(), hash: Some(hash), stamp, put, delete }) {
                 return Ok(());
             }
         }
@@ -646,7 +670,7 @@ impl State {
                 continue;
             }
             let delete = rows.iter().map(|k| (*k).clone()).collect();
-            if !sink(Change { item: item.to_string(), hash: None, put: Vec::new(), delete }) {
+            if !sink(Change { item: item.to_string(), hash: None, stamp: None, put: Vec::new(), delete }) {
                 break;
             }
         }
@@ -661,6 +685,10 @@ impl State {
         match change.hash {
             Some(h) => self.hashes.insert(change.item.clone(), h),
             None => self.hashes.remove(&change.item),
+        };
+        match change.stamp {
+            Some(stamp) => self.stamps.insert(change.item.clone(), stamp),
+            None => self.stamps.remove(&change.item),
         };
     }
 }
@@ -852,6 +880,10 @@ async fn run(mut backup: Backup, interval: Duration, cmds: tokio::sync::mpsc::Un
     tokio::time::sleep(START_DELAY).await;
     let mut failures = 0u32;
     loop {
+        if crate::capacity::machine_strained() {
+            tokio::time::sleep(interval).await;
+            continue;
+        }
         let wait = match backup.cycle().await {
             Ok(rows) => {
                 failures = 0;
@@ -1249,6 +1281,36 @@ mod tests {
     }
 
     #[test]
+    fn an_unchanged_file_is_not_read_again() {
+        let (_, key) = make_meta("pw", &FAST).unwrap();
+        let path = temp_home().join("t.jsonl");
+        std::fs::write(&path, "one\n").unwrap();
+        let items = BTreeMap::from([("timeline/t".to_string(), Item::File(path.clone()))]);
+        let mut state = State::new(BTreeMap::new(), BTreeSet::from([META.to_string()]));
+        state.plan(&key, &items).unwrap().iter().for_each(|c| state.commit(c));
+        // A wrong hash would force an upload if the file were read again.
+        state.hashes.insert("timeline/t".into(), 0);
+        assert!(state.plan(&key, &items).unwrap().is_empty());
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        assert_eq!(state.plan(&key, &items).unwrap().len(), 1, "a different length is read and uploaded");
+    }
+
+    #[test]
+    fn a_file_the_remote_already_holds_is_stamped_without_an_upload() {
+        let (_, key) = make_meta("pw", &FAST).unwrap();
+        let path = temp_home().join("t.jsonl");
+        std::fs::write(&path, "one\n").unwrap();
+        let items = BTreeMap::from([("timeline/t".to_string(), Item::File(path))]);
+        let mut state = State::new(BTreeMap::from([("timeline/t".to_string(), fingerprint(b"one\n"))]), BTreeSet::from(["timeline/t".to_string()]));
+        let first = state.plan(&key, &items).unwrap();
+        assert!(first.iter().all(|c| c.put.is_empty() && c.delete.is_empty()));
+        first.iter().for_each(|c| state.commit(c));
+        // A wrong hash would force an upload if the file were read again.
+        state.hashes.insert("timeline/t".into(), 0);
+        assert!(state.plan(&key, &items).unwrap().is_empty());
+    }
+
+    #[test]
     fn shrinking_an_item_deletes_its_stale_chunks() {
         let (_, key) = make_meta("pw", &FAST).unwrap();
         let state = State::new(BTreeMap::from([("timeline/t".to_string(), 1)]), BTreeSet::from(["timeline/t#0".to_string(), "timeline/t#1".to_string()]));
@@ -1324,7 +1386,7 @@ mod tests {
         let cfg = BackupConfig::from_value(Some(&section), Some("pw"));
         assert_eq!(cfg.ready().unwrap().unwrap().turso.host, "db-org.turso.io");
         assert_eq!(cfg.interval, Duration::from_secs(60), "floor");
-        assert_eq!(BackupConfig::from_value(None, None).interval, Duration::from_secs(900));
+        assert_eq!(BackupConfig::from_value(None, None).interval, Duration::from_secs(1800));
         let shown = cfg.redacted().to_string();
         assert!(shown.contains("\"tokenSet\":true") && !shown.contains("tok\"") && !shown.contains("pw"));
         assert_eq!(host_of("https://h.turso.io/").unwrap(), "h.turso.io");

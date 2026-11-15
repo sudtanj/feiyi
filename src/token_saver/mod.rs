@@ -30,6 +30,8 @@ use std::path::{Path, PathBuf};
 
 /// Hidden subcommands of the `feiyi` binary.
 pub const HOOK_CMD: &str = "rtk-hook";
+/// Guard then RTK in one process, so a Bash call pays one spawn.
+pub const PRE_TOOL_CMD: &str = "pre-tool-hook";
 pub const RUN_CMD: &str = "rtk";
 
 /// Shown after compressed output, so the agent knows how to see it raw
@@ -60,13 +62,14 @@ fn settings_path(cfg: &Config) -> PathBuf {
 /// advisory code graph hint on Grep and Read.
 fn claude_settings_json(exe: &Path, rtk: bool, guard: bool, graph: bool) -> Option<Value> {
     let exe = shell_quote(exe.to_str()?);
-    let hook = |matcher: &str, cmd: &str| json!({ "matcher": matcher, "hooks": [{ "type": "command", "command": format!("{exe} {cmd}"), "timeout": 5 }] });
+    let hook = |matcher: &str, cmd: &str| json!({ "matcher": matcher, "hooks": [{ "type": "command", "command": format!("{exe} {cmd}"), "timeout": 15 }] });
     let mut hooks = Vec::new();
+    // Both hooks on Bash run in one process (`pre-tool-hook`).
     if guard {
-        hooks.push(hook(crate::guard::MATCHER, crate::guard::HOOK_CMD));
+        hooks.push(hook(if rtk { crate::guard::MATCHER_NO_BASH } else { crate::guard::MATCHER }, crate::guard::HOOK_CMD));
     }
     if rtk {
-        hooks.push(hook("Bash", HOOK_CMD));
+        hooks.push(hook("Bash", if guard { PRE_TOOL_CMD } else { HOOK_CMD }));
     }
     if graph {
         hooks.push(hook("Grep|Read", crate::graph::HOOK_CMD));
@@ -114,6 +117,22 @@ pub fn hook_main() {
     let Ok(event) = serde_json::from_str::<Value>(&input) else { return };
     let Some(exe) = current_exe() else { return };
     if let Some(out) = hook_output(&event, &exe) {
+        let mut stdout = std::io::stdout();
+        let _ = stdout.write_all(out.to_string().as_bytes());
+        let _ = stdout.flush();
+    }
+}
+
+/// `feiyi pre-tool-hook`: the secret guard, then RTK, on one stdin read. A
+/// guard deny wins; otherwise RTK's rewrite, or nothing.
+pub fn pre_tool_main() {
+    let mut input = String::new();
+    if std::io::stdin().take(1 << 20).read_to_string(&mut input).is_err() {
+        return;
+    }
+    let Ok(event) = serde_json::from_str::<Value>(&input) else { return };
+    let out = crate::guard::hook_output(&event).or_else(|| hook_output(&event, &current_exe()?));
+    if let Some(out) = out {
         let mut stdout = std::io::stdout();
         let _ = stdout.write_all(out.to_string().as_bytes());
         let _ = stdout.flush();
@@ -381,18 +400,23 @@ mod tests {
     fn settings_hold_the_guard_the_bash_hook_and_the_graph_hook() {
         let exe = Path::new("/usr/bin/feiyi");
         let s = claude_settings_json(exe, true, true, true).unwrap();
-        assert_eq!(s["hooks"]["PreToolUse"][0]["matcher"], crate::guard::MATCHER);
+        assert_eq!(s["hooks"]["PreToolUse"][0]["matcher"], crate::guard::MATCHER_NO_BASH);
         assert_eq!(s["hooks"]["PreToolUse"][0]["hooks"][0]["command"], "'/usr/bin/feiyi' guard-hook");
         assert_eq!(s["hooks"]["PreToolUse"][1]["matcher"], "Bash");
-        assert_eq!(s["hooks"]["PreToolUse"][1]["hooks"][0]["command"], "'/usr/bin/feiyi' rtk-hook");
+        assert_eq!(s["hooks"]["PreToolUse"][1]["hooks"][0]["command"], "'/usr/bin/feiyi' pre-tool-hook");
+        assert_eq!(s["hooks"]["PreToolUse"][1]["hooks"][0]["timeout"], 15);
         assert_eq!(s["hooks"]["PreToolUse"][2]["matcher"], "Grep|Read");
         assert_eq!(s["hooks"]["PreToolUse"][2]["hooks"][0]["command"], "'/usr/bin/feiyi' graph-hook");
-        assert_eq!(s["hooks"]["PreToolUse"][2]["hooks"][0]["timeout"], 5);
+        assert_eq!(s["hooks"]["PreToolUse"][2]["hooks"][0]["timeout"], 15);
         assert_eq!(claude_settings_json(exe, false, true, true).unwrap()["hooks"]["PreToolUse"].as_array().unwrap().len(), 2);
         let no_graph = claude_settings_json(exe, true, true, false).unwrap();
         assert_eq!(no_graph["hooks"]["PreToolUse"].as_array().unwrap().len(), 2, "no graph, no graph hook");
         assert!(!no_graph.to_string().contains("graph-hook"));
         assert_eq!(claude_settings_json(exe, false, false, true).unwrap()["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
+        let guard_only = claude_settings_json(exe, false, true, false).unwrap();
+        assert_eq!(guard_only["hooks"]["PreToolUse"][0]["matcher"], crate::guard::MATCHER, "no RTK, the guard keeps Bash");
+        let rtk_only = claude_settings_json(exe, true, false, false).unwrap();
+        assert_eq!(rtk_only["hooks"]["PreToolUse"][0]["hooks"][0]["command"], "'/usr/bin/feiyi' rtk-hook");
         assert!(claude_settings_json(exe, false, false, false).is_none(), "no hook, no settings file");
     }
 

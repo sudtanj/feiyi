@@ -25,6 +25,8 @@ pub static EPOCH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| form
 /// Minimum gap between attempts to (re)start a keep-warm process, so a
 /// broken binary or a vanished session can't spin in a restart loop.
 const WARM_RETRY: Duration = Duration::from_secs(60);
+/// No warm-up this long after idle processes were released for memory.
+const RELEASE_QUIET: Duration = Duration::from_secs(300);
 
 /// Prompt text that compacts the conversation (native in Claude Code; mapped
 /// to `thread/compact/start` for Codex).
@@ -174,6 +176,8 @@ pub struct Manager {
     /// the container's limits that frees memory before it runs out.
     pub capacity: crate::capacity::Capacity,
     claude_warm_at: Option<Instant>,
+    /// When idle processes were last released for memory: no warm-up right after.
+    released_at: Option<Instant>,
     codex_warm_at: Option<Instant>,
     pub bcast: broadcast::Sender<Arc<str>>,
     pub events_tx: mpsc::UnboundedSender<ProviderEvent>,
@@ -261,7 +265,7 @@ impl Manager {
         if let crate::capacity::Mode::Fixed(n) = cfg.claude_max_live {
             claude.set_max_live(n);
         }
-        let mut manager = Manager { cfg, server_id, store, agents, claude, codex, active_cli: None, running: HashSet::new(), cli_queue: VecDeque::new(), capacity, claude_warm_at: None, codex_warm_at: None, bcast, events_tx, agents_dirty: false, pairing_url, projects, workspaces, cmds_tx, checkout: crate::checkout::Watcher::start(), started_at: now_iso(), waiters: Vec::new(), push_tokens, clients: Vec::new(), daemon_config, usage, schedules, sync: crate::directory_sync::DirectorySync::new(), chunks: HashMap::new(), chunk_deadline: None, last_trim: Instant::now() };
+        let mut manager = Manager { cfg, server_id, store, agents, claude, codex, active_cli: None, running: HashSet::new(), cli_queue: VecDeque::new(), capacity, claude_warm_at: None, released_at: None, codex_warm_at: None, bcast, events_tx, agents_dirty: false, pairing_url, projects, workspaces, cmds_tx, checkout: crate::checkout::Watcher::start(), started_at: now_iso(), waiters: Vec::new(), push_tokens, clients: Vec::new(), daemon_config, usage, schedules, sync: crate::directory_sync::DirectorySync::new(), chunks: HashMap::new(), chunk_deadline: None, last_trim: Instant::now() };
         manager.migrate_agent_workspaces();
         (manager, events_rx)
     }
@@ -360,7 +364,13 @@ impl Manager {
         }
         self.keep_warm();
         self.run_retries_and_watchdog();
-        self.flush_all();
+        // The agents.json fsync runs off the manager task; shutdown still saves in line.
+        self.flush_timelines();
+        if self.agents_dirty {
+            self.agents_dirty = false;
+            self.store.save_agents_in_background(self.agents.values().map(|a| &a.rec));
+        }
+        self.usage.save_if_dirty();
         let unload = self.cfg.timeline_unload;
         for agent in self.agents.values_mut() {
             if agent.timeline.is_some() && agent.status != "running" && agent.dirty_rows.is_empty() && agent.last_touch.elapsed() >= unload {
@@ -408,7 +418,7 @@ impl Manager {
                 }
             }
             Some("claude") => {
-                if self.cfg.claude_keep_warm && self.capacity.warm_room() && self.claude.live_count() == 0 && !self.codex.is_running() && self.running.is_empty() && self.cli_queue.is_empty() && due(self.claude_warm_at) && binary_available(&self.cfg.claude_bin) {
+                if self.cfg.claude_keep_warm && self.capacity.warm_room() && self.released_at.map(|t| t.elapsed() >= RELEASE_QUIET).unwrap_or(true) && self.claude.live_count() == 0 && !self.codex.is_running() && self.running.is_empty() && self.cli_queue.is_empty() && due(self.claude_warm_at) && binary_available(&self.cfg.claude_bin) {
                     // The process is tied to one session and cwd, so warm the Claude
                     // agent most likely to get the next prompt: the last one used.
                     let candidate = self
@@ -446,15 +456,19 @@ impl Manager {
         });
     }
 
-    pub fn flush_all(&mut self) {
+    /// Timeline rows to disk (appends, no fsync).
+    fn flush_timelines(&mut self) {
         self.flush_chunks();
         for agent in self.agents.values_mut() {
             agent.flush(&self.store);
         }
-        if self.agents_dirty {
-            self.agents_dirty = false;
-            self.store.save_agents(self.agents.values().map(|a| &a.rec));
-        }
+    }
+
+    pub fn flush_all(&mut self) {
+        self.flush_timelines();
+        // Not gated on agents_dirty: a background write may still be queued, and the lock in write_agents waits for it.
+        self.agents_dirty = false;
+        self.store.save_agents(self.agents.values().map(|a| &a.rec));
         self.usage.save_if_dirty();
     }
 
@@ -774,6 +788,7 @@ impl Manager {
         let change = self.capacity.update(running, queued, idle_mb, peak_mb);
         if change == crate::capacity::Change::Critical {
             let (freed, lost) = self.claude.release_idle(self.capacity.exhausted());
+            self.released_at = Some(Instant::now());
             if freed > 0 {
                 crate::warn!("capacity: released {freed} idle claude process(es) to free memory");
             }
@@ -782,6 +797,7 @@ impl Manager {
             }
         }
         // Sub-agents share their agent's process: under pressure no new ones start.
+        crate::capacity::set_machine_strained(self.capacity.strained());
         self.claude.set_strained(self.capacity.strained(), self.capacity.critical());
         let max = self.slots("claude");
         if max != self.claude.max_live() {
@@ -915,6 +931,13 @@ impl Manager {
             Some(a) if a.status == "running" && a.retry_at.is_none() => std::mem::take(&mut a.compacting),
             _ => return,
         };
+        // `--resume` of a session the CLI no longer has fails every time: start a fresh one on the next turn.
+        if matches!(&outcome, Err(e) if e.contains("No conversation found")) {
+            if let Some(a) = self.agents.get_mut(agent_id) {
+                a.rec.session_id = None;
+                self.agents_dirty = true;
+            }
+        }
         // A failed auto-compaction is not the user's failure: note it and
         // carry on with the uncompacted context (the CLI's own limit still applies).
         let outcome = match outcome {
@@ -1351,6 +1374,8 @@ impl Manager {
             .filter(|a| a.status == "running" && a.retry_at.is_none() && self.running.contains(&a.rec.id) && a.permissions.is_empty() && a.last_event.elapsed() >= limit)
             // Waiting for a Claude slot (another chat's turn or background sub-agents) is not a stall.
             .filter(|a| !self.claude.is_waiting(&a.rec.id))
+            // The child still writes, or sub-agents or a compaction keep it busy; the last two only for 3x the limit.
+            .filter(|a| (a.last_event.elapsed() >= limit * 3 || (!a.compacting && !self.claude.working_in_background(&a.rec.id))) && self.claude.quiet_for(&a.rec.id).map_or(true, |q| q >= limit))
             // A long-running tool call is quiet by nature.
             .filter(|a| !a.timeline.as_ref().and_then(|t| t.last()).map(|r| r.item.get("type").and_then(|t| t.as_str()) == Some("tool_call") && r.item.get("status").and_then(|s| s.as_str()) == Some("running")).unwrap_or(false))
             .map(|a| a.rec.id.clone())

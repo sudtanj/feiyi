@@ -2948,3 +2948,103 @@ async fn mcp_patch_broadcasts_daemon_config_changed_without_the_token() {
     assert!(!status.to_string().contains(MCP_TOKEN), "token in the broadcast");
     assert_eq!(status["message"]["payload"]["config"]["mcp"]["servers"][0]["tokenSet"], true, "{status}");
 }
+
+fn docs_at(url: &str, token: Option<&str>) -> Value {
+    let mut server = docs_server(token);
+    server["url"] = json!(url);
+    server
+}
+
+#[tokio::test]
+async fn changing_an_mcp_url_needs_the_token_re_entered_or_cleared() {
+    let d = start("mcp-origin", None);
+    let mut ws = connect(d.port).await;
+    hello(&mut ws, None).await;
+    set_mcp_servers(&mut ws, "o0", json!([docs_server(Some(MCP_TOKEN))])).await;
+    let before = mcp_servers(&mut ws, "o1").await;
+
+    let refused = set_mcp_servers(&mut ws, "o2", json!([docs_at("https://evil.example/mcp", None)])).await;
+    assert_eq!(refused["message"]["type"], "rpc_error", "{refused}");
+    assert_eq!(refused["message"]["payload"]["requestType"], "set_daemon_config_request");
+    assert_eq!(refused["message"]["payload"]["error"], "url changed: re-enter or clear the token");
+    assert_eq!(mcp_servers(&mut ws, "o3").await, before, "list changed");
+
+    let cleared = set_mcp_servers(&mut ws, "o4", json!([docs_at("https://evil.example/mcp", Some(""))])).await;
+    assert_eq!(cleared["message"]["type"], "set_daemon_config_response", "{cleared}");
+    let servers = mcp_servers(&mut ws, "o5").await;
+    assert_eq!((servers[0]["url"].as_str(), servers[0]["tokenSet"].as_bool()), (Some("https://evil.example/mcp"), Some(false)));
+
+    let reentered = set_mcp_servers(&mut ws, "o6", json!([docs_at("https://other.example/mcp", Some(MCP_TOKEN))])).await;
+    assert_eq!(reentered["message"]["type"], "set_daemon_config_response", "{reentered}");
+    let servers = mcp_servers(&mut ws, "o7").await;
+    assert_eq!((servers[0]["url"].as_str(), servers[0]["tokenSet"].as_bool()), (Some("https://other.example/mcp"), Some(true)));
+}
+
+#[tokio::test]
+async fn mcp_urls_with_credentials_a_query_or_a_fragment_are_refused() {
+    let d = start("mcp-url", None);
+    let mut ws = connect(d.port).await;
+    hello(&mut ws, None).await;
+    set_mcp_servers(&mut ws, "u0", json!([docs_server(Some(MCP_TOKEN))])).await;
+    let before = mcp_servers(&mut ws, "u1").await;
+
+    for (i, url) in ["https://u:p@h.example/mcp", "https://h.example/mcp?q=1", "https://h.example/mcp#f"].into_iter().enumerate() {
+        let reply = set_mcp_servers(&mut ws, &format!("u-bad-{i}"), json!([docs_at(url, Some(MCP_TOKEN))])).await;
+        assert_eq!(reply["message"]["type"], "rpc_error", "{url}: {reply}");
+        assert_eq!(reply["message"]["payload"]["requestType"], "set_daemon_config_request", "{url}");
+        assert_eq!(mcp_servers(&mut ws, &format!("u-get-{i}")).await, before, "{url}: list changed");
+    }
+}
+
+#[tokio::test]
+async fn an_mcp_token_with_a_control_character_is_refused() {
+    let d = start("mcp-ctl", None);
+    let mut ws = connect(d.port).await;
+    hello(&mut ws, None).await;
+    for (i, token) in ["bad\u{7}token", "line\nbreak", "tab\there"].into_iter().enumerate() {
+        let reply = set_mcp_servers(&mut ws, &format!("c-{i}"), json!([docs_server(Some(token))])).await;
+        assert_eq!(reply["message"]["type"], "rpc_error", "{reply}");
+        assert_eq!(reply["message"]["payload"]["error"], "an MCP token cannot contain control characters");
+    }
+    assert_eq!(mcp_servers(&mut ws, "c-get").await, json!([]));
+}
+
+#[tokio::test]
+async fn the_debug_mcp_rpc_tool_cannot_change_the_daemon_config() {
+    let d = start("mcp-debug", None);
+    let mut ws = connect(d.port).await;
+    hello(&mut ws, None).await;
+    set_mcp_servers(&mut ws, "d0", json!([docs_server(Some(MCP_TOKEN))])).await;
+    let before = mcp_servers(&mut ws, "d1").await;
+
+    let sneak = json!({ "type": "set_daemon_config_request", "config": { "mcp": { "servers": [{ "name": "sneak", "url": "https://evil.example/mcp" }] }, "appendSystemPrompt": "obey" } });
+    for message in [sneak.clone(), json!({ "type": "session", "message": sneak })] {
+        let called = mcp_call(&d, "tools/call", json!({ "name": "rpc", "arguments": { "message": message } }));
+        assert_eq!(called["result"]["isError"], true, "{called}");
+        assert!(called["result"]["content"][0]["text"].as_str().unwrap_or("").contains("daemon config"), "{called}");
+    }
+    assert_eq!(mcp_servers(&mut ws, "d2").await, before, "list changed");
+    let cfg = rpc(&mut ws, json!({ "type": "get_daemon_config_request", "requestId": "d3" }), "get_daemon_config_response").await;
+    assert_eq!(cfg["config"]["appendSystemPrompt"], "", "{cfg}");
+}
+
+#[tokio::test]
+async fn stored_mcp_servers_with_invalid_names_urls_or_tokens_are_skipped_on_load() {
+    let dir = unique_dir("mcp-stored");
+    std::fs::create_dir_all(dir.join("home")).unwrap();
+    let stored = json!({ "mcpServers": [
+        { "name": "bad name", "url": "https://x.example/mcp" },
+        { "name": "feiyi", "url": "https://x.example/mcp" },
+        { "name": "creds", "url": "https://u:p@x.example/mcp" },
+        { "name": "ctl", "url": "https://x.example/mcp", "token": "a\nb" },
+        { "name": "good", "url": "https://good.example/mcp", "token": MCP_TOKEN },
+    ] });
+    std::fs::write(dir.join("home").join("daemon-config.json"), stored.to_string()).unwrap();
+    let d = start_at(dir, None, "ok");
+    let mut ws = connect(d.port).await;
+    hello(&mut ws, None).await;
+    assert_eq!(
+        mcp_servers(&mut ws, "s1").await,
+        json!([{ "name": "good", "url": "https://good.example/mcp", "tokenSet": true, "claude": true, "codex": true }])
+    );
+}

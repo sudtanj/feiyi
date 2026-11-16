@@ -200,23 +200,22 @@ fn claude_config_json(cfg: &Config, user: &[UserServer]) -> Option<Value> {
 /// Writes Claude's `--mcp-config` file (at startup and when the user's
 /// servers change; 0600, it holds the secrets), or removes a stale one when
 /// no server is configured.
-pub fn write_claude_config(cfg: &Config) {
+pub fn write_claude_config(cfg: &Config) -> std::io::Result<()> {
     let path = claude_path(cfg);
     let Some(config) = claude_config_json(cfg, &user_servers()) else {
-        let _ = std::fs::remove_file(&path);
-        return;
+        return match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        };
     };
-    match crate::util::write_atomic(&path, config.to_string().as_bytes(), true) {
-        Ok(()) => {
-            if let Some(url) = &cfg.zilong_mcp_url {
-                crate::log!("mcp: {NAME} at {url} for Claude Code and Codex");
-            }
-            if let Some(debug) = &cfg.debug_mcp {
-                crate::log!("mcp: {DEBUG_NAME} debug server at {} for Claude Code and Codex", debug.url);
-            }
-        }
-        Err(e) => crate::warn!("mcp: cannot write {}: {e}; Claude Code starts without its MCP servers", path.display()),
+    crate::util::write_atomic(&path, config.to_string().as_bytes(), true)?;
+    if let Some(url) = &cfg.zilong_mcp_url {
+        crate::log!("mcp: {NAME} at {url} for Claude Code and Codex");
     }
+    if let Some(debug) = &cfg.debug_mcp {
+        crate::log!("mcp: {DEBUG_NAME} debug server at {} for Claude Code and Codex", debug.url);
+    }
+    Ok(())
 }
 
 /// `--mcp-config <file>` for `claude`, when any server is configured.

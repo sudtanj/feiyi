@@ -29,7 +29,7 @@ fn stored_servers(stored: &Map<String, Value>) -> Vec<UserServer> {
         let taken: Vec<&str> = servers.iter().map(|s| s.name.as_str()).collect();
         let valid = crate::mcp::check_user_server(&name, &url, &taken).and_then(|()| token.as_deref().map_or(Ok(()), crate::mcp::check_token));
         if let Err(why) = valid {
-            crate::warn!("daemon config: skipping a stored MCP server: {why}");
+            crate::warn!("daemon config: skipping a stored MCP server: {why:?}");
             continue;
         }
         servers.push(UserServer { name, url, token, claude: flag(entry, "claude"), codex: flag(entry, "codex") });

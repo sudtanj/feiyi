@@ -413,7 +413,9 @@ impl Manager {
         // New Claude Code processes read the file at spawn; Codex reads the
         // servers when its (idle-reaped) app-server next starts.
         if patch.get("mcp").is_some_and(|m| m.get("servers").is_some()) {
-            crate::mcp::write_claude_config(&self.cfg);
+            if let Err(e) = crate::mcp::write_claude_config(&self.cfg) {
+                return rpc_error(out, rid, "set_daemon_config_request", &format!("saved, but Claude's mcp-config could not be rewritten: {e}"));
+            }
         }
         let config = self.daemon_config.to_json(&self.cfg);
         reply(out, json!({ "type": "set_daemon_config_response", "payload": { "requestId": rid, "config": config } }));

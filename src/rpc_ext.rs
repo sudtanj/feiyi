@@ -407,7 +407,14 @@ impl Manager {
     /// to every client and refreshed provider model lists (custom models).
     fn set_daemon_config(&mut self, msg: &Value, rid: &str, out: &Out) {
         let patch = msg.get("config").cloned().unwrap_or(Value::Null);
-        self.daemon_config.apply_patch(&patch);
+        if let Err(error) = self.daemon_config.apply_patch(&patch) {
+            return rpc_error(out, rid, "set_daemon_config_request", &error);
+        }
+        // New Claude Code processes read the file at spawn; Codex reads the
+        // servers when its (idle-reaped) app-server next starts.
+        if patch.get("mcp").is_some_and(|m| m.get("servers").is_some()) {
+            crate::mcp::write_claude_config(&self.cfg);
+        }
         let config = self.daemon_config.to_json(&self.cfg);
         reply(out, json!({ "type": "set_daemon_config_response", "payload": { "requestId": rid, "config": config } }));
         self.broadcast(json!({ "type": "status", "payload": { "status": "daemon_config_changed", "config": config } }));

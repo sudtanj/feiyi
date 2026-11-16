@@ -3,13 +3,25 @@
 //! - `providers.<id>.additionalModels`: custom models added to that
 //!   provider's model list (snapshot, model picker),
 //! - `providers.<id>.enabled`: shown as the provider's enabled flag,
-//! - `appendSystemPrompt`: added to every agent's instructions.
+//! - `appendSystemPrompt`: added to every agent's instructions,
+//! - `mcp.servers`: the user's HTTP MCP servers (stored as `mcpServers`, with their
+//!   tokens, which `to_json` never returns), given to new Claude Code and Codex
+//!   processes (`mcp.rs`).
 //! Everything else is stored and echoed back so the settings screen
 //! round-trips, but feiyi's own settings come from environment variables.
 
 use crate::config::Config;
+use crate::mcp::{UserServer, MAX_USER_SERVERS};
 use serde_json::{json, Map, Value};
 use std::path::PathBuf;
+
+/// The user's MCP servers as stored (`mcpServers`, tokens included).
+fn stored_servers(stored: &Map<String, Value>) -> Vec<UserServer> {
+    let text = |s: &Value, key: &str| s.get(key).and_then(Value::as_str).map(String::from);
+    let flag = |s: &Value, key: &str| s.get(key).and_then(Value::as_bool).unwrap_or(true);
+    let list = stored.get("mcpServers").and_then(Value::as_array);
+    list.into_iter().flatten().filter_map(|s| Some(UserServer { name: text(s, "name")?, url: text(s, "url")?, token: text(s, "token").filter(|t| !t.is_empty()), claude: flag(s, "claude"), codex: flag(s, "codex") })).collect()
+}
 
 pub struct DaemonConfig {
     path: PathBuf,
@@ -97,7 +109,39 @@ impl DaemonConfig {
     pub fn load(home: &std::path::Path) -> DaemonConfig {
         let path = home.join("daemon-config.json");
         let stored = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()).and_then(|v| v.as_object().cloned()).unwrap_or_default();
+        // It holds MCP tokens: files written by older versions may be world-readable.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+        crate::mcp::set_user_servers(stored_servers(&stored));
         DaemonConfig { path, stored }
+    }
+
+    /// The new `mcp.servers` list from a patch: tokens kept for a name that
+    /// is still listed (when the entry has no `token`), cleared by `""` or null.
+    fn servers_from_patch(&self, list: &Value) -> Result<Vec<UserServer>, String> {
+        let list = list.as_array().ok_or("mcp.servers must be a list")?;
+        if list.len() > MAX_USER_SERVERS {
+            return Err(format!("at most {MAX_USER_SERVERS} MCP servers"));
+        }
+        let old = stored_servers(&self.stored);
+        let mut servers: Vec<UserServer> = Vec::new();
+        for entry in list {
+            let text = |key: &str| entry.get(key).and_then(Value::as_str);
+            let (name, url) = (text("name").ok_or("an MCP server needs a name")?, text("url").unwrap_or("").trim());
+            let taken: Vec<&str> = servers.iter().map(|s| s.name.as_str()).collect();
+            crate::mcp::check_user_server(name, url, &taken)?;
+            let token = match entry.get("token") {
+                None => old.iter().find(|s| s.name == name).and_then(|s| s.token.clone()),
+                Some(Value::String(t)) => Some(t.trim().to_string()).filter(|t| !t.is_empty()),
+                Some(_) => None,
+            };
+            let flag = |key: &str| entry.get(key).and_then(Value::as_bool).unwrap_or(true);
+            servers.push(UserServer { name: name.to_string(), url: url.to_string(), token, claude: flag("claude"), codex: flag("codex") });
+        }
+        Ok(servers)
     }
 
     fn save(&self) {
@@ -142,7 +186,9 @@ impl DaemonConfig {
     /// The full `MutableDaemonConfig` the app expects (stored values over defaults).
     pub fn to_json(&self, cfg: &Config) -> Value {
         let mut out = self.stored.clone();
-        out.insert("mcp".into(), json!({ "enabled": false, "injectIntoAgents": false }));
+        out.remove("mcpServers");
+        let servers: Vec<Value> = stored_servers(&self.stored).iter().map(|s| json!({ "name": s.name, "url": s.url, "tokenSet": s.token.is_some(), "claude": s.claude, "codex": s.codex })).collect();
+        out.insert("mcp".into(), json!({ "enabled": false, "injectIntoAgents": false, "servers": servers }));
         out.insert("hostnames".into(), json!(cfg.hostnames));
         out.insert("app".into(), json!({ "baseUrl": cfg.app_base_url }));
         out.insert("relay".into(), json!({ "enabled": cfg.relay_enabled }));
@@ -154,9 +200,25 @@ impl DaemonConfig {
     }
 
     /// Apply a `MutableDaemonConfigPatch`. Provider entries merge field by
-    /// field; `removeProviders` deletes entries; other keys replace.
-    pub fn apply_patch(&mut self, patch: &Value) {
-        let Some(patch) = patch.as_object() else { return };
+    /// field; `removeProviders` deletes entries; `mcp.servers` replaces the
+    /// MCP server list; other keys replace. An invalid `mcp.servers` rejects
+    /// the whole patch, nothing is applied.
+    pub fn apply_patch(&mut self, patch: &Value) -> Result<(), String> {
+        let Some(patch) = patch.as_object() else { return Ok(()) };
+        let servers = match patch.get("mcp").and_then(|m| m.get("servers")) {
+            Some(list) => Some(self.servers_from_patch(list)?),
+            None => None,
+        };
+        if let Some(servers) = &servers {
+            let list = servers.iter().map(|s| {
+                let mut entry = json!({ "name": s.name, "url": s.url, "claude": s.claude, "codex": s.codex });
+                if let Some(token) = &s.token {
+                    entry["token"] = json!(token);
+                }
+                entry
+            });
+            self.stored.insert("mcpServers".into(), Value::Array(list.collect()));
+        }
         for (key, value) in patch {
             match key.as_str() {
                 "providers" => {
@@ -188,13 +250,18 @@ impl DaemonConfig {
                     }
                 }
                 // Environment-controlled in feiyi (backup: edited by hand, it holds secrets; backupStatus: read-only); not stored.
-                "mcp" | "hostnames" | "app" | "relay" | "backup" | "backupStatus" => {}
+                // (mcpServers: only through the validated mcp.servers.)
+                "mcp" | "mcpServers" | "hostnames" | "app" | "relay" | "backup" | "backupStatus" => {}
                 _ => {
                     self.stored.insert(key.clone(), value.clone());
                 }
             }
         }
         self.save();
+        if let Some(servers) = servers {
+            crate::mcp::set_user_servers(servers);
+        }
+        Ok(())
     }
 }
 
@@ -224,7 +291,7 @@ mod tests {
     #[test]
     fn additional_models_are_merged() {
         let mut c = config();
-        c.apply_patch(&json!({ "providers": { "claude": { "additionalModels": [{ "id": "my-model", "label": "My Model" }] } } }));
+        c.apply_patch(&json!({ "providers": { "claude": { "additionalModels": [{ "id": "my-model", "label": "My Model" }] } } })).unwrap();
         let merged = c.overrides().merge_models("claude", json!([{ "provider": "claude", "id": "opus", "label": "Opus" }]));
         let ids: Vec<&str> = merged.as_array().unwrap().iter().map(|m| m["id"].as_str().unwrap()).collect();
         assert_eq!(ids, vec!["opus", "my-model"]);
@@ -234,7 +301,7 @@ mod tests {
     fn custom_default_wins_and_same_id_replaces_label() {
         let mut c = config();
         c.apply_patch(&json!({ "providers": { "codex": { "additionalModels": [
-            { "id": "gpt", "label": "Renamed", "isDefault": true } ] } } }));
+            { "id": "gpt", "label": "Renamed", "isDefault": true } ] } } })).unwrap();
         let merged = c.overrides().merge_models("codex", json!([
             { "provider": "codex", "id": "gpt", "label": "GPT", "isDefault": true, "thinkingOptions": [] },
             { "provider": "codex", "id": "other", "label": "Other", "isDefault": true } ]));
@@ -248,13 +315,13 @@ mod tests {
     #[test]
     fn provider_patches_merge_and_remove() {
         let mut c = config();
-        c.apply_patch(&json!({ "providers": { "claude": { "enabled": false } } }));
+        c.apply_patch(&json!({ "providers": { "claude": { "enabled": false } } })).unwrap();
         assert!(!c.overrides().enabled("claude"));
         assert!(c.overrides().enabled("codex"));
-        c.apply_patch(&json!({ "providers": { "claude": { "enabled": null } } }));
+        c.apply_patch(&json!({ "providers": { "claude": { "enabled": null } } })).unwrap();
         assert!(c.overrides().enabled("claude"));
-        c.apply_patch(&json!({ "providers": { "claude": { "enabled": false } } }));
-        c.apply_patch(&json!({ "removeProviders": ["claude"] }));
+        c.apply_patch(&json!({ "providers": { "claude": { "enabled": false } } })).unwrap();
+        c.apply_patch(&json!({ "removeProviders": ["claude"] })).unwrap();
         assert!(c.overrides().enabled("claude"));
     }
 
@@ -264,17 +331,104 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let mut c = DaemonConfig::load(&dir);
         assert!(c.append_system_prompt().is_none());
-        c.apply_patch(&json!({ "appendSystemPrompt": "  be brief  " }));
+        c.apply_patch(&json!({ "appendSystemPrompt": "  be brief  " })).unwrap();
         assert_eq!(c.append_system_prompt().as_deref(), Some("be brief"));
         let reloaded = DaemonConfig::load(&dir);
         assert_eq!(reloaded.append_system_prompt().as_deref(), Some("be brief"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn mcp_patch(servers: Value) -> Value {
+        json!({ "mcp": { "servers": servers } })
+    }
+
+    fn stored_token(c: &DaemonConfig, name: &str) -> Option<String> {
+        stored_servers(&c.stored).into_iter().find(|s| s.name == name).and_then(|s| s.token)
+    }
+
+    #[test]
+    fn mcp_servers_keep_clear_and_replace_tokens() {
+        let mut c = config();
+        c.apply_patch(&mcp_patch(json!([
+            { "name": "docs", "url": "https://docs.example/mcp", "claude": true, "codex": false, "token": "tok-1" },
+            { "name": "other", "url": "http://pi/mcp", "claude": false, "codex": true, "token": "tok-o" } ]))).unwrap();
+        assert_eq!(stored_token(&c, "docs").as_deref(), Some("tok-1"));
+        c.apply_patch(&mcp_patch(json!([
+            { "name": "docs", "url": "https://docs.example/v2", "claude": true, "codex": true },
+            { "name": "other", "url": "http://pi/mcp", "claude": false, "codex": true, "token": "" } ]))).unwrap();
+        assert_eq!(stored_token(&c, "docs").as_deref(), Some("tok-1"), "absent token keeps it");
+        assert_eq!(stored_token(&c, "other"), None, "empty token clears it");
+        c.apply_patch(&mcp_patch(json!([{ "name": "docs", "url": "https://docs.example/v2", "token": "tok-2" }]))).unwrap();
+        assert_eq!(stored_token(&c, "docs").as_deref(), Some("tok-2"));
+        c.apply_patch(&mcp_patch(json!([{ "name": "docs", "url": "https://docs.example/v2", "token": null }]))).unwrap();
+        assert_eq!(stored_token(&c, "docs"), None, "null clears it");
+        c.apply_patch(&mcp_patch(json!([{ "name": "docs", "url": "https://docs.example/v2", "token": "tok-3" }]))).unwrap();
+        c.apply_patch(&mcp_patch(json!([]))).unwrap();
+        c.apply_patch(&mcp_patch(json!([{ "name": "docs", "url": "https://docs.example/v2" }]))).unwrap();
+        assert_eq!(stored_token(&c, "docs"), None, "a removed server takes its token along");
+        let reloaded = DaemonConfig::load(c.path.parent().unwrap());
+        assert_eq!(stored_servers(&reloaded.stored).len(), 1, "saved");
+    }
+
+    #[test]
+    fn mcp_servers_are_reported_without_tokens() {
+        let mut c = config();
+        c.apply_patch(&mcp_patch(json!([
+            { "name": "docs", "url": "https://docs.example/mcp", "claude": true, "codex": false, "token": "tok-secret" },
+            { "name": "open", "url": "https://open.example/mcp", "claude": false, "codex": true } ]))).unwrap();
+        c.apply_patch(&json!({ "mcpServers": [{ "name": "forged", "url": "http://x", "token": "tok-forged" }] })).unwrap();
+        let out = c.to_json(&crate::config::Config::load(&[]));
+        assert_eq!(out["mcp"]["servers"], json!([
+            { "name": "docs", "url": "https://docs.example/mcp", "tokenSet": true, "claude": true, "codex": false },
+            { "name": "open", "url": "https://open.example/mcp", "tokenSet": false, "claude": false, "codex": true } ]));
+        assert!(out.get("mcpServers").is_none());
+        assert!(!out.to_string().contains("tok-"), "{out}");
+    }
+
+    #[test]
+    fn invalid_mcp_servers_reject_the_whole_patch() {
+        let mut c = config();
+        c.apply_patch(&mcp_patch(json!([{ "name": "docs", "url": "https://docs.example/mcp", "token": "tok-1" }]))).unwrap();
+        let ok = json!({ "name": "fine", "url": "https://fine.example/mcp" });
+        let too_many: Vec<Value> = (0..33).map(|i| json!({ "name": format!("s{i}"), "url": "https://h/mcp" })).collect();
+        for bad in [
+            json!({ "name": "has space", "url": "https://h/mcp" }),
+            json!({ "name": "", "url": "https://h/mcp" }),
+            json!({ "name": "zilong-router", "url": "https://h/mcp" }),
+            json!({ "name": "feiyi", "url": "https://h/mcp" }),
+            json!({ "name": "bad-url", "url": "ftp://h/mcp" }),
+            json!({ "name": "no-url" }),
+        ] {
+            assert!(c.apply_patch(&json!({ "appendSystemPrompt": "x", "mcp": { "servers": [ok.clone(), bad.clone()] } })).is_err(), "{bad}");
+        }
+        assert!(c.apply_patch(&mcp_patch(json!([ok.clone(), ok.clone()]))).is_err(), "duplicate name");
+        assert!(c.apply_patch(&mcp_patch(Value::Array(too_many))).is_err());
+        assert!(c.apply_patch(&mcp_patch(json!("nope"))).is_err());
+        assert!(c.append_system_prompt().is_none(), "nothing applied");
+        assert_eq!(stored_token(&c, "docs").as_deref(), Some("tok-1"), "the old list is untouched");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn config_file_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("feiyi-cfg-{}", crate::util::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("daemon-config.json");
+        std::fs::write(&file, "{}").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let mut c = DaemonConfig::load(&dir);
+        let mode = || std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(), 0o600, "existing file fixed on load");
+        c.apply_patch(&mcp_patch(json!([{ "name": "docs", "url": "https://docs.example/mcp", "token": "tok-1" }]))).unwrap();
+        assert_eq!(mode(), 0o600, "written private");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn environment_controlled_keys_are_not_stored() {
         let mut c = config();
-        c.apply_patch(&json!({ "relay": { "enabled": false }, "hostnames": ["x"] }));
+        c.apply_patch(&json!({ "relay": { "enabled": false }, "hostnames": ["x"] })).unwrap();
         assert!(c.stored.get("relay").is_none() && c.stored.get("hostnames").is_none());
     }
 
@@ -284,7 +438,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("daemon-config.json"), r#"{"backup":{"tursoToken":"tok-keep"}}"#).unwrap();
         let mut c = DaemonConfig::load(&dir);
-        c.apply_patch(&json!({ "backup": { "tursoToken": "tok-app" }, "appendSystemPrompt": "x" }));
+        c.apply_patch(&json!({ "backup": { "tursoToken": "tok-app" }, "appendSystemPrompt": "x" })).unwrap();
         let saved: Value = serde_json::from_slice(&std::fs::read(dir.join("daemon-config.json")).unwrap()).unwrap();
         assert_eq!(saved["backup"]["tursoToken"], "tok-keep");
         assert_eq!(saved["appendSystemPrompt"], "x");
@@ -297,7 +451,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("daemon-config.json"), r#"{"backup":{"tursoUrl":"libsql://db-org.turso.io","tursoToken":"tok-9f3a","passphrase":"pw-7c1d"}}"#).unwrap();
         let mut c = DaemonConfig::load(&dir);
-        c.apply_patch(&json!({ "backupStatus": { "enabled": true, "lastError": "forged" }, "appendSystemPrompt": "x" }));
+        c.apply_patch(&json!({ "backupStatus": { "enabled": true, "lastError": "forged" }, "appendSystemPrompt": "x" })).unwrap();
         assert!(c.stored.get("backupStatus").is_none());
         let saved = std::fs::read_to_string(dir.join("daemon-config.json")).unwrap();
         assert!(!saved.contains("backupStatus") && !saved.contains("forged"), "never persisted: {saved}");

@@ -261,6 +261,9 @@ async fn rpc_tool(ctx: &Arc<Ctx>, args: &Value) -> Result<Value, String> {
     if kind == "file.upload.request" {
         return Err("uploads need a socket session and are not available here".into());
     }
+    if kind == "set_daemon_config_request" {
+        return Err("changing the daemon config (it holds MCP tokens and runs commands for agents) is not available through the debug server; use the app".into());
+    }
     if msg.get("requestId").map(Value::is_null).unwrap_or(true) {
         msg["requestId"] = json!(format!("mcp-{}", crate::util::new_id()));
     }
@@ -678,6 +681,16 @@ mod tests {
     async fn body_json(resp: Response) -> Value {
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_rpc_tool_refuses_daemon_config_changes() {
+        let (ctx, mut rx) = ctx();
+        for message in [json!({ "type": "set_daemon_config_request", "config": { "mcp": { "servers": [] } } }), json!({ "type": "session", "message": { "type": "set_daemon_config_request" } })] {
+            let err = rpc_tool(&ctx, &json!({ "message": message })).await.unwrap_err();
+            assert!(err.contains("daemon config"), "{err}");
+        }
+        assert!(rx.try_recv().is_err(), "nothing reached the manager");
     }
 
     #[tokio::test]

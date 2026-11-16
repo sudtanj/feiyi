@@ -15,12 +15,32 @@ use crate::mcp::{UserServer, MAX_USER_SERVERS};
 use serde_json::{json, Map, Value};
 use std::path::PathBuf;
 
-/// The user's MCP servers as stored (`mcpServers`, tokens included).
+/// The user's MCP servers as stored (`mcpServers`, tokens included). Entries
+/// that fail the checks of a patch are skipped, so an edited file or a
+/// restored backup cannot put arbitrary names, URLs or tokens into a Codex
+/// command line or a request header.
 fn stored_servers(stored: &Map<String, Value>) -> Vec<UserServer> {
     let text = |s: &Value, key: &str| s.get(key).and_then(Value::as_str).map(String::from);
     let flag = |s: &Value, key: &str| s.get(key).and_then(Value::as_bool).unwrap_or(true);
-    let list = stored.get("mcpServers").and_then(Value::as_array);
-    list.into_iter().flatten().filter_map(|s| Some(UserServer { name: text(s, "name")?, url: text(s, "url")?, token: text(s, "token").filter(|t| !t.is_empty()), claude: flag(s, "claude"), codex: flag(s, "codex") })).collect()
+    let mut servers: Vec<UserServer> = Vec::new();
+    for entry in stored.get("mcpServers").and_then(Value::as_array).into_iter().flatten() {
+        let (Some(name), Some(url)) = (text(entry, "name"), text(entry, "url")) else { continue };
+        let token = text(entry, "token").filter(|t| !t.is_empty());
+        let taken: Vec<&str> = servers.iter().map(|s| s.name.as_str()).collect();
+        let valid = crate::mcp::check_user_server(&name, &url, &taken).and_then(|()| token.as_deref().map_or(Ok(()), crate::mcp::check_token));
+        if let Err(why) = valid {
+            crate::warn!("daemon config: skipping a stored MCP server: {why}");
+            continue;
+        }
+        servers.push(UserServer { name, url, token, claude: flag(entry, "claude"), codex: flag(entry, "codex") });
+    }
+    servers
+}
+
+/// Scheme, host and port of a URL: where a bearer token would be sent.
+fn origin(url: &str) -> String {
+    let (scheme, rest) = url.split_once("://").unwrap_or(("", url));
+    format!("{}://{}", scheme.to_ascii_lowercase(), rest.split('/').next().unwrap_or("").to_ascii_lowercase())
 }
 
 pub struct DaemonConfig {
@@ -134,25 +154,26 @@ impl DaemonConfig {
             let taken: Vec<&str> = servers.iter().map(|s| s.name.as_str()).collect();
             crate::mcp::check_user_server(name, url, &taken)?;
             let token = match entry.get("token") {
-                None => old.iter().find(|s| s.name == name).and_then(|s| s.token.clone()),
+                None => match old.iter().find(|s| s.name == name) {
+                    Some(old) if old.token.is_some() && origin(&old.url) != origin(url) => return Err("url changed: re-enter or clear the token".into()),
+                    Some(old) => old.token.clone(),
+                    None => None,
+                },
                 Some(Value::String(t)) => Some(t.trim().to_string()).filter(|t| !t.is_empty()),
                 Some(_) => None,
             };
+            if let Some(token) = &token {
+                crate::mcp::check_token(token)?;
+            }
             let flag = |key: &str| entry.get(key).and_then(Value::as_bool).unwrap_or(true);
             servers.push(UserServer { name: name.to_string(), url: url.to_string(), token, claude: flag("claude"), codex: flag("codex") });
         }
         Ok(servers)
     }
 
-    fn save(&self) {
-        match serde_json::to_vec_pretty(&self.stored) {
-            Ok(bytes) => {
-                if let Err(e) = crate::util::write_atomic(&self.path, &bytes, true) {
-                    crate::warn!("failed to save daemon config: {e}");
-                }
-            }
-            Err(e) => crate::warn!("failed to encode daemon config: {e}"),
-        }
+    fn save(&self) -> Result<(), String> {
+        let bytes = serde_json::to_vec_pretty(&self.stored).map_err(|e| format!("failed to encode daemon config: {e}"))?;
+        crate::util::write_atomic(&self.path, &bytes, true).map_err(|e| format!("failed to save daemon config: {e}"))
     }
 
     pub fn overrides(&self) -> ProviderOverrides {
@@ -171,7 +192,9 @@ impl DaemonConfig {
         }
         if entry.get("lastModel").and_then(|v| v.as_str()) != Some(model) {
             entry["lastModel"] = json!(model);
-            self.save();
+            if let Err(e) = self.save() {
+                crate::warn!("{e}");
+            }
         }
     }
 
@@ -209,6 +232,7 @@ impl DaemonConfig {
             Some(list) => Some(self.servers_from_patch(list)?),
             None => None,
         };
+        let before = self.stored.clone();
         if let Some(servers) = &servers {
             let list = servers.iter().map(|s| {
                 let mut entry = json!({ "name": s.name, "url": s.url, "claude": s.claude, "codex": s.codex });
@@ -257,7 +281,10 @@ impl DaemonConfig {
                 }
             }
         }
-        self.save();
+        if let Err(e) = self.save() {
+            self.stored = before;
+            return Err(e);
+        }
         if let Some(servers) = servers {
             crate::mcp::set_user_servers(servers);
         }
@@ -368,6 +395,61 @@ mod tests {
         assert_eq!(stored_token(&c, "docs"), None, "a removed server takes its token along");
         let reloaded = DaemonConfig::load(c.path.parent().unwrap());
         assert_eq!(stored_servers(&reloaded.stored).len(), 1, "saved");
+    }
+
+    #[test]
+    fn a_changed_url_does_not_inherit_the_token() {
+        let mut c = config();
+        c.apply_patch(&mcp_patch(json!([{ "name": "docs", "url": "https://docs.example/mcp", "token": "tok-1" }]))).unwrap();
+        for moved in ["https://evil.example/mcp", "http://docs.example/mcp", "https://docs.example:8443/mcp"] {
+            let err = c.apply_patch(&mcp_patch(json!([{ "name": "docs", "url": moved }]))).unwrap_err();
+            assert_eq!(err, "url changed: re-enter or clear the token");
+        }
+        assert_eq!(stored_servers(&c.stored)[0].url, "https://docs.example/mcp", "nothing applied");
+        c.apply_patch(&mcp_patch(json!([{ "name": "docs", "url": "https://DOCS.example/other-path" }]))).unwrap();
+        assert_eq!(stored_token(&c, "docs").as_deref(), Some("tok-1"), "same origin keeps it");
+        c.apply_patch(&mcp_patch(json!([{ "name": "docs", "url": "https://evil.example/mcp", "token": "" }]))).unwrap();
+        c.apply_patch(&mcp_patch(json!([{ "name": "docs", "url": "https://elsewhere.example/mcp" }]))).unwrap();
+        c.apply_patch(&mcp_patch(json!([{ "name": "docs", "url": "https://evil.example/mcp", "token": "tok-new" }]))).unwrap();
+        assert_eq!(stored_token(&c, "docs").as_deref(), Some("tok-new"), "re-entered");
+    }
+
+    #[test]
+    fn tokens_with_control_characters_are_rejected() {
+        let mut c = config();
+        for token in ["a\nb", "a\u{0}b", "a\rb"] {
+            assert!(c.apply_patch(&mcp_patch(json!([{ "name": "docs", "url": "https://docs.example/mcp", "token": token }]))).is_err());
+        }
+        assert!(stored_servers(&c.stored).is_empty());
+    }
+
+    #[test]
+    fn invalid_stored_servers_are_skipped_on_load() {
+        let dir = std::env::temp_dir().join(format!("feiyi-cfg-{}", crate::util::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stored = json!({ "mcpServers": [
+            { "name": "good", "url": "https://good.example/mcp", "token": "tok-1" },
+            { "name": "good", "url": "https://dup.example/mcp" },
+            { "name": "x\" -c shell=\"rm", "url": "https://h/mcp" },
+            { "name": "zilong-router", "url": "https://h/mcp" },
+            { "name": "bad-url", "url": "https://u:p@h/mcp" },
+            { "name": "bad-token", "url": "https://h/mcp", "token": "a\nb" },
+            { "name": "no-url" } ] });
+        std::fs::write(dir.join("daemon-config.json"), stored.to_string()).unwrap();
+        let c = DaemonConfig::load(&dir);
+        let names: Vec<String> = stored_servers(&c.stored).into_iter().map(|s| s.name).collect();
+        assert_eq!(names, vec!["good"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_save_fails_the_patch_and_changes_nothing() {
+        let dir = std::env::temp_dir().join(format!("feiyi-cfg-{}", crate::util::new_id()));
+        std::fs::create_dir_all(dir.join("daemon-config.json")).unwrap();
+        let mut c = DaemonConfig::load(&dir);
+        assert!(c.apply_patch(&json!({ "appendSystemPrompt": "x", "mcp": { "servers": [{ "name": "docs", "url": "https://docs.example/mcp" }] } })).is_err());
+        assert!(c.append_system_prompt().is_none() && stored_servers(&c.stored).is_empty(), "rolled back");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

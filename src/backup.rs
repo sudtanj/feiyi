@@ -1237,6 +1237,13 @@ mod tests {
     }
 
     #[test]
+    fn config_row_drops_mcp_server_tokens() {
+        let raw = json!({ "mcpServers": [{ "name": "docs", "url": "https://docs.example/mcp", "token": "tok-mcp-1", "claude": true }] });
+        let row: Value = serde_json::from_slice(&config_row(raw.to_string().as_bytes()).unwrap()).unwrap();
+        assert_eq!(row, json!({ "mcpServers": [{ "name": "docs", "url": "https://docs.example/mcp", "claude": true }] }));
+    }
+
+    #[test]
     fn config_row_drops_secrets_and_the_backup_section() {
         let raw = json!({
             "appendSystemPrompt": "be brief",

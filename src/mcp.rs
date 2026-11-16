@@ -155,9 +155,20 @@ pub fn check_user_server(name: &str, url: &str, taken: &[&str]) -> Result<(), St
         return Err(format!("MCP server name '{name}' is used twice"));
     }
     let rest = url.strip_prefix("http://").or_else(|| url.strip_prefix("https://"));
-    let host = rest.and_then(|r| r.split(['/', '?', '#']).next()).and_then(|a| a.rsplit('@').next()).unwrap_or("");
-    if host.is_empty() || host.starts_with(':') || url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+    let authority = rest.and_then(|r| r.split(['/', '?', '#']).next()).unwrap_or("");
+    if authority.is_empty() || authority.starts_with(':') || url.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return Err(format!("MCP server '{name}': the URL must be http:// or https:// with a host"));
+    }
+    if authority.contains('@') || url.contains('?') || url.contains('#') {
+        return Err(format!("MCP server '{name}': the URL cannot hold credentials, a query or a fragment; put the secret in the token field"));
+    }
+    Ok(())
+}
+
+/// A token goes into a header and an environment variable: no control characters.
+pub fn check_token(token: &str) -> Result<(), String> {
+    if token.chars().any(char::is_control) {
+        return Err("an MCP token cannot contain control characters".into());
     }
     Ok(())
 }
@@ -380,7 +391,10 @@ mod tests {
     #[test]
     fn user_server_checks() {
         assert!(check_user_server("my_docs-2", "http://pi:8080/mcp", &["other"]).is_ok());
-        assert!(check_user_server("a", "https://u:p@host/mcp?x=1", &[]).is_ok());
+        for url in ["https://u:p@host/mcp", "https://host/mcp?key=1", "https://host/mcp#frag", "https://host/a@b?x"] {
+            assert!(check_user_server("a", url, &[]).is_err(), "{url}");
+        }
+        assert!(check_user_server("a", "https://host:8443/a@b", &[]).is_ok());
         let long = "x".repeat(65);
         for bad in ["", "has space", "dot.name", "zilong-router", "Feiyi", long.as_str()] {
             assert!(check_user_server(bad, "https://h/mcp", &[]).is_err(), "{bad}");

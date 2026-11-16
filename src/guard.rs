@@ -19,6 +19,8 @@ pub const MATCHER_NO_BASH: &str = "Read|Edit|MultiEdit|Write|Grep|Glob|NotebookE
 
 /// Variables holding secrets, by name (GH_TOKEN is left out: agents push with it).
 const SECRET_VARS: &[&str] = &["PASEO_ZILONG_API_KEY", "PASEO_LITE_MCP_TOKEN", "PASEO_PASSWORD", "FEIYI_BACKUP_PASSPHRASE", "FEIYI_BACKUP_TURSO_TOKEN", "FEIYI_BACKUP_TURSO_URL", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_MESSAGING_TOKEN", "CODEX_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"];
+/// Variable name prefixes holding secrets (the app's MCP server tokens).
+const SECRET_PREFIXES: &[&str] = &["PASEO_MCP_TOKEN_"];
 /// Paths that are secret wherever the home directory is.
 const SECRET_PATHS: &[&str] = &["/.claude/.credentials.json", "/.codex/auth.json", "/.ssh"];
 /// What an agent may still read inside the state dir.
@@ -82,7 +84,7 @@ fn names_secret_path(text: &str, state: &str) -> bool {
 
 fn reads_secret_env(command: &str) -> bool {
     // Expansions only: grepping or committing a variable's name is fine.
-    if SECRET_VARS.iter().any(|v| command.contains(&format!("${v}")) || command.contains(&format!("${{{v}"))) {
+    if SECRET_VARS.iter().chain(SECRET_PREFIXES).any(|v| command.contains(&format!("${v}")) || command.contains(&format!("${{{v}"))) {
         return true;
     }
     // Commands start after a separator or a `$(`/backtick; bare parentheses
@@ -113,6 +115,9 @@ mod tests {
         assert!(deny("Read", "file_path", "/home/x/.claude/.credentials.json"));
         assert!(deny("Grep", "path", "~/.ssh"));
         assert!(deny("Bash", "command", "echo $PASEO_ZILONG_API_KEY"));
+        assert!(deny("Bash", "command", "echo $PASEO_MCP_TOKEN_MY_DOCS"));
+        assert!(deny("Bash", "command", "curl -H \"Authorization: Bearer ${PASEO_MCP_TOKEN_X}\" h"));
+        assert!(!deny("Bash", "command", "grep -rn PASEO_MCP_TOKEN_ src"));
         assert!(deny("Bash", "command", "cat /proc/self/environ"));
         assert!(deny("Bash", "command", "ls && printenv"));
         assert!(deny("Bash", "command", "env | grep KEY"));

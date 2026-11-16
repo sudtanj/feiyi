@@ -206,16 +206,69 @@ describe("McpServersSection", () => {
   it("omits the token when editing without touching it", async () => {
     render(withServers([alpha, beta]));
     await click("host-page-mcp-servers-alpha-edit");
-    type("host-page-mcp-servers-url-input", "https://a2.example/mcp");
+    await click("host-page-mcp-servers-form-codex");
     await click("host-page-mcp-servers-save");
     expect(patchConfig.mock.calls[0]?.[0]).toStrictEqual({
       mcp: {
         servers: [
-          { name: "alpha", url: "https://a2.example/mcp", claude: true, codex: false },
+          { name: "alpha", url: alpha.url, claude: true, codex: true },
           { name: "beta", url: beta.url, claude: false, codex: true },
         ],
       },
     });
+  });
+
+  it("sends a new token when editing with one typed", async () => {
+    render(withServers([alpha]));
+    await click("host-page-mcp-servers-alpha-edit");
+    type("host-page-mcp-servers-url-input", "https://a2.example/mcp");
+    type("host-page-mcp-servers-token-input", "new");
+    await click("host-page-mcp-servers-save");
+    expect(patchConfig.mock.calls[0]?.[0]).toStrictEqual({
+      mcp: {
+        servers: [
+          { name: "alpha", url: "https://a2.example/mcp", claude: true, codex: false, token: "new" },
+        ],
+      },
+    });
+  });
+
+  it("blocks a URL change that would send the stored token to a new host", async () => {
+    render(withServers([alpha]));
+    await click("host-page-mcp-servers-alpha-edit");
+    type("host-page-mcp-servers-url-input", "https://a2.example/mcp");
+    await click("host-page-mcp-servers-save");
+    expect(byId("host-page-mcp-servers-form-error").textContent).toContain("Enter the token again");
+    expect(patchConfig).not.toHaveBeenCalled();
+  });
+
+  it("sends the full list without tokens when a row switch is toggled", async () => {
+    render(withServers([alpha, beta]));
+    await click("host-page-mcp-servers-beta-claude");
+    expect(patchConfig.mock.calls[0]?.[0]).toStrictEqual({
+      mcp: {
+        servers: [
+          { name: "alpha", url: alpha.url, claude: true, codex: false },
+          { name: "beta", url: beta.url, claude: true, codex: true },
+        ],
+      },
+    });
+  });
+
+  it("disables Add at 32 servers", () => {
+    const many = Array.from({ length: 32 }, (_, index) => ({ ...beta, name: `s${index}` }));
+    render(withServers(many));
+    expect(byId<HTMLButtonElement>("host-page-mcp-servers-add").disabled).toBe(true);
+  });
+
+  it("reports an edit whose server was removed elsewhere", async () => {
+    render(withServers([alpha]));
+    await click("host-page-mcp-servers-alpha-edit");
+    configState.config = withServers([]);
+    await act(async () => root?.render(<McpServersSection serverId="s" />));
+    await click("host-page-mcp-servers-save");
+    expect(byId("host-page-mcp-servers-error").textContent).toContain("was removed");
+    expect(patchConfig).not.toHaveBeenCalled();
   });
 
   it("sends an empty token to clear it", async () => {

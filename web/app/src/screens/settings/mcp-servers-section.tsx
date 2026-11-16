@@ -96,8 +96,14 @@ function ServerForm({ editing, saving, onSave, onCancel, validate }: ServerFormP
 
   const handleSave = useCallback(() => {
     const message = validate({ name, url });
-    setError(message);
-    if (message) return;
+    const tokenKept = !clearToken && token === "";
+    const keptTokenToNewHost =
+      !message && editing?.tokenSet === true && tokenKept && url.trim() !== editing.url;
+    const blocked = keptTokenToNewHost
+      ? "The URL changed. Enter the token again or clear it so the stored token is not sent to the new host."
+      : message;
+    setError(blocked);
+    if (blocked) return;
     const patch: McpServerPatch = { name: name.trim(), url: url.trim(), claude, codex };
     if (clearToken) patch.token = "";
     else if (token !== "") patch.token = token;
@@ -310,6 +316,10 @@ export function McpServersSection({ serverId }: { serverId: string }) {
   const handleSave = useCallback(
     async (entry: McpServerPatch) => {
       const current = servers ?? [];
+      if (form.mode === "edit" && !current.some((server) => server.name === form.server.name)) {
+        setError(`"${form.server.name}" was removed from the daemon. Cancel and add it again.`);
+        return;
+      }
       const next =
         form.mode === "edit"
           ? current.map((server) => (server.name === form.server.name ? entry : toPatch(server)))

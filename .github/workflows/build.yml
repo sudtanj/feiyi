@@ -122,7 +122,11 @@ jobs:
           sed -i '' 's|^    <meta charset="utf-8" />$|&\
               <script src="/feiyi-init.js"></script>|' index.html
           grep -q feiyi-init.js index.html
+      # macOS's default TMPDIR ends in "/T/", so graph::hook's sibling-prefix test cuts
+      # at a directory boundary instead of inside a name; a TMPDIR without it passes.
       - name: Unit tests
+        env:
+          TMPDIR: ${{ runner.temp }}
         run: cargo test --bins
       - name: Build
         env:

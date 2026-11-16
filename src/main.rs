@@ -1,3 +1,5 @@
+#[cfg(feature = "app")]
+mod app;
 mod backup;
 mod capacity;
 mod checkout;

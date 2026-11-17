@@ -65,6 +65,7 @@ import { ICON_SIZE } from "@/styles/theme";
 import type { Theme } from "@/styles/theme";
 import { useProviderIcon } from "@/components/provider-icons";
 import { BackupSection } from "./backup-section";
+import { McpServersSection } from "./mcp-servers-section";
 import { BrowserToolsOptInCard } from "./browser-tools-card";
 import { restartDaemonFromSettings, updateDaemonFromSettings } from "./daemon-lifecycle";
 
@@ -376,6 +377,8 @@ export function HostSettingsPage({
       <HostConnectionError serverId={serverId} />
 
       {isConnected ? <BackupSection serverId={serverId} /> : null}
+
+      {isConnected ? <McpServersSection serverId={serverId} /> : null}
 
       <HostAppearanceSection host={host} />
 

@@ -144,7 +144,9 @@ async fn run(cfg: Config, identity: Arc<e2ee::DaemonIdentity>) {
     });
 
     crate::log!("feiyi {} serverId={} home={}", env!("CARGO_PKG_VERSION"), identity.server_id, cfg.home.display());
-    mcp::write_claude_config(&cfg);
+    if let Err(e) = mcp::write_claude_config(&cfg) {
+        crate::warn!("mcp: cannot write Claude's mcp-config: {e}; Claude Code starts without its MCP servers");
+    }
     token_saver::write_claude_settings(&cfg);
     backup::spawn(&cfg, ctx.cmds.clone());
     graph::configure(&cfg, ctx.cmds.clone());

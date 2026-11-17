@@ -277,6 +277,23 @@ env:
   PASEO_ZILONG_API_KEY: ${{ secrets.PASEO_ZILONG_API_KEY }}
 ```
 
+### MCP servers added in the app
+
+Settings can also hold your own HTTP MCP servers (`mcp.servers` in the daemon config: name, URL, optional bearer
+token, and whether Claude Code and Codex each get it). They are stored in `daemon-config.json` (mode 0600, tokens
+included) and the app only sees whether a token is set. Names are 1-64 characters of letters, digits, `-` and `_`,
+unique, not `zilong-router` or `feiyi`; URLs are `http://` or `https://` with a host, without credentials (`user:pass@`), query or fragment (put the secret in
+the token field); at most 32 servers. An `http://` server receives its bearer token in cleartext, so use `https://`
+unless it is on loopback or a trusted network. Changing a server's URL to another scheme, host or port needs the token
+re-entered (or cleared); the stored token is never sent to a different origin. The daemon's `rpc` debug MCP tool
+cannot change the daemon config.
+
+Changes apply to agent processes started afterwards, not running ones: Claude Code reads the rewritten
+`claude-mcp.json` at its next spawn; Codex gets `-c mcp_servers.<name>.url=…` when its shared app-server next starts
+(it exits after `codex_idle` with no turns). A token reaches Codex as `PASEO_MCP_TOKEN_<NAME>` (upper case, `-` as
+`_`) on the app-server's environment, never on a command line, and is masked from agent shells like the other `PASEO_*`
+variables.
+
 ## MCP: feiyi
 
 Every Claude Code and Codex agent (and its sub-agents) also gets `feiyi`, an MCP server built into the daemon

@@ -226,8 +226,7 @@ mod tests {
     #[test]
     fn a_sibling_directory_with_the_same_prefix_is_not_the_project() {
         let long = long_file(crate::outline::READ_WHOLE_MAX_LINES + 1);
-        let (dir, _) = long.rsplit_once('/').unwrap();
-        let ev = json!({ "tool_name": "Read", "tool_input": { "file_path": long }, "cwd": &dir[..dir.len() - 1] });
+        let ev = json!({ "tool_name": "Read", "tool_input": { "file_path": long }, "cwd": &long[..long.rfind('/').unwrap() + 4] });
         assert_eq!(query_for(&ev).unwrap().1, long, "not cut at a character inside a directory name");
         let _ = std::fs::remove_file(long);
     }

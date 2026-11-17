@@ -57,7 +57,7 @@ The default relay is `relay.paseo.sh:443`. You can point it at a self-hosted
 ### Web app on GitHub Pages
 
 `.github/workflows/pages.yml` builds the official Paseo web app (upstream `packages/app`, pinned to a
-release, `v0.12.0` by default) and publishes it at `https://sudtanj.github.io/feiyi/`, so you don't
+release in `web-app.yml`, `v0.12.0` by default) and publishes it at `https://sudtanj.github.io/feiyi/`, so you don't
 depend on app.paseo.sh and the app version stays one that works with feiyi. Run it from the
 Actions tab, optionally with another upstream tag. To make the pairing QR/link open this copy:
 

@@ -1,7 +1,7 @@
 name: web-check
 
 # Typechecks and unit-tests the web app (web/app) without building or deploying anything.
-# Same upstream pin and setup as pages.yml.
+# Same upstream pin and setup as web-app.yml (the pin lives there).
 
 on:
   workflow_dispatch:

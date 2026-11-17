@@ -28,6 +28,11 @@ libc = "0.2"
 miniz_oxide = "0.8"
 argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
 crypto_secretbox = "0.1"
+include_dir = { version = "0.7", optional = true }
+
+[features]
+# Embeds the web app from the directory in FEIYI_APP_DIST and serves it at /.
+app = ["dep:include_dir"]
 
 [dev-dependencies]
 rcgen = { version = "0.13", default-features = false, features = ["ring"] }

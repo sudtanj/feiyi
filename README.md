@@ -57,7 +57,7 @@ The default relay is `relay.paseo.sh:443`. You can point it at a self-hosted
 ### Web app on GitHub Pages
 
 `.github/workflows/pages.yml` builds the official Paseo web app (upstream `packages/app`, pinned to a
-release, `v0.12.0` by default) and publishes it at `https://sudtanj.github.io/feiyi/`, so you don't
+release in `web-app.yml`, `v0.12.0` by default) and publishes it at `https://sudtanj.github.io/feiyi/`, so you don't
 depend on app.paseo.sh and the app version stays one that works with feiyi. Run it from the
 Actions tab, optionally with another upstream tag. To make the pairing QR/link open this copy:
 
@@ -91,6 +91,22 @@ the relay it is all a client needs, so treat it like a password. On this site it
   share one, so a script on another of your Pages sites could read it. For full isolation, serve this
   site from its own origin: a custom (sub)domain in Settings > Pages, or a separate GitHub
   organization's `<org>.github.io`.
+
+### macOS (Apple Silicon)
+
+The `latest` release carries `feiyi-aarch64-apple-darwin.tar.gz` (+ `.sha256`): one unsigned binary
+with the web app embedded (cargo feature `app`, built from the same `web-app.yml` workflow as the
+Pages site). With the feature on, `/` serves the app and the pairing page moves to `/pair`.
+
+```sh
+tar xzf feiyi-aarch64-apple-darwin.tar.gz
+xattr -d com.apple.quarantine feiyi
+PASEO_PASSWORD=secret ./feiyi        # then open http://localhost:6768/
+```
+
+`claude`/`codex` must be on `PATH`. State is in `~/.paseo-lite`. macOS has no memory-pressure
+reading, so the agent limit stays at its ceiling (from total RAM and CPUs); pin it with
+`PASEO_CLAUDE_MAX_LIVE=<n>`. Details in [docs/README-mac.md](docs/README-mac.md).
 
 ## Protocol compatibility
 

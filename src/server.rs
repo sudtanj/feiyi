@@ -25,11 +25,13 @@ pub async fn serve(ctx: Arc<Ctx>, listen: String, hostnames: Vec<String>, mcp: O
     let listener = tokio::net::TcpListener::bind(&listen).await?;
     let state = AppState { ctx, hostnames: Arc::new(hostnames), mcp: mcp.map(Arc::new) };
     let app = Router::new()
-        .route("/", get(index))
+        .route(if cfg!(feature = "app") { "/pair" } else { "/" }, get(index))
         .route("/ws", get(ws_upgrade))
         .route("/api/files/download", get(download))
-        .route("/mcp", post(mcp_post).get(mcp_other).delete(mcp_other))
-        .with_state(state);
+        .route("/mcp", post(mcp_post).get(mcp_other).delete(mcp_other));
+    #[cfg(feature = "app")]
+    let app = app.fallback(crate::app::serve);
+    let app = app.with_state(state);
     crate::log!("listening on http://{listen} (web UI) and ws://{listen}/ws");
     // Nagle off: agent stream updates are many small frames.
     // Peer addresses for /mcp, which only answers this machine.

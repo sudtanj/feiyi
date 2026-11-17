@@ -446,6 +446,17 @@ fn psi(text: &str) -> Option<f64> {
     line.split_whitespace().find_map(|f| f.strip_prefix("avg10=")).and_then(|v| v.parse().ok())
 }
 
+/// macOS: `hw.memsize`. Available memory has no reading there, so no auto shrink: the limit stays at the ceiling.
+#[cfg(target_os = "macos")]
+fn host_total_mb() -> Option<u64> {
+    let mut bytes: u64 = 0;
+    let mut len = std::mem::size_of::<u64>();
+    // SAFETY: hw.memsize is a u64; `len` is its size and both outlive the call.
+    let rc = unsafe { libc::sysctlbyname(c"hw.memsize".as_ptr(), (&mut bytes as *mut u64).cast(), &mut len, std::ptr::null_mut(), 0) };
+    (rc == 0).then_some(bytes / (1024 * 1024))
+}
+
+#[cfg(not(target_os = "macos"))]
 fn host_total_mb() -> Option<u64> {
     read("/proc/meminfo").and_then(|t| field(&t, "MemTotal")).map(|kb| kb / 1024)
 }

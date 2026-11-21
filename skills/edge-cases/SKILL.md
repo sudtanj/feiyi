@@ -49,4 +49,4 @@ Most production bugs sit in cases nobody wrote down. Go through every group belo
 
 ## Rule
 
-For every item write applies / N/A (why) / handled (test name or file:line). An unanswered item is a blocker.
+For every item write applies / N/A (why) / handled (test name or file:line). One line per group is enough; give detail only for items marked handled or blocker. An unanswered item is a blocker.

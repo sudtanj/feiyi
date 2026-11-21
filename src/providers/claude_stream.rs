@@ -76,7 +76,7 @@ const ADMIT_GRACE: Duration = Duration::from_secs(30);
 /// at `SUBAGENT_POLL`, for the machine to recover before it is denied.
 const SUBAGENT_WAIT: Duration = Duration::from_secs(45);
 pub const SUBAGENT_POLL: Duration = Duration::from_secs(3);
-const SUBAGENT_STRAINED: &str = "Sub-agent not started: the machine is low on memory right now. This is temporary, not a failure: do not drop the work. Do this part yourself if it is small; otherwise start a background shell `sleep 90` (run_in_background: true), end the turn, and when it reports back launch the sub-agent again. Repeat until it starts, and keep going with any other parts meanwhile.";
+const SUBAGENT_STRAINED: &str = "Sub-agent not started: the machine is low on memory right now. This is temporary, not a failure: do not drop the work. Do this part yourself if it is small; otherwise start a background shell `sleep 90` (run_in_background: true), end the turn, and when it reports back launch the sub-agent again. Retry at most three times with waits of 90, 300 and 900 seconds, then report what is blocked, and keep going with any other parts meanwhile.";
 
 /// Lines kept in a running sub-agent's log (the oldest are dropped).
 const MAX_SUB_LOG_LINES: usize = 50;

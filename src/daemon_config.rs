@@ -276,7 +276,7 @@ impl DaemonConfig {
                 }
                 // Environment-controlled in feiyi (backup: edited by hand, it holds secrets; backupStatus: read-only); not stored.
                 // (mcpServers: only through the validated mcp.servers.)
-                "mcp" | "mcpServers" | "hostnames" | "app" | "relay" | "backup" | "backupStatus" => {}
+                "mcp" | "mcpServers" | "hostnames" | "app" | "relay" | "claude" | "backup" | "backupStatus" => {}
                 _ => {
                     self.stored.insert(key.clone(), value.clone());
                 }

@@ -822,7 +822,8 @@ impl Manager {
                 let keep: Vec<&str> = self.cli_queue.iter().map(|(id, _)| id.as_str()).collect();
                 // A big context is reread uncached after an eviction: compact it first, while the cache is warm.
                 // Half the auto-compact thresholds; never when memory is critical.
-                let victim = self.claude.idle_victim(&keep).filter(|id| !self.capacity.critical() && self.agents.get(id).is_some_and(|a| a.status == "idle" && a.queue.is_empty()) && self.context_fills(id, 2));
+                let compacting_for_evict = self.agents.values().any(|a| a.evict_after_compact);
+                let victim = self.claude.idle_victim(&keep).filter(|id| !compacting_for_evict && !self.capacity.critical() && self.agents.get(id).is_some_and(|a| a.status == "idle" && a.queue.is_empty()) && self.context_fills(id, 2));
                 match victim {
                     Some(id) => {
                         crate::log!("claude: compacting agent {id} before releasing its idle process");
@@ -1164,6 +1165,7 @@ impl Manager {
             a.attempts = 0;
             a.produced = produced;
             a.compacting = false;
+            a.evict_after_compact = false;
             a.retry_at = None;
             a.limit_hit = None;
             a.limit_wait = false;
@@ -1281,6 +1283,7 @@ impl Manager {
             // Retrying a quiet reply would restart the process mid-turn.
             a.produced = true;
             a.compacting = false;
+            a.evict_after_compact = false;
             a.retry_at = None;
             a.limit_hit = None;
             a.limit_wait = false;
@@ -1317,6 +1320,7 @@ impl Manager {
             a.attempts = 0;
             a.produced = true;
             a.compacting = false;
+            a.evict_after_compact = false;
             a.limit_hit = None;
             a.limit_wait = false;
             a.limit_since = None;
@@ -1342,6 +1346,7 @@ impl Manager {
             a.attempts = 0;
             a.produced = true;
             a.compacting = false;
+            a.evict_after_compact = false;
             a.retry_at = None;
             a.limit_hit = None;
             a.limit_wait = false;
@@ -1708,6 +1713,7 @@ impl Manager {
             a.status = "idle";
             a.active_turn = None;
             a.compacting = false;
+            a.evict_after_compact = false;
             a.retry_at = None;
         }
         self.persist_pending(agent_id);

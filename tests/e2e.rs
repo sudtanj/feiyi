@@ -414,6 +414,12 @@ async fn daemon_config_reports_the_downshift_percent() {
         send(&mut ws, session(json!({ "type": "get_daemon_config_request", "requestId": "d1" }))).await;
         let cfg = recv_until(&mut ws, |v| (v["message"]["type"] == "get_daemon_config_response").then(|| v["message"]["payload"]["config"].clone())).await;
         assert_eq!(cfg["claude"]["downshiftPct"], want, "PASEO_CLAUDE_DOWNSHIFT_PCT={value:?}");
+        // The value comes from the environment: a patch cannot store its own.
+        send(&mut ws, session(json!({ "type": "set_daemon_config_request", "requestId": "d2", "config": { "claude": { "downshiftPct": 5 } } }))).await;
+        recv_until(&mut ws, |v| (v["message"]["type"] == "set_daemon_config_response").then_some(())).await;
+        send(&mut ws, session(json!({ "type": "get_daemon_config_request", "requestId": "d3" }))).await;
+        let cfg = recv_until(&mut ws, |v| (v["message"]["type"] == "get_daemon_config_response").then(|| v["message"]["payload"]["config"].clone())).await;
+        assert_eq!(cfg["claude"]["downshiftPct"], want, "a config patch must not override the environment");
     }
 }
 

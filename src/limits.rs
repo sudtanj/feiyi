@@ -229,10 +229,10 @@ mod tests {
         assert_eq!(downshift(0.0, 70, "opus"), None, "unknown window reads 0");
         assert_eq!(downshift(0.0, 0, "opus"), None);
         assert_eq!(downshift(100.0, 0, "opus"), None, "0 disables");
-        for m in ["opus", "opus[1m]", "claude-opus-4-1", "claude-opus-4-1-20250805", "Opus", "CLAUDE-OPUS-4"] {
+        for m in ["opus", "claude-opus-4-1", "claude-opus-4-1-20250805", "Opus", "CLAUDE-OPUS-4"] {
             assert_eq!(downshift(80.0, 70, m), Some("sonnet"), "{m}");
         }
-        for m in ["sonnet", "sonnet[1m]", "claude-sonnet-4-5", "haiku", "default", ""] {
+        for m in ["opus[1m]", "claude-opus-4-1[1m]", "sonnet", "sonnet[1m]", "claude-sonnet-4-5", "haiku", "default", ""] {
             assert_eq!(downshift(99.0, 70, m), None, "{m}");
         }
         assert_eq!(downshift(f64::NAN, 70, "opus"), None);

@@ -490,6 +490,7 @@ fn redacted_config(cfg: &crate::config::Config) -> Value {
             "idleSecs": secs(cfg.claude_idle),
             "maxSubagents": cfg.claude_max_subagents,
             "contextWindow": cfg.claude_context_window,
+            "downshiftPct": cfg.claude_downshift_pct,
             "subagentPromptSet": cfg.claude_subagent_prompt.is_some(),
         },
         "codex": { "bin": cfg.codex_bin, "maxActive": cfg.codex_max_active.label(), "keepWarm": cfg.codex_keep_warm, "idleSecs": secs(cfg.codex_idle) },

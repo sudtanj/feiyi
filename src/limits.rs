@@ -157,6 +157,21 @@ pub fn windows(provider: &str) -> (Vec<Value>, Option<Value>) {
 /// Does `provider` talk to something other than its subscription (a custom
 /// base URL, an API key, a cloud provider)? Read on each report so a change
 /// shows without a restart.
+/// Claude's 5-hour window share in percent; 0 when unknown or already reset.
+pub fn claude_five_hour_pct() -> f64 {
+    let windows = WINDOWS.lock().unwrap();
+    match windows.get("claude/five_hour") {
+        Some(w) if !w.resets_at.is_some_and(|r| r <= now()) && !custom_endpoint("claude") => w.used_pct.unwrap_or(0.0),
+        _ => 0.0,
+    }
+}
+
+/// Sonnet instead of an Opus-class `model` once the 5-hour window is at
+/// `threshold` percent (0 = never).
+pub fn downshift(used_pct: f64, threshold: u32, model: &str) -> Option<&'static str> {
+    (threshold > 0 && used_pct >= threshold as f64 && model.to_ascii_lowercase().contains("opus")).then_some("sonnet")
+}
+
 fn custom_endpoint(provider: &str) -> bool {
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
     match provider {
@@ -194,6 +209,16 @@ fn codex_custom(config: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn downshift_opus_past_threshold() {
+        assert_eq!(downshift(70.0, 70, "opus"), Some("sonnet"));
+        assert_eq!(downshift(95.0, 70, "claude-opus-4-1"), Some("sonnet"));
+        assert_eq!(downshift(69.9, 70, "opus"), None);
+        assert_eq!(downshift(99.0, 0, "opus"), None, "0 disables");
+        assert_eq!(downshift(99.0, 70, "sonnet"), None);
+        assert_eq!(downshift(99.0, 70, "default"), None);
+    }
 
     #[test]
     fn codex_config_custom_provider() {

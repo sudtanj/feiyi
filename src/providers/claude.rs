@@ -277,8 +277,7 @@ impl ClaudePool {
     /// about to run, which would otherwise cold-start). For the capacity:
     /// growing counted warm idle memory as room, and this makes it real.
     pub fn release_one_idle(&mut self, keep: &[&str]) -> bool {
-        let victim = self.procs.iter().filter(|(id, p)| !p.busy() && !p.holding() && !keep.contains(&id.as_str())).min_by_key(|(_, p)| p.last_used).map(|(id, _)| id.clone());
-        match victim {
+        match self.idle_victim(keep) {
             Some(id) => {
                 crate::log!("claude: releasing idle process of agent {id} to make room for one more agent");
                 self.stop(&id);
@@ -286,6 +285,11 @@ impl ClaudePool {
             }
             None => false,
         }
+    }
+
+    /// The process `release_one_idle` would stop.
+    pub fn idle_victim(&self, keep: &[&str]) -> Option<String> {
+        self.procs.iter().filter(|(id, p)| !p.busy() && !p.holding() && !keep.contains(&id.as_str())).min_by_key(|(_, p)| p.last_used).map(|(id, _)| id.clone())
     }
 
     fn evict_one_idle(&mut self) -> bool {
@@ -315,7 +319,12 @@ impl ClaudePool {
             cmd.arg("--settings").arg(settings);
         }
         if let Some(model) = spec.model.as_deref().filter(|m| !m.is_empty() && *m != "default") {
-            cmd.args(["--model", model]);
+            let used = crate::limits::claude_five_hour_pct();
+            let shifted = crate::limits::downshift(used, self.cfg.claude_downshift_pct, model);
+            if let Some(sonnet) = shifted {
+                crate::log!("limits: 5-hour window at {used:.0}%, starting {} on {sonnet} instead of {model}", spec.id);
+            }
+            cmd.args(["--model", shifted.unwrap_or(model)]);
         }
         let session_id = match &spec.session_id {
             Some(sid) => {

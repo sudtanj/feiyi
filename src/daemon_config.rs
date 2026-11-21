@@ -215,6 +215,7 @@ impl DaemonConfig {
         out.insert("hostnames".into(), json!(cfg.hostnames));
         out.insert("app".into(), json!({ "baseUrl": cfg.app_base_url }));
         out.insert("relay".into(), json!({ "enabled": cfg.relay_enabled }));
+        out.insert("claude".into(), json!({ "downshiftPct": cfg.claude_downshift_pct }));
         out.remove("backup");
         out.insert("backupStatus".into(), crate::backup::app_status(&cfg.backup));
         out.entry("providers").or_insert_with(|| json!({}));

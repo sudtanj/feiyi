@@ -69,6 +69,9 @@ pub struct Config {
     /// window: every model call uploads the whole context, so a smaller one
     /// saves egress (and cache-read cost). 0 = no cap.
     pub auto_compact_tokens: u64,
+    /// New Claude processes start on Sonnet instead of Opus once the 5-hour
+    /// window is this full (percent). 0 = never.
+    pub claude_downshift_pct: u32,
     /// Context window assumed for Claude models (1M for `[1m]` models).
     pub claude_context_window: u64,
     /// Automatic retries of a failed, empty or stalled turn (0 = off).
@@ -194,6 +197,7 @@ impl Config {
             agent_low_io: env_bool("PASEO_AGENT_LOW_IO").unwrap_or(true),
             auto_compact_pct: env("PASEO_AUTO_COMPACT_PCT").and_then(|v| v.parse().ok()).unwrap_or(40).min(99),
             auto_compact_tokens: env("PASEO_AUTO_COMPACT_TOKENS").and_then(|v| v.parse().ok()).unwrap_or(120_000),
+            claude_downshift_pct: env("PASEO_CLAUDE_DOWNSHIFT_PCT").and_then(|v| v.parse().ok()).unwrap_or(70).min(100),
             claude_context_window: env("PASEO_CLAUDE_CONTEXT_WINDOW").and_then(|v| v.parse().ok()).unwrap_or(200_000),
             retry_max: env("PASEO_RETRY_MAX").and_then(|v| v.parse().ok()).unwrap_or(3),
             retry_base: env_secs("PASEO_RETRY_BASE_SECS", 5),

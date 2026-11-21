@@ -32,6 +32,14 @@ const RELEASE_QUIET: Duration = Duration::from_secs(300);
 /// to `thread/compact/start` for Codex).
 const COMPACT_COMMAND: &str = "/compact";
 
+/// What Claude gets instead: the same command plus what the summary keeps.
+const CLAUDE_COMPACT_COMMAND: &str = "/compact Keep: the user's goal and constraints; decisions made and why; files changed, with paths; open tasks and their state; verification results and anything not verified; running background work and its ids. Drop: tool output, file contents, exploration dead ends.";
+
+/// A context of `used` tokens is at `pct` percent of `max` or at the token `cap` (0 = no cap).
+fn context_reached(used: u64, max: Option<u64>, pct: u64, cap: u64) -> bool {
+    (cap > 0 && used >= cap) || max.is_some_and(|max| used * 100 >= max * pct)
+}
+
 /// The CLI that serves a provider.
 pub(crate) fn cli_of(provider: &str) -> &'static str {
     if provider == "codex" { "codex" } else { "claude" }
@@ -135,6 +143,8 @@ pub struct Agent {
     pub last_touch: Instant,
     /// The active turn is a daemon-started compaction, not a user prompt.
     pub compacting: bool,
+    /// The compaction was started to shrink the context before the idle process is evicted.
+    pub evict_after_compact: bool,
     /// The user prompt of the running turn (resent when a retry has nothing to continue).
     pub turn_text: String,
     /// Automatic retries used by the running turn.
@@ -810,7 +820,21 @@ impl Manager {
             // swap or the next spawn find the container full.
             if self.capacity.room_short() && (!self.cli_queue.is_empty() || self.claude.waiting_count() > 0) {
                 let keep: Vec<&str> = self.cli_queue.iter().map(|(id, _)| id.as_str()).collect();
-                self.claude.release_one_idle(&keep);
+                // A big context is reread uncached after an eviction: compact it first, while the cache is warm.
+                // Half the auto-compact thresholds; never when memory is critical.
+                let victim = self.claude.idle_victim(&keep).filter(|id| !self.capacity.critical() && self.agents.get(id).is_some_and(|a| a.status == "idle" && a.queue.is_empty()) && self.context_fills(id, 2));
+                match victim {
+                    Some(id) => {
+                        crate::log!("claude: compacting agent {id} before releasing its idle process");
+                        if let Some(a) = self.agents.get_mut(&id) {
+                            a.evict_after_compact = true;
+                        }
+                        self.start_compaction(&id);
+                    }
+                    None => {
+                        self.claude.release_one_idle(&keep);
+                    }
+                }
             }
             self.pump();
         }
@@ -879,6 +903,11 @@ impl Manager {
     /// True when the agent's last turn left its context at or past
     /// `auto_compact_pct` of the window or `auto_compact_tokens`.
     fn needs_compaction(&self, agent_id: &str) -> bool {
+        self.context_fills(agent_id, 1)
+    }
+
+    /// Like `needs_compaction` at `1/divisor` of both thresholds.
+    fn context_fills(&self, agent_id: &str, divisor: u64) -> bool {
         let pct = self.cfg.auto_compact_pct as u64;
         let Some(a) = self.agents.get(agent_id) else { return false };
         if pct == 0 || a.rec.session_id.is_none() {
@@ -887,8 +916,7 @@ impl Manager {
         let Some(usage) = &a.rec.last_usage else { return false };
         let get = |k: &str| usage.get(k).and_then(|v| v.as_u64()).filter(|n| *n > 0);
         let Some(used) = get("contextWindowUsedTokens") else { return false };
-        let cap = self.cfg.auto_compact_tokens;
-        (cap > 0 && used >= cap) || get("contextWindowMaxTokens").map(|max| used * 100 >= max * pct).unwrap_or(false)
+        context_reached(used, get("contextWindowMaxTokens"), pct.div_ceil(divisor), self.cfg.auto_compact_tokens.div_ceil(divisor))
     }
 
     /// Run `/compact` as its own turn, ahead of the agent's queued prompts,
@@ -920,15 +948,16 @@ impl Manager {
         self.stream(agent_id, &provider, json!({ "type": "turn_started", "provider": provider, "turnId": turn_id }));
         self.touch(agent_id);
         self.publish_agent(agent_id);
-        self.dispatch(agent_id, COMPACT_COMMAND.to_string());
+        let command = if provider == "codex" { COMPACT_COMMAND } else { CLAUDE_COMPACT_COMMAND };
+        self.dispatch(agent_id, command.to_string());
     }
 
     /// End the active turn. `Ok(None)` completed, `Ok(Some(reason))` canceled, `Err` failed.
     pub fn finish_turn(&mut self, agent_id: &str, outcome: Result<Option<String>, String>) {
         self.flush_chunk(agent_id);
-        let compacting = match self.agents.get_mut(agent_id) {
+        let (compacting, evict) = match self.agents.get_mut(agent_id) {
             // A scheduled retry owns the turn; late events from the dead attempt are ignored.
-            Some(a) if a.status == "running" && a.retry_at.is_none() => std::mem::take(&mut a.compacting),
+            Some(a) if a.status == "running" && a.retry_at.is_none() => (std::mem::take(&mut a.compacting), std::mem::take(&mut a.evict_after_compact)),
             _ => return,
         };
         // `--resume` of a session the CLI no longer has fails every time: start a fresh one on the next turn.
@@ -1038,6 +1067,9 @@ impl Manager {
         if provider == "claude" {
             let ready = self.claude.turn_finished(agent_id);
             self.send_ready(ready);
+            if evict && self.agents.get(agent_id).is_some_and(|a| a.queue.is_empty()) {
+                self.claude.stop(agent_id);
+            }
         }
         self.pump();
         if !compacting && matches!(outcome, Ok(None)) && self.needs_compaction(agent_id) {
@@ -1692,7 +1724,7 @@ impl Manager {
 
 impl Agent {
     pub fn new(rec: AgentRecord) -> Agent {
-        Agent { rec, status: "idle", active_turn: None, queue: VecDeque::new(), permissions: Vec::new(), timeline: None, dirty_rows: BTreeSet::new(), last_touch: Instant::now(), compacting: false, turn_text: String::new(), attempts: 0, produced: false, answers_during_background: false, last_event: Instant::now(), retry_at: None, retry_text: String::new(), limit_hit: None, limit_wait: false, limit_since: None }
+        Agent { rec, status: "idle", active_turn: None, queue: VecDeque::new(), permissions: Vec::new(), timeline: None, dirty_rows: BTreeSet::new(), last_touch: Instant::now(), compacting: false, evict_after_compact: false, turn_text: String::new(), attempts: 0, produced: false, answers_during_background: false, last_event: Instant::now(), retry_at: None, retry_text: String::new(), limit_hit: None, limit_wait: false, limit_since: None }
     }
 
     pub fn ensure_timeline(&mut self, store: &Store) {
@@ -1781,6 +1813,19 @@ fn wait_text(d: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_thresholds() {
+        let (pct, cap) = (40u64, 120_000u64);
+        assert!(!context_reached(50_000, Some(200_000), pct, cap));
+        assert!(context_reached(80_000, Some(200_000), pct, cap), "percent of the window");
+        assert!(context_reached(120_000, Some(1_000_000), pct, cap), "token cap");
+        assert!(!context_reached(70_000, Some(1_000_000), pct, 0), "0 = no cap");
+        // Half the thresholds, as before an eviction.
+        assert!(context_reached(50_000, Some(200_000), pct.div_ceil(2), cap.div_ceil(2)));
+        assert!(context_reached(60_000, None, pct.div_ceil(2), cap.div_ceil(2)));
+        assert!(!context_reached(30_000, Some(200_000), pct.div_ceil(2), cap.div_ceil(2)));
+    }
 
     #[test]
     fn limit_wait_is_described_plainly() {

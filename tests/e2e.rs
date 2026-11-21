@@ -402,6 +402,42 @@ async fn daemon_config_custom_models_round_trip() {
     assert_eq!(cfg["providers"]["claude"]["additionalModels"][0]["id"], "my-custom-model");
 }
 
+/// `claude.downshiftPct` in the daemon config: default 70, 0 disables, over
+/// 100 is capped, garbage falls back to the default.
+#[tokio::test]
+async fn daemon_config_reports_the_downshift_percent() {
+    for (value, want) in [(None, 70), (Some("0"), 0), (Some("150"), 100), (Some("55"), 55), (Some("lots"), 70), (Some("-5"), 70)] {
+        let vars: Vec<(&str, &str)> = value.map(|v| ("PASEO_CLAUDE_DOWNSHIFT_PCT", v)).into_iter().collect();
+        let d = start_with(unique_dir("downshift"), None, "ok", &vars);
+        let mut ws = connect(d.port).await;
+        hello(&mut ws, None).await;
+        send(&mut ws, session(json!({ "type": "get_daemon_config_request", "requestId": "d1" }))).await;
+        let cfg = recv_until(&mut ws, |v| (v["message"]["type"] == "get_daemon_config_response").then(|| v["message"]["payload"]["config"].clone())).await;
+        assert_eq!(cfg["claude"]["downshiftPct"], want, "PASEO_CLAUDE_DOWNSHIFT_PCT={value:?}");
+    }
+}
+
+/// With no 5-hour usage known the window reads 0%, so an Opus agent starts on
+/// the model it asked for, at the default threshold and with downshift off.
+#[tokio::test]
+async fn claude_keeps_the_requested_model_while_the_window_is_empty() {
+    for extra in [None, Some("0")] {
+        let vars: Vec<(&str, &str)> = extra.map(|v| ("PASEO_CLAUDE_DOWNSHIFT_PCT", v)).into_iter().collect();
+        let d = start_with(unique_dir("modelkeep"), None, "args", &vars);
+        let mut ws = connect(d.port).await;
+        hello(&mut ws, None).await;
+        let cwd = d.dir.join("w1");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let config = json!({ "provider": "claude", "cwd": cwd.to_string_lossy(), "modeId": "bypassPermissions", "model": "opus" });
+        send(&mut ws, session(json!({ "type": "create_agent_request", "requestId": "m1", "config": config, "initialPrompt": "hi" }))).await;
+        recv_until(&mut ws, |v| (v["message"]["type"] == "agent_stream" && v["message"]["payload"]["event"]["type"] == "turn_completed").then_some(())).await;
+        let args = std::fs::read_to_string(d.dir.join("claude-args")).unwrap();
+        let lines: Vec<&str> = args.lines().collect();
+        let i = lines.iter().position(|l| *l == "--model").expect(&args);
+        assert_eq!(lines[i + 1], "opus", "{args}");
+    }
+}
+
 #[tokio::test]
 async fn project_add_and_list() {
     let d = start("project", None);

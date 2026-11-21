@@ -1834,6 +1834,29 @@ mod tests {
     }
 
     #[test]
+    fn context_thresholds_edge_cases() {
+        assert!(context_reached(80_000, Some(200_000), 40, 0), "exactly the percent");
+        assert!(!context_reached(79_999, Some(200_000), 40, 0), "one token under");
+        assert!(context_reached(120_000, None, 40, 120_000), "exactly the cap, window unknown");
+        assert!(!context_reached(119_999, None, 40, 120_000));
+        assert!(!context_reached(1_000_000, None, 40, 0), "no window and no cap never fills");
+        // Halving rounds up, so an odd threshold is never lowered below half; 0 stays "no cap".
+        assert_eq!(41u64.div_ceil(2), 21);
+        assert_eq!(1u64.div_ceil(2), 1);
+        assert_eq!(0u64.div_ceil(2), 0);
+        assert!(!context_reached(41_000, Some(200_000), 41u64.div_ceil(2), 0));
+        assert!(context_reached(42_000, Some(200_000), 41u64.div_ceil(2), 0));
+    }
+
+    #[test]
+    fn compact_commands() {
+        assert_eq!(COMPACT_COMMAND, "/compact", "Codex matches this by equality");
+        assert!(CLAUDE_COMPACT_COMMAND.starts_with("/compact "));
+        assert_ne!(CLAUDE_COMPACT_COMMAND, COMPACT_COMMAND);
+        assert!(!CLAUDE_COMPACT_COMMAND.contains('\n'), "one line, one prompt");
+    }
+
+    #[test]
     fn limit_wait_is_described_plainly() {
         assert_eq!(reset_text(1_760_000_000), "2025-10-09 08:53 UTC");
         assert_eq!(wait_text(Duration::from_secs(59)), "1m");
